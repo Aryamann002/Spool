@@ -11,30 +11,32 @@ export const WORLD_ANCHORS = {
   paperSketch: { desktop: [55, 20], compact: [55, 20], rotation: 5 },
   eyeStudy: { desktop: [72, 19], compact: [72, 19], rotation: -3 },
   darkThoughtful: { desktop: [86, 20], compact: [85, 31], rotation: 5 },
-  blackSketch: { desktop: [2, 30], compact: [9, 30], rotation: 4 },
-  leftImageStack: { desktop: [16, 37], compact: [20, 37], rotation: -3 },
+  blackSketch: { desktop: [4, 30], compact: [9, 30], rotation: 4 },
+  leftImageStack: { desktop: [18, 37], compact: [20, 37], rotation: -3 },
   japanesePoster: { desktop: [4, 47], compact: [7, 45], rotation: -7 },
-  hero: { desktop: [50, 38], compact: [50, 39], rotation: 0 },
+  hero: { desktop: [50, 42], compact: [50, 41], rotation: 0 },
   rightImageStack: { desktop: [79, 43], compact: [77, 45], rotation: -4 },
   noteCard: { desktop: [80, 54], compact: [79, 55], rotation: -7 },
   humanSite: { desktop: [12, 64], compact: [17, 66], rotation: 5 },
   thoughtCard: { desktop: [8, 76], compact: [17, 80], rotation: 3 },
   wordmark: { desktop: [49, 66], compact: [50, 64], rotation: 0 },
-  processSketch: { desktop: [14, 90], compact: [16, 93], rotation: -2 },
+  processSketch: { desktop: [16, 90], compact: [16, 93], rotation: -2 },
   editorialFragment: { desktop: [40, 88], compact: [41, 90], rotation: -1 },
   terminal: { desktop: [49, 89], compact: [68, 89], rotation: 2 },
-  buildCard: { desktop: [93, 55], compact: [92, 62], rotation: 3 },
-  ideasSite: { desktop: [83, 84], compact: [81, 84], rotation: -7 },
+  buildCard: { desktop: [91, 55], compact: [92, 62], rotation: 3 },
+  ideasSite: { desktop: [81, 84], compact: [81, 84], rotation: -7 },
 } as const satisfies Record<string, WorldAnchor>;
 
 export type WorldRegion = keyof typeof WORLD_ANCHORS;
 
 export const SCENE_ANCHORS = {
-  home: "hero",
+  home: "home",
   gallery: "rightImageStack",
   features: "processSketch",
   useCases: "ideasSite",
-} as const satisfies Record<string, WorldRegion>;
+} as const satisfies Record<string, WorldRegion | "home">;
+
+export const SCENE_NAV_ITEMS = ["gallery", "features", "useCases"] as const satisfies readonly (keyof typeof SCENE_ANCHORS)[];
 
 export type SceneAnchor = keyof typeof SCENE_ANCHORS;
 

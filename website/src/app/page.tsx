@@ -4,7 +4,6 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import PuzzleLoader, { type PuzzleRevealMode } from "../components/puzzle/PuzzleLoader";
 import { usePrefersReducedMotion } from "../components/puzzle/use-prefers-reduced-motion";
 import WorldCanvas from "../components/WorldCanvas";
-import { WORDMARK_REVEAL_DURATION_MS } from "../components/wordmark-paths";
 
 type ExperienceState =
   | "void"
@@ -47,7 +46,7 @@ const TIMING = {
   hold: 360,
   exit: 320,
   ready: 520,
-  thread: WORDMARK_REVEAL_DURATION_MS,
+  thread: 540,
   reducedCanvas: 180,
   reducedHold: 100,
   reducedExit: 180,

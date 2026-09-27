@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
-import { anchorPosition, SCENE_ANCHORS, type SceneAnchor, type WorldRegion } from "./composition";
-import { WORDMARK_GLYPHS, WORDMARK_LETTER_DURATION_MS, WORDMARK_LETTER_STAGGER_MS, WORDMARK_TOTAL_ADVANCE, WORDMARK_UNITS_PER_EM } from "./wordmark-paths";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { anchorPosition, SCENE_ANCHORS, SCENE_NAV_ITEMS, type SceneAnchor, type WorldRegion } from "./composition";
+
 
 export type Camera = { x: number; y: number; scale: number };
 
@@ -21,11 +21,10 @@ type WorldMetrics = {
   height: number;
   worldWidth: number;
   worldHeight: number;
-  contentBounds: { left: number; top: number; right: number; bottom: number };
 };
 
 const WORLD_SCALE = 1;
-const CONTENT_EDGE_ALLOWANCE = 0.2;
+const HOME_CAMERA = { worldX: 0.5, worldY: 0.5 } as const;
 const CAMERA_TRAVEL_MS = 780;
 const GITHUB_URL = "https://github.com/atpugvaraa/spool";
 const DOCS_URL: string | null = null;
@@ -45,18 +44,10 @@ function DownloadAction({ className, icon = false }: { className: string; icon?:
 }
 
 function clampCamera(camera: Camera, metrics: WorldMetrics): Camera {
-  const horizontalAllowance = metrics.width * CONTENT_EDGE_ALLOWANCE;
-  const verticalAllowance = metrics.height * CONTENT_EDGE_ALLOWANCE;
-  const minX = Math.max(
-    metrics.width - metrics.worldWidth,
-    metrics.width - metrics.contentBounds.right - horizontalAllowance,
-  );
-  const maxX = Math.min(0, -metrics.contentBounds.left + horizontalAllowance);
-  const minY = Math.max(
-    metrics.height - metrics.worldHeight,
-    metrics.height - metrics.contentBounds.bottom - verticalAllowance,
-  );
-  const maxY = Math.min(0, -metrics.contentBounds.top + verticalAllowance);
+  const minX = Math.min(0, metrics.width - metrics.worldWidth);
+  const maxX = Math.max(0, metrics.width - metrics.worldWidth);
+  const minY = Math.min(0, metrics.height - metrics.worldHeight);
+  const maxY = Math.max(0, metrics.height - metrics.worldHeight);
 
   return {
     ...camera,
@@ -64,6 +55,14 @@ function clampCamera(camera: Camera, metrics: WorldMetrics): Camera {
     y: Math.max(minY, Math.min(maxY, camera.y)),
     scale: WORLD_SCALE,
   };
+}
+
+function homeCamera(metrics: WorldMetrics): Camera {
+  return clampCamera({
+    x: metrics.width / 2 - metrics.worldWidth * HOME_CAMERA.worldX,
+    y: metrics.height / 2 - metrics.worldHeight * HOME_CAMERA.worldY,
+    scale: WORLD_SCALE,
+  }, metrics);
 }
 
 function centeredCamera(x: number, y: number, metrics: WorldMetrics): Camera {
@@ -74,8 +73,12 @@ function centeredCamera(x: number, y: number, metrics: WorldMetrics): Camera {
   }, metrics);
 }
 
-const WORDMARK_CENTER = 350;
-const WORDMARK_BASELINE = 223;
+function renderedCamera(world: HTMLElement, current: Camera): Camera {
+  const transform = window.getComputedStyle(world).transform;
+  const matrix = new DOMMatrixReadOnly(transform === "none" ? undefined : transform);
+  return { ...current, x: matrix.m41, y: matrix.m42 };
+}
+
 
 type ItemStyle = CSSProperties & {
   "--x": string;
@@ -84,9 +87,6 @@ type ItemStyle = CSSProperties & {
   "--rotation": string;
 };
 
-type WordmarkStyle = ItemStyle & {
-  "--letter-duration": string;
-};
 
 function itemStyle(x: number, y: number, width: number, rotation = 0): ItemStyle {
   return {
@@ -102,50 +102,45 @@ function anchoredStyle(region: WorldRegion, width: number) {
   return itemStyle(x, y, width, rotation);
 }
 
-function wordmarkStyle(): WordmarkStyle {
-  return {
-    ...anchoredStyle("wordmark", 700),
-    "--letter-duration": `${WORDMARK_LETTER_DURATION_MS}ms`,
-  };
+function wordmarkStyle(): ItemStyle {
+  return anchoredStyle("wordmark", 700);
 }
 
 export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
-  const artifactsRef = useRef<HTMLDivElement>(null);
-  const wordmarkRef = useRef<SVGSVGElement>(null);
-  const wordmarkGeometryRef = useRef<SVGGElement>(null);
+
+
   const metricsRef = useRef<WorldMetrics>({
     width: 0,
     height: 0,
     worldWidth: 0,
     worldHeight: 0,
-    contentBounds: { left: 0, top: 0, right: 0, bottom: 0 },
   });
   const cameraRef = useRef<Camera>({ x: 0, y: 0, scale: 1 });
   const pointerRef = useRef<{ id: number; x: number; y: number } | null>(null);
   const navigationTimerRef = useRef<number | null>(null);
+  const navigationFrameRef = useRef<number | null>(null);
   const mobileNavToggleRef = useRef<HTMLButtonElement>(null);
   const navigationActive = phase === "exploring";
   const [dragging, setDragging] = useState(false);
   const [activeAnchor, setActiveAnchor] = useState<SceneAnchor | null>("home");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [logoMarkup, setLogoMarkup] = useState("");
   const wordmarkRevealStarted = phase === "thread" || phase === "exploring";
 
-  useLayoutEffect(() => {
-    const wordmark = wordmarkRef.current;
-    if (!wordmark) return;
-
-    const updateWordmarkGeometry = () => {
-      const fontSize = Number.parseFloat(window.getComputedStyle(wordmark).fontSize);
-      const scale = fontSize / WORDMARK_UNITS_PER_EM;
-      const transform = `translate(${WORDMARK_CENTER} ${WORDMARK_BASELINE}) scale(${scale} ${scale}) translate(${-WORDMARK_TOTAL_ADVANCE / 2} 0)`;
-      wordmarkGeometryRef.current?.setAttribute("transform", transform);
-    };
-
-    updateWordmarkGeometry();
-    window.addEventListener("resize", updateWordmarkGeometry);
-    return () => window.removeEventListener("resize", updateWordmarkGeometry);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch("/logo.svg", { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Logo request failed with status ${response.status}`);
+        return response.text();
+      })
+      .then(setLogoMarkup)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) console.error("Unable to load the Spool logo SVG", error);
+      });
+    return () => controller.abort();
   }, []);
 
   const writeCamera = useCallback((camera: Camera) => {
@@ -155,41 +150,71 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
     }
   }, []);
 
+  const finishCameraTransition = useCallback((adoptRendered = true) => {
+    const world = worldRef.current;
+    if (adoptRendered && world && navigationTimerRef.current) {
+      cameraRef.current = renderedCamera(world, cameraRef.current);
+    }
+    if (navigationTimerRef.current) window.clearTimeout(navigationTimerRef.current);
+    if (navigationFrameRef.current !== null) window.cancelAnimationFrame(navigationFrameRef.current);
+    navigationTimerRef.current = null;
+    navigationFrameRef.current = null;
+    if (world) world.style.transition = "none";
+  }, []);
+
   const navigateToAnchor = useCallback((anchor: SceneAnchor) => {
     const metrics = metricsRef.current;
     const world = worldRef.current;
     if (!world || !metrics.width || !metrics.height) return;
 
-    const compact = metrics.width <= 720;
-    const { x, y } = anchorPosition(SCENE_ANCHORS[anchor], compact);
-    const worldOriginX = (metrics.worldWidth - metrics.width) / 2;
-    const worldOriginY = (metrics.worldHeight - metrics.height) / 2;
-    const target = centeredCamera(
-      worldOriginX + (x / 100) * metrics.width,
-      worldOriginY + (y / 100) * metrics.height,
-      metrics,
-    );
+    if (navigationTimerRef.current) {
+      cameraRef.current = renderedCamera(world, cameraRef.current);
+      finishCameraTransition(false);
+      writeCamera(cameraRef.current);
+    }
 
-    if (navigationTimerRef.current) window.clearTimeout(navigationTimerRef.current);
+    const targetAnchor = SCENE_ANCHORS[anchor];
+    let target: Camera;
+    if (targetAnchor === "home") {
+      target = homeCamera(metrics);
+    } else {
+      const compact = metrics.width <= 720;
+      const { x, y } = anchorPosition(targetAnchor, compact);
+      const worldOriginX = (metrics.worldWidth - metrics.width) / 2;
+      const worldOriginY = (metrics.worldHeight - metrics.height) / 2;
+      target = centeredCamera(
+        worldOriginX + (x / 100) * metrics.width,
+        worldOriginY + (y / 100) * metrics.height,
+        metrics,
+      );
+    }
+
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const duration = reducedMotion ? 100 : CAMERA_TRAVEL_MS;
-    world.style.transition = `transform ${duration}ms var(--${reducedMotion ? "ease-out" : "ease-in-out"})`;
-    writeCamera(target);
-    setActiveAnchor(anchor);
-    navigationTimerRef.current = window.setTimeout(() => {
-      if (worldRef.current) worldRef.current.style.transition = "none";
-      navigationTimerRef.current = null;
-    }, duration + 50);
-  }, [writeCamera]);
+    if (reducedMotion) {
+      finishCameraTransition(false);
+      writeCamera(target);
+    } else {
+      const duration = CAMERA_TRAVEL_MS;
+      world.style.transition = `transform ${duration}ms var(--ease-in-out)`;
+      world.style.transform = `translate3d(${target.x}px, ${target.y}px, 0) scale(1)`;
+      const syncRenderedCamera = () => {
+        if (!navigationTimerRef.current || !worldRef.current) return;
+        cameraRef.current = renderedCamera(worldRef.current, cameraRef.current);
+        navigationFrameRef.current = window.requestAnimationFrame(syncRenderedCamera);
+      };
+      navigationFrameRef.current = window.requestAnimationFrame(syncRenderedCamera);
+      navigationTimerRef.current = window.setTimeout(() => {
+        finishCameraTransition(false);
+        writeCamera(target);
+      }, duration + 50);
+    }
 
-  const finishCameraTransition = useCallback(() => {
-    if (navigationTimerRef.current) window.clearTimeout(navigationTimerRef.current);
-    navigationTimerRef.current = null;
-    if (worldRef.current) worldRef.current.style.transition = "none";
-  }, []);
+    setActiveAnchor(anchor);
+  }, [finishCameraTransition, writeCamera]);
 
   useEffect(() => () => {
     if (navigationTimerRef.current) window.clearTimeout(navigationTimerRef.current);
+    if (navigationFrameRef.current !== null) window.cancelAnimationFrame(navigationFrameRef.current);
   }, []);
 
   useEffect(() => {
@@ -212,37 +237,31 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
       if (!bounds.width || !bounds.height) return;
 
       const world = worldRef.current;
-      const artifacts = artifactsRef.current;
-      if (!world || !artifacts) return;
+      if (!world) return;
+
+      if (navigationTimerRef.current) {
+        cameraRef.current = renderedCamera(world, cameraRef.current);
+        finishCameraTransition(false);
+        writeCamera(cameraRef.current);
+      }
 
       const current = cameraRef.current;
-      const itemBounds = Array.from(artifacts.querySelectorAll<HTMLElement>(".world-item"))
-        .map((element) => element.getBoundingClientRect());
-      if (!itemBounds.length) return;
-
+      const previous = metricsRef.current;
       const metrics: WorldMetrics = {
         width: bounds.width,
         height: bounds.height,
         worldWidth: world.offsetWidth,
         worldHeight: world.offsetHeight,
-        contentBounds: {
-          left: Math.min(...itemBounds.map((rect) => rect.left - current.x)),
-          top: Math.min(...itemBounds.map((rect) => rect.top - current.y)),
-          right: Math.max(...itemBounds.map((rect) => rect.right - current.x)),
-          bottom: Math.max(...itemBounds.map((rect) => rect.bottom - current.y)),
-        },
       };
-      const previous = metricsRef.current;
       metricsRef.current = metrics;
 
       const nextCamera = !previous.width || !previous.height
-        ? centeredCamera(metrics.worldWidth / 2, metrics.worldHeight / 2, metrics)
+        ? homeCamera(metrics)
         : centeredCamera(
           previous.width / 2 - current.x,
           previous.height / 2 - current.y,
           metrics,
         );
-      if (world.style.transition) finishCameraTransition();
       writeCamera(nextCamera);
     };
 
@@ -258,18 +277,11 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
 
     const world = worldRef.current;
     if (world && navigationTimerRef.current) {
-      const renderedTransform = window.getComputedStyle(world).transform;
-      const renderedMatrix = new DOMMatrixReadOnly(renderedTransform === "none" ? undefined : renderedTransform);
-      finishCameraTransition();
-      writeCamera(clampCamera({
-        ...cameraRef.current,
-        x: renderedMatrix.m41,
-        y: renderedMatrix.m42,
-      }, metricsRef.current));
-      setActiveAnchor(null);
-    } else {
-      setActiveAnchor(null);
+      const currentRenderedCamera = clampCamera(renderedCamera(world, cameraRef.current), metricsRef.current);
+      finishCameraTransition(false);
+      writeCamera(currentRenderedCamera);
     }
+    setActiveAnchor(null);
 
     pointerRef.current = { id: event.pointerId, x: event.clientX, y: event.clientY };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -319,7 +331,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
         aria-label="Draggable Spool creative world"
       >
         <div className="world-coordinate-space" data-world-coordinate-space ref={worldRef}>
-          <div className="world-artifacts" ref={artifactsRef}>
+          <div className="world-artifacts">
 
         <figure className="world-item opnest-board" style={anchoredStyle("opnest", 354)} aria-label="A generated website with a landscape image">
           <div className="opnest-board__image"><span>opnest</span><small>your calmer internet.</small></div>
@@ -399,30 +411,14 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
           <svg viewBox="0 0 180 94" aria-hidden="true"><path d="m43 20 24-12 27 10-24 13-27-11Zm0 0v23l27 12V31m24-13v24L70 55m48-29 24-11 22 10-23 12-23-11Zm0 0v22l23 12V27m22-12v25l-22 9m-89 24 21-10 19 9-21 11-19-10Zm0 0v18l19 10V73m21-9v18l-21 9" /></svg>
         </div>
 
-        <svg
+        <div
           className="world-item identity-wordmark"
           style={wordmarkStyle()}
-          viewBox="0 0 700 280"
-          preserveAspectRatio="none"
-          ref={wordmarkRef}
           data-reveal-started={wordmarkRevealStarted || undefined}
           role="img"
           aria-label="Spool"
-        >
-          <title>Spool</title>
-          <g ref={wordmarkGeometryRef} className="thread-logo__wordmark">
-            {WORDMARK_GLYPHS.map((glyph, index) => (
-              <g key={`wordmark-position-${index}`} transform={`translate(${glyph.x} 0)`}>
-                <g
-                  className="thread-logo__letter"
-                  style={{ "--letter-delay": `${index * WORDMARK_LETTER_STAGGER_MS}ms` } as CSSProperties}
-                >
-                  <path d={glyph.d} />
-                </g>
-              </g>
-            ))}
-          </g>
-        </svg>
+          dangerouslySetInnerHTML={{ __html: logoMarkup }}
+        />
         <aside className="world-item pencil-note pencil-note--styles" style={itemStyle(24, 76, 126, 8)}>
           Different styles.<br />Same ideas. <span>↗</span>
         </aside>
@@ -496,7 +492,7 @@ export default function WorldCanvas({ phase }: { phase: WorldPhase }) {
           Explore <span aria-hidden="true">{mobileNavOpen ? "−" : "+"}</span>
         </button>
         <nav className="site-links" id="spool-main-navigation" aria-label="Main navigation" data-open={mobileNavOpen}>
-          {(Object.keys(SCENE_ANCHORS) as SceneAnchor[]).map((anchor) => (
+          {SCENE_NAV_ITEMS.map((anchor) => (
             <button
               key={anchor}
               type="button"
