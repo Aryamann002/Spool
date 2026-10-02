@@ -1,5 +1,6 @@
 mod canvas;
 mod diagnostics;
+mod document_runtime_bridge;
 mod layers;
 pub mod project_bundle;
 pub mod source_binding;

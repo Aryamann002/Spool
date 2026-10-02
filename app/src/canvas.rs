@@ -215,7 +215,10 @@ impl Camera {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+// `Ord` is additive: it lets the runtime projection key a `BTreeMap` by
+// `ObjectId` so projection order is deterministic. No existing behaviour
+// depends on this, and `ObjectId` remains a runtime lookup key, not identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
 
 impl ObjectId {

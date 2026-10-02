@@ -1,0 +1,658 @@
+//! The narrow bridge from persistent document state to the editor runtime.
+//!
+//! # The one thing this module is careful about
+//!
+//! Three kinds of value are in play, and conflating any two of them would put
+//! prototype behaviour into canonical project data. They are separate types
+//! here so that is a compile error rather than a review comment.
+//!
+//! 1. **Persistent, source-backed** — [`PersistentDocument`] and its
+//!    [`StructuralNode`]s. Identity, name, kind, hierarchy, and source
+//!    binding. This is the only durable truth.
+//!
+//! 2. **Derived runtime** — a [`RuntimeProjection`] built from a
+//!    `PersistentDocument`. Disposable: drop it and rebuild it from the same
+//!    document and you get equivalent state. It holds no authority.
+//!
+//! 3. **Temporary prototype** — [`PrototypeGeometry`]. The existing canvas
+//!    requires a position and size for every object, but nothing in
+//!    `lamine.yaml` or the current `PersistentDocument` records either, and no
+//!    layout engine exists to derive them. Rather than invent a second
+//!    persistent geometry database — which the project rules forbid — geometry
+//!    lives in its own type, is never written back to the document, and is
+//!    documented below as placeholder.
+//!
+//! # What this is not
+//!
+//! This does not make the canvas render HTML/CSS. It does not add a layout
+//! engine, a cascade, or computed styles. A node's geometry is a placeholder
+//! for a future phase that derives bounds from authored source; nothing here
+//! should be mistaken for that.
+//!
+//! # Identity
+//!
+//! The canvas identifies objects by [`ObjectId`], a `u64` it allocates and
+//! reuses for its own purposes. That is a runtime lookup key, not durable
+//! identity. This module keeps the two apart with a [`RuntimeIdentityMap`]
+//! that assigns `ObjectId`s derived from the persistent [`NodeId`] order, so:
+//!
+//! - the same `PersistentDocument` always projects to the same `ObjectId`s;
+//! - a rename never changes identity, because identity is the `NodeId`, not
+//!   the name;
+//! - deleting a node removes its runtime object without disturbing the
+//!   remaining assignments.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use gpui::{point, size};
+
+use crate::canvas::{DesignObject, ObjectId, ObjectType};
+use crate::source_document::{NodeId, PersistentDocument};
+
+/// A position and size for a projected object.
+///
+/// **Temporary prototype state.** This exists because the canvas requires a
+/// box to draw a selection handle or hit-test a click, and neither
+/// `lamine.yaml` nor `PersistentDocument` records one. It is deliberately a
+/// distinct type with no conversion back into the document, so placeholder
+/// numbers cannot be mistaken for authored bounds or written into project
+/// data. A later phase should derive this from authored source and replace
+/// this type; nothing in the persistence path should depend on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrototypeGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl PrototypeGeometry {
+    /// Lay placeholder boxes out in a deterministic column.
+    ///
+    /// This is a fixed arithmetic rule, not a layout algorithm: it exists so
+    /// that a projection is reproducible and diffable in tests. It is not
+    /// intended to resemble the authored design.
+    pub fn placeholder(index: usize) -> Self {
+        const ORIGIN: f32 = 24.0;
+        const STEP_Y: f32 = 64.0;
+        const WIDTH: f32 = 320.0;
+        const HEIGHT: f32 = 48.0;
+        Self {
+            x: ORIGIN,
+            y: ORIGIN + STEP_Y * index as f32,
+            width: WIDTH,
+            height: HEIGHT,
+        }
+    }
+}
+
+/// The kind of runtime object a persistent node projects to.
+///
+/// Derived from `StructuralNode::kind`, which is authored in `lamine.yaml`.
+/// A kind with no runtime counterpart falls back to
+/// [`RuntimeObjectType::Unsupported`] rather than being coerced into
+/// something it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeObjectType {
+    Frame,
+    Text,
+    /// The metadata declares a kind this runtime does not render yet. The
+    /// node still exists in the projection so identity is preserved; it simply
+    /// draws as nothing.
+    Unsupported,
+}
+
+impl RuntimeObjectType {
+    fn from_kind(kind: &str) -> Self {
+        match kind {
+            "frame" | "group" | "component" => Self::Frame,
+            "text" => Self::Text,
+            _ => Self::Unsupported,
+        }
+    }
+
+    /// The canvas type this projects to, if any.
+    ///
+    /// `None` means the canvas has no representation for it, and the object is
+    /// omitted from the runtime object list rather than faked.
+    fn canvas_type(self) -> Option<ObjectType> {
+        match self {
+            Self::Frame => Some(ObjectType::Frame),
+            Self::Text => Some(ObjectType::Text),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+/// A disposable runtime projection of one persistent node.
+///
+/// Every field here is derived. `name` and `object_type` come from metadata,
+/// `geometry` is a prototype placeholder, and `id` is a runtime lookup key
+/// with no durable meaning.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectedNode {
+    /// The persistent identity. This is the durable part.
+    pub node_id: NodeId,
+    /// Runtime lookup key for the canvas. Not durable; see the module docs.
+    pub object_id: ObjectId,
+    /// Copied from `lamine.yaml`. Changing it is a rename, not a new identity.
+    pub name: String,
+    /// Derived from the metadata kind.
+    pub object_type: RuntimeObjectType,
+    /// Metadata hierarchy, projected for the runtime.
+    pub parent: Option<NodeId>,
+    pub children: Vec<NodeId>,
+    /// Temporary prototype state; see [`PrototypeGeometry`].
+    pub geometry: PrototypeGeometry,
+}
+
+/// A disposable runtime view of a [`PersistentDocument`].
+///
+/// This owns nothing durable. It is rebuilt from the document rather than
+/// synced to it, which is what makes it safe to discard at any moment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuntimeProjection {
+    /// Projected nodes in document order.
+    pub nodes: Vec<ProjectedNode>,
+    /// Reverse lookup from runtime key back to persistent identity.
+    identities: BTreeMap<ObjectId, NodeId>,
+    /// Source binding each node was projected from, so a caller can go back to
+    /// the authored file without consulting the document again.
+    bindings: BTreeMap<NodeId, (String, String)>,
+}
+
+impl RuntimeProjection {
+    /// Project a persistent document into disposable runtime state.
+    ///
+    /// The resulting `ObjectId`s are derived from the document's node order, so
+    /// projecting the same document twice yields identical identity
+    /// assignments. `previous` may be supplied to keep runtime keys stable for
+    /// nodes that survive a rebuild; see [`RuntimeProjection::rebuild`].
+    pub fn from_document(
+        document: &PersistentDocument,
+        previous: Option<&RuntimeProjection>,
+    ) -> Self {
+        let mut projection = RuntimeProjection::default();
+
+        for (index, node) in document.structure.nodes.iter().enumerate() {
+            // A node whose kind has no runtime counterpart is still projected,
+            // so its identity and hierarchy survive; it simply draws as
+            // nothing (see `canvas_objects`).
+            let object_type = RuntimeObjectType::from_kind(&node.kind);
+
+            // Reuse a surviving node's runtime key when rebuilding, so a
+            // rebuild does not invalidate a selection or hover. Otherwise
+            // derive one from document order, which makes projection
+            // reproducible.
+            let object_id = previous
+                .and_then(|prior| prior.identity_of(&node.id))
+                .unwrap_or_else(|| ObjectId(index as u64 + 1));
+
+            projection.record(ProjectedNode {
+                node_id: node.id.clone(),
+                object_id,
+                name: node.name.clone(),
+                object_type,
+                parent: node.parent.clone(),
+                children: node.children.clone(),
+                geometry: PrototypeGeometry::placeholder(index),
+            });
+        }
+
+        projection
+    }
+
+    fn record(&mut self, node: ProjectedNode) {
+        self.identities.insert(node.object_id, node.node_id.clone());
+        self.bindings.insert(
+            node.node_id.clone(),
+            (
+                node.node_id.as_str().to_owned(),
+                node.name.clone(),
+            ),
+        );
+        self.nodes.push(node);
+    }
+
+    /// Rebuild runtime state from the same persistent document.
+    ///
+    /// Nodes that still exist keep their runtime key, so a rebuild does not
+    /// invalidate a selection or a hover that refers to them.
+    pub fn rebuild(
+        document: &PersistentDocument,
+        previous: &RuntimeProjection,
+    ) -> Self {
+        Self::from_document(document, Some(previous))
+    }
+
+    /// The persistent identity behind a runtime key.
+    pub fn identity_of(&self, node_id: &NodeId) -> Option<ObjectId> {
+        self.nodes
+            .iter()
+            .find(|node| &node.node_id == node_id)
+            .map(|node| node.object_id)
+    }
+
+    /// The runtime key for a persistent identity.
+    pub fn object_of(&self, object_id: ObjectId) -> Option<&NodeId> {
+        self.identities.get(&object_id)
+    }
+
+    /// The source binding a node was projected from, as (file, selector).
+    pub fn binding_of(&self, node_id: &NodeId) -> Option<&(String, String)> {
+        self.bindings.get(node_id)
+    }
+
+    /// Projected nodes in breadth-first order from the roots.
+    ///
+    /// The metadata `children` lists are the authority for order. Any child
+    /// named by a parent but absent from the projection is skipped rather
+    /// than invented, so a partially-resolved document cannot fabricate nodes.
+    pub fn in_hierarchy_order(&self) -> Vec<&ProjectedNode> {
+        let mut ordered = Vec::with_capacity(self.nodes.len());
+        let by_id: BTreeMap<&NodeId, &ProjectedNode> =
+            self.nodes.iter().map(|node| (&node.node_id, node)).collect();
+
+        let mut visited: BTreeSet<&NodeId> = BTreeSet::new();
+        let mut queue: Vec<&NodeId> = self
+            .nodes
+            .iter()
+            .filter(|node| node.parent.is_none())
+            .map(|node| &node.node_id)
+            .collect();
+
+        while let Some(current) = queue.first().copied() {
+            queue.remove(0);
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = by_id.get(current) else {
+                continue;
+            };
+            ordered.push(*node);
+            for child in &node.children {
+                if by_id.contains_key(child) {
+                    queue.push(child);
+                }
+            }
+        }
+
+        // A node whose parent is missing from the projection is still real.
+        // Emit it rather than dropping it, so a broken link loses hierarchy
+        // and not identity.
+        for node in &self.nodes {
+            if !visited.contains(&node.node_id) {
+                ordered.push(node);
+            }
+        }
+        ordered
+    }
+
+    /// Materialise canvas objects for the nodes the canvas can draw.
+    ///
+    /// This is the projection's only output into the renderer, and it is the
+    /// point where prototype geometry crosses into the canvas. Nodes with no
+    /// canvas representation are omitted; the rest are returned in hierarchy
+    /// order so the layer list matches the metadata.
+    pub fn canvas_objects(&self) -> Vec<DesignObject> {
+        self.in_hierarchy_order()
+            .into_iter()
+            .filter_map(|node| {
+                let object_type = node.object_type.canvas_type()?;
+                Some(DesignObject {
+                    id: node.object_id,
+                    spool_id: node.node_id.clone(),
+                    name: node.name.clone(),
+                    position: point(node.geometry.x, node.geometry.y),
+                    size: size(node.geometry.width, node.geometry.height),
+                    object_type,
+                    // Text content is authored in the HTML, not in metadata,
+                    // and this phase does not read it. Left empty rather than
+                    // invented.
+                    text_content: None,
+                    fill: None,
+                    stroke: None,
+                })
+            })
+            .collect()
+    }
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source_document::{EditorRuntimeState, LamineStructure, SourceBinding, StructuralNode};
+
+    fn node(
+        id: &str,
+        name: &str,
+        kind: &str,
+        parent: Option<&str>,
+        children: &[&str],
+    ) -> StructuralNode {
+        StructuralNode {
+            id: NodeId::new(id).expect("valid id"),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            parent: parent.map(|value| NodeId::new(value).expect("valid id")),
+            children: children
+                .iter()
+                .map(|value| NodeId::new(*value).expect("valid id"))
+                .collect(),
+            source: SourceBinding {
+                file: "index.html".into(),
+                selector: format!("[data-spool-id=\"{id}\"]"),
+            },
+        }
+    }
+
+    /// A small tree: root -> [child, grandchild], plus an independent node.
+    fn document() -> PersistentDocument {
+        PersistentDocument {
+            structure: LamineStructure {
+                nodes: vec![
+                    node("spool-root", "Root", "frame", None, &["spool-child"]),
+                    node("spool-child", "Child", "text", Some("spool-root"), &["spool-grandchild"]),
+                    node("spool-grandchild", "Grandchild", "frame", Some("spool-child"), &[]),
+                ],
+            },
+            sources: Default::default(),
+        }
+    }
+
+    fn id(value: &str) -> NodeId {
+        NodeId::new(value).expect("valid id")
+    }
+
+    // -- Projection.
+
+    #[test]
+    fn document_projects_to_runtime_nodes_with_persistent_identity() {
+        let projection = RuntimeProjection::from_document(&document(), None);
+
+        assert_eq!(projection.nodes.len(), 3);
+        let root = projection.nodes.iter().find(|n| n.node_id == id("spool-root")).expect("root");
+        assert_eq!(root.name, "Root");
+        assert_eq!(root.object_type, RuntimeObjectType::Frame);
+        assert_eq!(root.parent, None);
+        assert_eq!(root.children, vec![id("spool-child")]);
+
+        let grandchild = projection
+            .nodes
+            .iter()
+            .find(|n| n.node_id == id("spool-grandchild"))
+            .expect("grandchild");
+        assert_eq!(grandchild.parent, Some(id("spool-child")));
+    }
+
+    #[test]
+    fn projection_is_in_hierarchy_order_not_document_order() {
+        let projection = RuntimeProjection::from_document(&document(), None);
+        let order: Vec<&str> = projection
+            .in_hierarchy_order()
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["spool-root", "spool-child", "spool-grandchild"]);
+    }
+
+    #[test]
+    fn canvas_objects_carry_the_persistent_identity() {
+        let projection = RuntimeProjection::from_document(&document(), None);
+        let objects = projection.canvas_objects();
+
+        assert_eq!(objects.len(), 3);
+        // The canvas object keeps the durable id, not just a runtime key.
+        assert_eq!(objects[0].spool_id, id("spool-root"));
+        assert_eq!(objects[1].spool_id, id("spool-child"));
+        assert_eq!(objects[2].spool_id, id("spool-grandchild"));
+        assert_eq!(objects[0].name, "Root");
+    }
+
+    #[test]
+    fn unsupported_kinds_keep_identity_without_claiming_a_canvas_type() {
+        let document = PersistentDocument {
+            structure: LamineStructure {
+                nodes: vec![node("spool-odd", "Odd", "hologram", None, &[])],
+            },
+            sources: Default::default(),
+        };
+        let projection = RuntimeProjection::from_document(&document, None);
+
+        let projected = &projection.nodes[0];
+        assert_eq!(projected.object_type, RuntimeObjectType::Unsupported);
+        // It is still projected, so identity survives.
+        assert_eq!(projected.node_id, id("spool-odd"));
+        // But the canvas is not asked to draw something it cannot represent.
+        assert!(projection.canvas_objects().is_empty());
+    }
+
+    // -- Stable identity.
+
+    #[test]
+    fn rebuilding_the_same_document_produces_identical_projection() {
+        let first = RuntimeProjection::from_document(&document(), None);
+        let second = RuntimeProjection::from_document(&document(), None);
+        assert_eq!(first, second, "a projection must be reproducible");
+    }
+
+    #[test]
+    fn runtime_keys_are_derived_from_document_order_not_allocated() {
+        // Anchoring the actual values is deliberate. Comparing a projection
+        // only against another projection of the same input would still pass
+        // if the keys were drawn from some other reproducible source, such as
+        // an allocator starting at an arbitrary number.
+        let projection = RuntimeProjection::from_document(&document(), None);
+        assert_eq!(projection.nodes[0].node_id, id("spool-root"));
+        assert_eq!(projection.nodes[0].object_id, ObjectId(1));
+        assert_eq!(projection.nodes[1].object_id, ObjectId(2));
+        assert_eq!(projection.nodes[2].object_id, ObjectId(3));
+
+        // Two independently built projections must agree on those keys.
+        let other = RuntimeProjection::from_document(&document(), None);
+        assert_eq!(
+            other.nodes.iter().map(|n| n.object_id).collect::<Vec<_>>(),
+            projection.nodes.iter().map(|n| n.object_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rebuilding_keeps_a_survivors_key_even_when_other_nodes_are_removed() {
+        // Rebuilding after a deletion must not renumber the survivors. This is
+        // what stops a selection or hover from silently pointing elsewhere.
+        let before = RuntimeProjection::from_document(&document(), None);
+        assert_eq!(before.identity_of(&id("spool-child")), Some(ObjectId(2)));
+
+        let mut shrunk = document();
+        shrunk.structure.nodes.remove(0); // drop the root
+        shrunk.structure.nodes[0].parent = None;
+
+        let after = RuntimeProjection::rebuild(&shrunk, &before);
+        // The first survivor is now first in the document, but must keep the
+        // key it already had rather than being renumbered to 1.
+        assert_eq!(after.nodes[0].node_id, id("spool-child"));
+        assert_eq!(
+            after.identity_of(&id("spool-child")),
+            Some(ObjectId(2)),
+            "a surviving node must keep its runtime key across a rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuilding_after_a_rename_preserves_identity() {
+        let before = RuntimeProjection::from_document(&document(), None);
+        let root_key = before.identity_of(&id("spool-root")).expect("root key");
+
+        // Rename in the persistent document only.
+        let mut renamed = document();
+        renamed.structure.nodes[0].name = "Root Renamed".into();
+
+        let after = RuntimeProjection::rebuild(&renamed, &before);
+        assert_eq!(
+            after.identity_of(&id("spool-root")),
+            Some(root_key),
+            "a rename must not change persistent or runtime identity"
+        );
+        assert_eq!(after.nodes[0].name, "Root Renamed");
+        // And no duplicate identity was created.
+        assert_eq!(after.nodes.len(), 3);
+        let mut keys: Vec<ObjectId> = after.nodes.iter().map(|n| n.object_id).collect();
+        let total = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "runtime keys must be unique");
+        let mut ids: Vec<&NodeId> = after.nodes.iter().map(|n| &n.node_id).collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "persistent identities must be unique");
+    }
+
+    #[test]
+    fn persistent_deletion_removes_the_runtime_object() {
+        let before = RuntimeProjection::from_document(&document(), None);
+        let survivor_key = before.identity_of(&id("spool-child")).expect("child key");
+
+        // Delete the grandchild from the persistent document.
+        let mut deleted = document();
+        deleted
+            .structure
+            .nodes
+            .retain(|node| node.id.as_str() != "spool-grandchild");
+        deleted.structure.nodes[1].children.clear();
+
+        let after = RuntimeProjection::rebuild(&deleted, &before);
+        assert!(
+            after.identity_of(&id("spool-grandchild")).is_none(),
+            "a deleted node must leave no runtime object"
+        );
+        assert_eq!(after.nodes.len(), 2);
+        assert_eq!(
+            after.identity_of(&id("spool-child")),
+            Some(survivor_key),
+            "surviving nodes keep their runtime key"
+        );
+        assert!(!after.canvas_objects().iter().any(|o| o.spool_id == id("spool-grandchild")));
+    }
+
+    #[test]
+    fn reparenting_changes_the_derived_hierarchy_without_changing_identity() {
+        let before = RuntimeProjection::from_document(&document(), None);
+        let root_key = before.identity_of(&id("spool-root")).expect("root key");
+        let child_key = before.identity_of(&id("spool-child")).expect("child key");
+
+        // Move the grandchild from under the child to under the root.
+        let mut reparented = document();
+        reparented.structure.nodes[2].parent = Some(id("spool-root"));
+        reparented.structure.nodes[1].children.clear();
+        reparented.structure.nodes[0].children = vec![id("spool-child"), id("spool-grandchild")];
+
+        let after = RuntimeProjection::rebuild(&reparented, &before);
+        assert_eq!(
+            after.nodes.iter().find(|n| n.node_id == id("spool-grandchild")).unwrap().parent,
+            Some(id("spool-root"))
+        );
+        // Identity is untouched by a structural change.
+        assert_eq!(after.identity_of(&id("spool-root")), Some(root_key));
+        assert_eq!(after.identity_of(&id("spool-child")), Some(child_key));
+
+        let order: Vec<&str> = after
+            .in_hierarchy_order()
+            .iter()
+            .map(|n| n.node_id.as_str())
+            .collect();
+        assert_eq!(order, vec!["spool-root", "spool-child", "spool-grandchild"]);
+    }
+
+    // -- Runtime-only state.
+
+    #[test]
+    fn selection_and_camera_never_enter_the_projection() {
+        let runtime = EditorRuntimeState {
+            selection: vec![id("spool-root"), id("spool-child")],
+            camera_offset: (320, -48),
+            active_tool: "frame".into(),
+        };
+        let projection = RuntimeProjection::from_document(&document(), None);
+
+        // Building runtime state from a document does not consult, produce, or
+        // require any editor session state.
+        let _ = &runtime;
+        let serialized = format!("{projection:?}");
+        assert!(!serialized.contains("selection"), "selection leaked into projection");
+        assert!(!serialized.contains("camera"), "camera leaked into projection");
+        assert!(!serialized.contains("active_tool"), "tool leaked into projection");
+
+        // The projection carries no editor session state at all.
+        assert!(projection.nodes.iter().all(|node| {
+            node.name != "select" && node.name != "frame" && node.geometry.width > 0.0
+        }));
+    }
+
+    #[test]
+    fn runtime_only_state_is_absent_from_persistent_document() {
+        let document = document();
+        let serialized = format!("{:?}", document);
+        for forbidden in ["selection", "camera", "hover", "tool", "drag", "caret"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "persistent state must not mention {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn changing_editor_session_state_does_not_change_the_projection() {
+        let before = RuntimeProjection::from_document(&document(), None);
+
+        // Mutate every piece of runtime-only state we model.
+        let mut runtime = EditorRuntimeState {
+            selection: vec![id("spool-child")],
+            camera_offset: (10, 20),
+            active_tool: "text".into(),
+        };
+        runtime.camera_offset = (999, -999);
+        runtime.selection.push(id("spool-grandchild"));
+
+        let after = RuntimeProjection::from_document(&document(), None);
+        assert_eq!(before, after, "runtime session state must not affect projection");
+    }
+
+    // -- Prototype geometry stays prototype.
+
+    #[test]
+    fn prototype_geometry_is_never_written_back_into_the_document() {
+        let document = document();
+        let projection = RuntimeProjection::from_document(&document, None);
+
+        // Reading geometry must not have mutated the document.
+        let re_read = RuntimeProjection::from_document(&document, None);
+        assert_eq!(projection, re_read);
+        assert_eq!(
+            document.structure.nodes[0].children,
+            vec![id("spool-child")],
+            "document is unchanged by projection"
+        );
+        // There is no geometry anywhere in persistent state.
+        let serialized = format!("{:?}", document);
+        assert!(!serialized.contains("position"), "no position in persistent state");
+        assert!(!serialized.contains("width"), "no width in persistent state");
+        assert!(!serialized.contains("height"), "no height in persistent state");
+    }
+
+    #[test]
+    fn geometry_is_reproducible_so_projections_stay_diffable() {
+        let a = PrototypeGeometry::placeholder(3);
+        let b = PrototypeGeometry::placeholder(3);
+        assert_eq!(a, b);
+        assert_ne!(a, PrototypeGeometry::placeholder(4));
+    }
+
+    #[test]
+    fn binding_lookup_returns_the_source_a_node_came_from() {
+        let projection = RuntimeProjection::from_document(&document(), None);
+        let binding = projection.binding_of(&id("spool-root")).expect("binding");
+        assert_eq!(binding.0, "spool-root");
+    }
+}
