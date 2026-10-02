@@ -10,6 +10,8 @@ gpui_platform = {
     features = ["font-kit"]
 }
 serde_json = "1"
+tree-sitter = "0.27.0"
+tree-sitter-html = "0.23.2"
 # smallvec is included here for convenience, it is used by gpui when creating
 # components that can have children. uncomment this line or
 # use `cargo add smallvec` to add it to your project

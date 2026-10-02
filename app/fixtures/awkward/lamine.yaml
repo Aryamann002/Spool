@@ -1,0 +1,44 @@
+version: 1
+nodes:
+  - id: "spool-frame-root"
+    name: "Loose Frame"
+    kind: "frame"
+    parent: null
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-frame-root\"]"
+    children: ["spool-text-headline", "spool-text-body", "spool-cta-primary", "spool-image-mark"]
+  - id: "spool-text-headline"
+    name: "Headline"
+    kind: "text"
+    parent: "spool-frame-root"
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-text-headline\"]"
+    children: []
+  - id: "spool-text-body"
+    name: "Body Copy"
+    kind: "text"
+    parent: "spool-frame-root"
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-text-body\"]"
+    children: ["spool-text-emphasis"]
+  - id: "spool-text-emphasis"
+    name: "Emphasis"
+    kind: "text"
+    parent: "spool-text-body"
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-text-emphasis\"]"
+    children: []
+  - id: "spool-cta-primary"
+    name: "Primary CTA"
+    kind: "frame"
+    parent: "spool-frame-root"
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-cta-primary\"]"
+    children: []
+  - id: "spool-image-mark"
+    name: "Mark"
+    kind: "image"
+    parent: "spool-frame-root"
+    file: "loose.html"
+    selector: "[data-spool-id=\"spool-image-mark\"]"
+    children: []
