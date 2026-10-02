@@ -409,6 +409,10 @@ mod tests {
         assert_eq!(objects[1].spool_id, id("spool-child"));
         assert_eq!(objects[2].spool_id, id("spool-grandchild"));
         assert_eq!(objects[0].name, "Root");
+
+        // The reverse lookup resolves a runtime key back to durable identity.
+        assert_eq!(projection.object_of(objects[1].id), Some(&id("spool-child")));
+        assert_eq!(projection.object_of(ObjectId(999)), None);
     }
 
     #[test]

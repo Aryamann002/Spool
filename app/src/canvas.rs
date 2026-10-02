@@ -25,7 +25,11 @@ gpui::actions!(
     ]
 );
 
-use crate::{diagnostics, source_document::NodeId, theme};
+use crate::{
+    diagnostics,
+    operations::{OperationError, SemanticHistory, SemanticOperation},
+    source_document::NodeId, theme,
+};
 
 #[cfg(debug_assertions)]
 #[path = "canvas_workloads.rs"]
@@ -376,9 +380,16 @@ pub struct TextChange {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct ObjectPlacement {
-    object: DesignObject,
-    index: usize,
+pub struct ObjectPlacement {
+    pub object: DesignObject,
+    pub index: usize,
+}
+
+/// Which way a command is being replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayDirection {
+    Undo,
+    Redo,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -402,35 +413,130 @@ impl DocumentCommand {
         }
     }
 
-    fn style(changes: Vec<StyleChange>) -> Self {
+    pub fn style(changes: Vec<StyleChange>) -> Self {
         Self {
             operation: CommandOperation::Style(changes),
         }
     }
 
-    fn text(changes: Vec<TextChange>) -> Self {
+    pub fn text(changes: Vec<TextChange>) -> Self {
         Self {
             operation: CommandOperation::Text(changes),
         }
     }
 
-    fn insert(objects: Vec<ObjectPlacement>) -> Self {
+    pub fn insert(objects: Vec<ObjectPlacement>) -> Self {
         Self {
             operation: CommandOperation::Insert(objects),
         }
     }
 
-    fn delete(objects: Vec<ObjectPlacement>) -> Self {
+    pub fn delete(objects: Vec<ObjectPlacement>) -> Self {
         Self {
             operation: CommandOperation::Delete(objects),
         }
     }
 }
 
+impl DocumentCommand {
+    /// Whether applying this command would change nothing.
+    ///
+    /// A no-op command never enters history, so a gesture that ends where it
+    /// started produces no entry and does not clear redo.
+    pub fn is_noop(&self) -> bool {
+        match &self.operation {
+            CommandOperation::Geometry(changes) => changes.iter().all(|c| c.before == c.after),
+            CommandOperation::Style(changes) => changes.iter().all(|c| c.before == c.after),
+            CommandOperation::Text(changes) => changes.iter().all(|c| c.before == c.after),
+            CommandOperation::Insert(objects) | CommandOperation::Delete(objects) => {
+                objects.is_empty()
+            }
+        }
+    }
+
+    /// Check the command can apply, before any state changes.
+    pub fn validate(&self, document: &Document) -> Result<(), OperationError> {
+        // Only in-place edits need their target present. An insert adds the
+        // objects, and a delete has already removed them, so requiring
+        // presence there would reject every legitimate command.
+        let ids: Vec<ObjectId> = match &self.operation {
+            CommandOperation::Geometry(changes) => changes.iter().map(|c| c.id).collect(),
+            CommandOperation::Style(changes) => changes.iter().map(|c| c.id).collect(),
+            CommandOperation::Text(changes) => changes.iter().map(|c| c.id).collect(),
+            CommandOperation::Insert(_) | CommandOperation::Delete(_) => Vec::new(),
+        };
+        for id in ids {
+            if document.object(id).is_none() {
+                return Err(OperationError::MissingObject(id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the command in one direction. This is the undo/redo mechanism:
+    /// each variant replays `before` or `after`, and insert/delete are
+    /// symmetric inverses by construction.
+    pub fn replay(&self, document: &mut Document, direction: ReplayDirection) {
+        let forward = matches!(direction, ReplayDirection::Redo);
+        match &self.operation {
+            CommandOperation::Geometry(changes) => {
+                for change in changes {
+                    document.set_geometry(change.id, if forward { change.after } else { change.before });
+                }
+            }
+            CommandOperation::Style(changes) => {
+                for change in changes {
+                    document.set_style(change.id, if forward { change.after } else { change.before });
+                }
+            }
+            CommandOperation::Text(changes) => {
+                for change in changes {
+                    document.set_text_content(
+                        change.id,
+                        if forward { change.after.clone() } else { change.before.clone() },
+                    );
+                }
+            }
+            CommandOperation::Insert(objects) => {
+                // Undoing an insert removes what it added; redoing restores it.
+                if forward {
+                    document.insert_objects(objects);
+                } else {
+                    let ids: Vec<ObjectId> =
+                        objects.iter().map(|placement| placement.object.id).collect();
+                    document.remove_objects(&ids);
+                }
+            }
+            CommandOperation::Delete(objects) => {
+                // Undoing a delete puts the removed objects back.
+                if forward {
+                    let ids: Vec<ObjectId> =
+                        objects.iter().map(|placement| placement.object.id).collect();
+                    document.remove_objects(&ids);
+                } else {
+                    document.insert_objects(objects);
+                }
+            }
+        }
+    }
+
+    /// A copy with the no-op entries removed.
+    fn normalized(mut self) -> Self {
+        match &mut self.operation {
+            CommandOperation::Geometry(changes) => changes.retain(|c| c.before != c.after),
+            CommandOperation::Style(changes) => changes.retain(|c| c.before != c.after),
+            CommandOperation::Text(changes) => changes.retain(|c| c.before != c.after),
+            CommandOperation::Insert(_) | CommandOperation::Delete(_) => {}
+        }
+        self
+    }
+}
+
 #[derive(Default)]
 pub struct History {
-    undo: Vec<DocumentCommand>,
-    redo: Vec<DocumentCommand>,
+    /// The unified stack. Every canvas command goes through this, and so does
+    /// every persistent operation, so there is exactly one undo model.
+    inner: SemanticHistory,
 }
 
 #[derive(Clone, Debug)]
@@ -492,6 +598,21 @@ impl Default for Document {
 }
 
 impl Document {
+    /// A document with no objects.
+    ///
+    /// `Document::default()` is the canvas starter scene, which is populated
+    /// with four demonstration frames. Anything that needs a blank document —
+    /// a test, or a runtime built purely from a projection — wants this.
+    pub fn empty() -> Self {
+        Self {
+            objects: Vec::new(),
+            next_id: 1,
+            next_node_id: 1,
+            next_names: [1; 4],
+            layer_structure_revision: 0,
+        }
+    }
+
     pub fn layer_structure_revision(&self) -> u64 {
         self.layer_structure_revision
     }
@@ -543,7 +664,33 @@ impl Document {
         format!("{} {number}", object_type.label())
     }
 
-    fn create_object(
+    /// Capture the current geometry of the given objects.
+    ///
+    /// Used to open a gesture and to build the `before` half of a geometry
+    /// command. This is a handful of small values per gesture, not a copy of
+    /// the document.
+    pub fn snapshot_objects(&self, ids: &[ObjectId]) -> Vec<ObjectSnapshot> {
+        ids.iter()
+            .filter_map(|id| {
+                self.object(*id)
+                    .map(|object| ObjectSnapshot { id: *id, geometry: object.geometry() })
+            })
+            .collect()
+    }
+
+    /// The current geometry of one object.
+    pub fn geometry_of(&self, id: ObjectId) -> Option<Geometry> {
+        self.object(id).map(|object| object.geometry())
+    }
+
+    /// Restore previously captured geometry, undoing a cancelled gesture.
+    pub fn restore_snapshots(&mut self, snapshots: &[ObjectSnapshot]) {
+        for snapshot in snapshots {
+            self.set_geometry(snapshot.id, snapshot.geometry);
+        }
+    }
+
+    pub fn create_object(
         &mut self,
         object_type: ObjectType,
         position: Point<f32>,
@@ -579,7 +726,7 @@ impl Document {
         true
     }
 
-    fn insert_objects(&mut self, placements: &[ObjectPlacement]) {
+    pub fn insert_objects(&mut self, placements: &[ObjectPlacement]) {
         let mut placements = placements.to_vec();
         placements.sort_by_key(|placement| placement.index);
         for placement in placements {
@@ -595,7 +742,7 @@ impl Document {
         })
     }
 
-    fn remove_objects(&mut self, ids: &[ObjectId]) -> Vec<ObjectPlacement> {
+    pub fn remove_objects(&mut self, ids: &[ObjectId]) -> Vec<ObjectPlacement> {
         let removed: Vec<_> = self
             .objects
             .iter()
@@ -611,7 +758,7 @@ impl Document {
         removed
     }
 
-    fn duplicate_objects(&mut self, ids: &[ObjectId]) -> Vec<ObjectPlacement> {
+    pub fn duplicate_objects(&mut self, ids: &[ObjectId]) -> Vec<ObjectPlacement> {
         let originals: Vec<_> = self
             .objects
             .iter()
@@ -638,7 +785,7 @@ impl Document {
         })
     }
 
-    fn set_style(&mut self, id: ObjectId, style: ObjectStyle) -> bool {
+    pub fn set_style(&mut self, id: ObjectId, style: ObjectStyle) -> bool {
         let Some(object) = self.objects.iter_mut().find(|object| object.id == id) else {
             return false;
         };
@@ -695,109 +842,56 @@ impl Document {
 }
 
 impl History {
-    pub fn record(&mut self, mut command: DocumentCommand) {
-        match &mut command.operation {
-            CommandOperation::Geometry(changes) => {
-                changes.retain(|change| change.before != change.after);
-                if changes.is_empty() {
-                    return;
-                }
-            }
-            CommandOperation::Style(changes) => {
-                changes.retain(|change| change.before != change.after);
-                if changes.is_empty() {
-                    return;
-                }
-            }
-            CommandOperation::Text(changes) => {
-                changes.retain(|change| change.before != change.after);
-                if changes.is_empty() {
-                    return;
-                }
-            }
-            CommandOperation::Insert(objects) | CommandOperation::Delete(objects)
-                if objects.is_empty() =>
-            {
-                return;
-            }
-            CommandOperation::Insert(_) | CommandOperation::Delete(_) => {}
+    /// Commit a canvas command.
+    ///
+    /// This is a facade over the unified `SemanticHistory` stack, kept so the
+    /// canvas call sites and their tests are unchanged. No-op commands are
+    /// dropped before they reach a stack.
+    pub fn record(&mut self, command: DocumentCommand) {
+        let command = command.normalized();
+        if command.is_noop() {
+            return;
         }
-        self.undo.push(command);
-        self.redo.clear();
+        self.inner.record(SemanticOperation::Runtime(command));
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        self.inner.can_undo()
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.inner.can_redo()
+    }
+
+    /// Number of committed operations currently undoable.
+    pub fn undo_len(&self) -> usize {
+        self.inner.undo_len()
+    }
+
+    /// Number of operations currently redoable.
+    pub fn redo_len(&self) -> usize {
+        self.inner.redo_len()
+    }
+
+    /// The command the next undo would reverse, without removing it.
+    pub fn peek_undo_command(&self) -> Option<&DocumentCommand> {
+        match self.inner.peek_undo() {
+            Some(SemanticOperation::Runtime(command)) => Some(command),
+            Some(SemanticOperation::Rename(_)) => None,
+            None => None,
+        }
     }
 
     pub fn undo(&mut self, document: &mut Document) -> bool {
-        let Some(command) = self.undo.pop() else {
-            return false;
-        };
-        match &command.operation {
-            CommandOperation::Geometry(changes) => {
-                for change in changes {
-                    document.set_geometry(change.id, change.before);
-                }
-            }
-            CommandOperation::Style(changes) => {
-                for change in changes {
-                    document.set_style(change.id, change.before);
-                }
-            }
-            CommandOperation::Text(changes) => {
-                for change in changes {
-                    document.set_text_content(change.id, change.before.clone());
-                }
-            }
-            CommandOperation::Insert(objects) => {
-                let ids: Vec<_> = objects
-                    .iter()
-                    .map(|placement| placement.object.id)
-                    .collect();
-                document.remove_objects(&ids);
-            }
-            CommandOperation::Delete(objects) => document.insert_objects(objects),
-        }
-        self.redo.push(command);
-        true
+        self.inner
+            .undo(&mut crate::operations::OperationTarget::Runtime(document))
+            .unwrap_or(false)
     }
 
     pub fn redo(&mut self, document: &mut Document) -> bool {
-        let Some(command) = self.redo.pop() else {
-            return false;
-        };
-        match &command.operation {
-            CommandOperation::Geometry(changes) => {
-                for change in changes {
-                    document.set_geometry(change.id, change.after);
-                }
-            }
-            CommandOperation::Style(changes) => {
-                for change in changes {
-                    document.set_style(change.id, change.after);
-                }
-            }
-            CommandOperation::Text(changes) => {
-                for change in changes {
-                    document.set_text_content(change.id, change.after.clone());
-                }
-            }
-            CommandOperation::Insert(objects) => document.insert_objects(objects),
-            CommandOperation::Delete(objects) => {
-                let ids: Vec<_> = objects
-                    .iter()
-                    .map(|placement| placement.object.id)
-                    .collect();
-                document.remove_objects(&ids);
-            }
-        }
-        self.undo.push(command);
-        true
+        self.inner
+            .redo(&mut crate::operations::OperationTarget::Runtime(document))
+            .unwrap_or(false)
     }
 }
 
@@ -955,9 +1049,9 @@ struct PanGesture {
 }
 
 #[derive(Clone, Copy)]
-struct ObjectSnapshot {
-    id: ObjectId,
-    geometry: ObjectGeometry,
+pub struct ObjectSnapshot {
+    pub id: ObjectId,
+    pub geometry: ObjectGeometry,
 }
 
 #[derive(Clone, Copy)]
@@ -4058,7 +4152,7 @@ mod tests {
         canvas.finish_interaction(point(3.0, 0.0));
 
         assert_eq!(canvas.document.objects().len(), 4);
-        assert!(canvas.history.undo.is_empty());
+        assert!(canvas.history.undo_len() == 0);
     }
 
     #[test]
@@ -4089,7 +4183,7 @@ mod tests {
             assert_eq!(created.object_type, object_type);
             assert_eq!(created.size, size(60.0, 40.0));
             assert_eq!(canvas.selection.ids(), &[created.id]);
-            assert_eq!(canvas.history.undo.len(), 1);
+            assert_eq!(canvas.history.undo_len(), 1);
         }
     }
 
@@ -4109,7 +4203,7 @@ mod tests {
         assert!(canvas.cancel_interaction());
 
         assert_eq!(canvas.document.objects().len(), 4);
-        assert!(canvas.history.undo.is_empty());
+        assert!(canvas.history.undo_len() == 0);
         assert_eq!(canvas.selection.ids(), &[ObjectId::LANDING]);
         assert!(canvas.interaction.preview().is_none());
     }
@@ -4132,7 +4226,7 @@ mod tests {
         assert_eq!(text.text_content.as_deref(), Some("Type something"));
         assert_eq!(text.position, point(100.0, 120.0));
         assert_eq!(canvas.selection.ids(), &[text.id]);
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
     }
 
     #[test]
@@ -4490,7 +4584,7 @@ mod tests {
 
         assert!(history.can_undo());
         assert!(!history.can_redo());
-        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo_len(), 1);
     }
 
     #[test]
@@ -4640,8 +4734,8 @@ mod tests {
         canvas.interaction = Interaction::Moving(gesture);
         canvas.finish_interaction(point(50.0, 25.0));
 
-        assert_eq!(canvas.history.undo.len(), 1);
-        match &canvas.history.undo[0].operation {
+        assert_eq!(canvas.history.undo_len(), 1);
+        match &canvas.history.peek_undo_command().expect("an entry").operation {
             CommandOperation::Geometry(changes) => assert_eq!(changes.len(), 2),
             _ => panic!("expected geometry command"),
         }
@@ -4700,7 +4794,7 @@ mod tests {
         record_position(&mut history, &mut document, ObjectId::LANDING, 250.0);
 
         assert!(!history.can_redo());
-        assert_eq!(history.redo.len(), 0);
+        assert_eq!(history.redo_len(), 0);
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
             250.0
@@ -4734,7 +4828,7 @@ mod tests {
         canvas.finish_interaction(point(24.0, 0.0));
         let resized = canvas.document.geometry(ObjectId::LANDING).unwrap();
 
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
         assert!(canvas.history.undo(&mut canvas.document));
         assert_eq!(
             canvas.document.geometry(ObjectId::LANDING),
@@ -5023,7 +5117,7 @@ mod tests {
         let deleted = document.remove_objects(&[first.id, second.id]);
         history.record(DocumentCommand::delete(deleted));
 
-        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo_len(), 1);
         assert_eq!(document.objects().len(), 4);
         assert!(history.undo(&mut document));
         assert_eq!(document.objects(), expected);
@@ -5070,7 +5164,7 @@ mod tests {
         let duplicate_objects = document.duplicate_objects(&[original.id]);
         let duplicate_id = duplicate_objects[0].object.id;
         history.record(DocumentCommand::insert(duplicate_objects));
-        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo_len(), 1);
 
         assert!(history.undo(&mut document));
         assert!(document.object(original.id).is_some());
@@ -5155,7 +5249,7 @@ mod tests {
         assert!(canvas.delete_selected_objects());
         assert!(canvas.selection.is_empty());
         assert!(canvas.document.object(created.id).is_none());
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
 
         canvas.history.undo(&mut canvas.document);
         canvas.retain_existing_selection();
@@ -5188,7 +5282,7 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(!selected.contains(&first.id));
         assert!(!selected.contains(&second.id));
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
         assert_eq!(
             canvas.document.object(selected[0]).unwrap().object_type,
             ObjectType::Rectangle
@@ -5211,7 +5305,7 @@ mod tests {
 
         assert!(canvas.delete_selected_objects());
 
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
         assert!(canvas.selection.is_empty());
         assert!(canvas.document.object(ids[0]).is_none());
         assert!(canvas.document.object(ids[1]).is_none());
@@ -5358,20 +5452,20 @@ mod tests {
             StyleEdit::Fill(Some(blue)),
         );
         let changed = document.style(object.id).unwrap();
-        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.undo_len(), 1);
         assert!(history.undo(&mut document));
         assert_eq!(document.style(object.id), Some(default));
         assert!(history.redo(&mut document));
         assert_eq!(document.style(object.id), Some(changed));
 
-        let commands = history.undo.len();
+        let commands = history.undo_len();
         apply_style_to_document(
             &mut document,
             &mut history,
             &[object.id],
             StyleEdit::Fill(Some(blue)),
         );
-        assert_eq!(history.undo.len(), commands);
+        assert_eq!(history.undo_len(), commands);
     }
 
     #[test]
@@ -5395,13 +5489,13 @@ mod tests {
 
         assert!(canvas.apply_selected_style(StyleEdit::Fill(Some(fill))));
 
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
         assert_eq!(canvas.selection.ids(), selected);
         assert!(selected
             .iter()
             .all(|id| { canvas.document.object(*id).unwrap().fill == Some(Fill { color: fill }) }));
         assert!(
-            matches!(canvas.history.undo[0].operation, CommandOperation::Style(ref changes) if changes.len() == 2)
+            matches!(canvas.history.peek_undo_command().expect("an entry").operation, CommandOperation::Style(ref changes) if changes.len() == 2)
         );
 
         let stroke = Color::from_rgb(0xc45d5d);
@@ -5415,7 +5509,7 @@ mod tests {
                 .map(|value| value.color)
                 == Some(stroke)
         }));
-        assert_eq!(canvas.history.undo.len(), 2);
+        assert_eq!(canvas.history.undo_len(), 2);
     }
 
     #[test]
@@ -5608,10 +5702,10 @@ mod tests {
 
         assert!(canvas.commit_text_edit());
         assert_eq!(canvas.document.text_content(object.id), Some("Hello world"));
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
         assert_eq!(canvas.selection.ids(), &[object.id]);
         assert!(matches!(
-            canvas.history.undo[0].operation,
+            canvas.history.peek_undo_command().expect("an entry").operation,
             CommandOperation::Text(_)
         ));
     }
@@ -5812,7 +5906,7 @@ mod tests {
         assert!(canvas.commit_text_edit());
         assert_eq!(canvas.document.text_content(object.id), Some("Hello"));
         assert_eq!(canvas.selection.ids(), &[object.id]);
-        assert_eq!(canvas.history.undo.len(), 1);
+        assert_eq!(canvas.history.undo_len(), 1);
     }
 
     #[test]
