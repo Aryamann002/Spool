@@ -639,6 +639,65 @@ impl Document {
         }
     }
 
+    /// Build a runtime document from already-projected canvas objects.
+    ///
+    /// This is the bridge between `RuntimeProjection::canvas_objects` and the
+    /// live editor. It is deliberately one-way: the runtime document is a
+    /// disposable interpretation, and nothing here writes projected geometry
+    /// back into the persistent document.
+    ///
+    /// The counters are seeded so that anything the user draws afterwards gets
+    /// a key above every projected key. Projected keys come from the reserved
+    /// range owned by `document_runtime_bridge`, so this only has to clear the
+    /// highest one actually present rather than assume a base.
+    ///
+    /// `next_node_id` restarts at 1 because projected objects keep their real
+    /// `NodeId`s; the counter only mints ids for objects created later in this
+    /// session.
+    pub fn from_design_objects(objects: Vec<DesignObject>) -> Self {
+        let next_id = objects
+            .iter()
+            .map(|object| object.id.0)
+            .max()
+            .map(|highest| highest + 1)
+            .unwrap_or(1);
+        // Provisional visibility bridge.
+        //
+        // A projection currently supplies geometry but no paint: fill and
+        // stroke are `None` because the authored CSS has not been read yet. An
+        // object with neither is drawn as nothing, so a correctly projected
+        // project would be present in the document, in the layers panel, and
+        // hit-testable, yet invisible on the canvas.
+        //
+        // Falling back to the canvas default style keeps the projected scene
+        // visible while CSS ownership is still unimplemented. This is
+        // deliberately NOT a style claim: it is a placeholder so the pipeline
+        // can be seen end to end. When CSS ownership lands it must replace this
+        // fallback, not sit beside it.
+        let objects = objects
+            .into_iter()
+            .map(|mut object| {
+                if object.fill.is_none() && object.stroke.is_none() {
+                    let default = default_style(object.object_type);
+                    object.fill = default.fill;
+                    object.stroke = default.stroke;
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        let mut document = Self {
+            objects,
+            next_id,
+            next_node_id: 1,
+            next_names: [1; 4],
+            layer_structure_revision: 0,
+        };
+        // Assign a layer-structure revision per inserted object so layers and
+        // other observers see the document as freshly built rather than empty.
+        document.layer_structure_revision = document.objects.len() as u64;
+        document
+    }
+
     pub fn layer_structure_revision(&self) -> u64 {
         self.layer_structure_revision
     }
@@ -1355,6 +1414,30 @@ impl CanvasView {
         view
     }
 
+    /// Replace this canvas's contents with a source-backed project.
+    ///
+    /// This is the seam between opening a project and editing it. The canvas
+    /// takes the already-derived runtime document plus the canonical persistent
+    /// document and does no parsing itself, so there is exactly one place in
+    /// the editor that knows how a project becomes a scene.
+    ///
+    /// History is reset deliberately: the new document has no relationship to
+    /// whatever was open before, and replaying an old operation against it
+    /// would be meaningless rather than merely stale.
+    pub fn load_project(&mut self, loaded: crate::project_open::LoadedProject) {
+        self.session = EditSession::new(loaded.document, loaded.runtime);
+        // A freshly loaded document has no selection, and keeping stale ids
+        // would let hit-testing and layers refer to objects that no longer
+        // exist.
+        self.selection = Selection::default();
+        self.interaction = Interaction::None;
+        self.marquee = None;
+        self.text_edit = None;
+        // Projected objects are laid out by the projection's own placeholder
+        // rule, so fitting the camera is what actually brings them on screen.
+        self.camera.fit();
+    }
+
     /// The live commit path for every canvas mutation.
     ///
     /// One call is one history entry, however many objects it touched. The
@@ -1630,6 +1713,22 @@ impl CanvasView {
 
     pub fn document_objects(&self) -> &[DesignObject] {
         self.session.runtime.objects()
+    }
+
+    /// The canonical, source-backed document.
+    ///
+    /// Read-only on purpose: metadata is durable and is changed through
+    /// semantic operations, never by poking at it from a view.
+    pub fn persistent_document(&self) -> &PersistentDocument {
+        &self.session.document
+    }
+
+    /// The disposable runtime document the editor draws and hit-tests.
+    ///
+    /// Exposed so a project can be checked against what the editor actually
+    /// holds, rather than against a separate copy.
+    pub fn runtime_document(&self) -> &Document {
+        &self.session.runtime
     }
 
     pub fn set_tool(&mut self, tool: Tool) {

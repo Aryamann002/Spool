@@ -11,6 +11,9 @@ enum Workload {
     Drag,
     Selection,
     Text,
+    /// Exercises the document a real project was opened into, rather than a
+    /// synthetic fixture. Requires `SPOOL_PROJECT` to have been set.
+    Project,
 }
 
 fn config() -> Option<(Workload, usize)> {
@@ -24,9 +27,15 @@ fn config() -> Option<(Workload, usize)> {
         "drag" => Workload::Drag,
         "selection" => Workload::Selection,
         "text" => Workload::Text,
+        "project" => Workload::Project,
         _ => return None,
     };
-    let count = count.parse().ok()?;
+    let count: usize = count.parse().ok()?;
+    // The project workload runs against whatever was opened, so the requested
+    // count is only a positive sanity check, never a document size.
+    if kind == Workload::Project {
+        return (count > 0).then_some((kind, count));
+    }
     [100, 1_000, 10_000]
         .contains(&count)
         .then_some((kind, count))
@@ -68,7 +77,11 @@ impl CanvasView {
     pub(super) fn install_workload_fixture(&mut self) {
         if let Some((kind, count)) = config() {
             self.workload_running = true;
-            self.session.runtime = fixture(count);
+            // The project workload must keep the document that was opened from
+            // disk; swapping in a synthetic fixture would defeat the point.
+            if kind != Workload::Project {
+                self.session.runtime = fixture(count);
+            }
             if kind == Workload::Text {
                 let object = &mut self.session.runtime.objects[0];
                 object.object_type = ObjectType::Text;
@@ -133,6 +146,30 @@ impl CanvasView {
             if kind == Workload::Text {
                 self.begin_text_edit(ObjectId(5), window, cx);
             }
+            if kind == Workload::Project {
+                // Select the root the projection emitted and start a real drag
+                // on it, so the gesture path runs against project state.
+                let Some(root_id) = self.document_objects().first().map(|o| o.id) else {
+                    eprintln!("spool_project_probe failed=no_runtime_objects");
+                    self.workload_running = false;
+                    return;
+                };
+                self.selection.replace(vec![root_id]);
+                self.interaction = Interaction::PotentialMove(MoveGesture {
+                    pointer_start_screen: point(0.0, 0.0),
+                    pointer_start_world: point(0.0, 0.0),
+                    objects: self
+                        .document_objects()
+                        .iter()
+                        .map(|o| ObjectSnapshot {
+                            id: o.id,
+                            geometry: o.geometry(),
+                        })
+                        .collect(),
+                    selected_ids: vec![root_id],
+                    click_selection: ClickSelection::SelectOnly(root_id),
+                });
+            }
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -153,6 +190,31 @@ impl CanvasView {
                 "initial_viewport_height_px",
                 self.camera.viewport.height.round() as u64,
             );
+        }
+        if step == STEPS && kind == Workload::Project {
+            // End-to-end probe against the document that was actually opened
+            // from disk. Everything reported here is read back out of the live
+            // canvas, not from a parallel copy.
+            let objects: Vec<(String, String, u64)> = self
+                .document_objects()
+                .iter()
+                .map(|o| (o.spool_id.as_str().to_owned(), o.name.clone(), o.id.0))
+                .collect();
+            let persistent: Vec<String> = self
+                .persistent_document()
+                .structure
+                .nodes
+                .iter()
+                .map(|n| n.id.as_str().to_owned())
+                .collect();
+            let selected = self.selection().ids().to_vec();
+            eprintln!(
+                "spool_project_probe persistent_nodes={:?} runtime_objects={objects:?} selected={selected:?}",
+                persistent
+            );
+            self.workload_running = false;
+            eprintln!("spool_workload_complete {kind:?}:{count}");
+            return;
         }
         if step == STEPS {
             // The last update's frame has completed before this callback.
@@ -228,7 +290,7 @@ redo_ok={redid} redo_matches_commit={}",
                 diagnostics::count("canvas_notify", 1);
                 cx.notify();
             }
-            Workload::Drag => {
+            Workload::Drag | Workload::Project => {
                 let before = std::mem::discriminant(&self.interaction);
                 assert!(
                     self.update_interaction(pointer),

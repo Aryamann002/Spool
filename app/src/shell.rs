@@ -1,6 +1,6 @@
 use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, SharedString, Window};
 
-use crate::{canvas, layers::LayersView, theme};
+use crate::{canvas, layers::LayersView, project_open, theme};
 
 const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
     ("↖", "Select", "V", canvas::Tool::Select),
@@ -89,9 +89,43 @@ pub struct AppShell {
     color_picker: Option<StyleProperty>,
 }
 
+/// Open the project named by `SPOOL_PROJECT`, if one was requested.
+///
+/// This is the application's only project-opening path. `SPOOL_PROJECT` points
+/// at a directory containing `lamine.yaml` and its authored source; without it
+/// the editor opens the blank starter scene exactly as before.
+///
+/// A failure is reported deterministically on stderr and leaves the blank
+/// document in place. It never silently produces an empty canvas that looks
+/// like a project that happened to be empty, and it never falls back to a
+/// partially loaded document.
+fn open_requested_project(view: &mut canvas::CanvasView) {
+    let Ok(root) = std::env::var("SPOOL_PROJECT") else {
+        return;
+    };
+    match project_open::open_project(&root) {
+        Ok(loaded) => {
+            // Reported so a launch log shows what actually opened, rather than
+            // leaving the operator to infer it from pixels.
+            eprintln!(
+                "spool_project_open ok root={} persistent_nodes={} runtime_objects={} unrendered={:?}",
+                loaded.root.display(),
+                loaded.document.structure.nodes.len(),
+                loaded.runtime.objects().len(),
+                loaded.unrendered,
+            );
+            view.load_project(loaded);
+        }
+        Err(error) => {
+            eprintln!("spool_project_open failed root={root}: {error}");
+        }
+    }
+}
+
 impl AppShell {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let canvas = cx.new(canvas::CanvasView::new_with_context);
+        canvas.update(cx, |view, _| open_requested_project(view));
         let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
         Self {
             canvas,

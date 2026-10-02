@@ -4,6 +4,7 @@ mod document_runtime_bridge;
 mod layers;
 mod operations;
 pub mod project_bundle;
+mod project_open;
 pub mod source_binding;
 mod shell;
 pub mod source_document;
