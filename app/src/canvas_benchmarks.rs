@@ -1,6 +1,7 @@
 //! Reproducible core timings, not GPUI frame-time benchmarks.
 //! Run: cargo test --locked core_workload_baseline -- --ignored --nocapture --test-threads=1
 use super::*;
+use crate::operations::{SemanticHistory, SemanticOperation};
 use std::{hint::black_box, time::Instant};
 
 fn measure(mut operation: impl FnMut(), iterations: usize) -> f64 {
@@ -79,8 +80,10 @@ fn core_workload_baseline() {
         );
         let history = measure(
             || {
-                let mut history = History::default();
-                history.record(geometry_command(&document, &snapshots));
+                let mut history = SemanticHistory::default();
+                history.record(SemanticOperation::Runtime(geometry_command(
+                    &document, &snapshots,
+                )));
                 black_box(history);
             },
             1000,

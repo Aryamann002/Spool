@@ -56,12 +56,21 @@ fn fixture(count: usize) -> Document {
 }
 
 impl CanvasView {
+    /// World positions of the given runtime objects, for runtime probes.
+    pub(super) fn positions_of(&self, ids: &[ObjectId]) -> Vec<(f32, f32)> {
+        ids.iter()
+            .map(|id| {
+                let geometry = self.session.runtime.geometry(*id).expect("object exists");
+                (geometry.position.x, geometry.position.y)
+            })
+            .collect()
+    }
     pub(super) fn install_workload_fixture(&mut self) {
         if let Some((kind, count)) = config() {
             self.workload_running = true;
-            self.document = fixture(count);
+            self.session.runtime = fixture(count);
             if kind == Workload::Text {
-                let object = &mut self.document.objects[0];
+                let object = &mut self.session.runtime.objects[0];
                 object.object_type = ObjectType::Text;
                 object.text_content = Some("Text".into());
             }
@@ -93,7 +102,8 @@ impl CanvasView {
             self.camera.zoom = 1.0;
             if kind == Workload::Drag {
                 let objects: Vec<_> = self
-                    .document
+                    .session
+                    .runtime
                     .objects
                     .iter()
                     .rev()
@@ -104,6 +114,13 @@ impl CanvasView {
                     })
                     .collect();
                 let selected_ids: Vec<_> = objects.iter().map(|object| object.id).collect();
+                // True pre-gesture positions, captured before any pointer step,
+                // so the runtime probe can tell "undo restored the start" from
+                // "nothing ever moved".
+                self.drag_start_positions = objects
+                    .iter()
+                    .map(|snapshot| (snapshot.geometry.position.x, snapshot.geometry.position.y))
+                    .collect();
                 self.selection.replace(selected_ids.clone());
                 self.interaction = Interaction::PotentialMove(MoveGesture {
                     pointer_start_screen: point(0.0, 0.0),
@@ -142,10 +159,58 @@ impl CanvasView {
             diagnostics::report(&format!("{kind:?}:{count}"));
             if kind == Workload::Drag {
                 let start = diagnostics::start();
+
+                // Runtime evidence that the live commit path really goes
+                // through EditSession -> SemanticHistory, and that one
+                // committed drag is one undoable entry.
+                let dragged: Vec<ObjectId> = self
+                    .session
+                    .runtime
+                    .objects
+                    .iter()
+                    .rev()
+                    .take(10)
+                    .map(|object| object.id)
+                    .collect();
+                let resting = std::mem::take(&mut self.drag_start_positions);
+                assert_eq!(
+                    resting.len(),
+                    dragged.len(),
+                    "the probe must compare the same objects the gesture moved"
+                );
+                let depth_before = self.session.history.undo_len();
+
                 self.finish_interaction(point(STEPS as f32 * 5.0, STEPS as f32 * 3.0));
                 diagnostics::record("drag_finish_history", start);
+
+                let depth_after = self.session.history.undo_len();
+                let committed = self.positions_of(&dragged);
+
+                let undid = self.undo_history();
+                let after_undo = self.positions_of(&dragged);
+
+                let redid = self.redo_history();
+                let after_redo = self.positions_of(&dragged);
+
+                let moved = committed != resting;
+                eprintln!(
+                    "spool_history_probe depth_before={depth_before} depth_after_commit={depth_after} \
+exactly_one_entry={} objects_moved={} undo_ok={undid} undo_restored_start={} \
+redo_ok={redid} redo_matches_commit={}",
+                    depth_after - depth_before == 1,
+                    moved,
+                    after_undo == resting,
+                    after_redo == committed,
+                );
                 diagnostics::report(&format!("{kind:?}:{count}:finished"));
             }
+            // Runtime proof that pan, zoom and selection changes are runtime
+            // state and never become history entries.
+            let depth = self.session.history.undo_len();
+            eprintln!(
+                "spool_history_depth_probe kind={kind:?} depth={depth} runtime_state_excluded={}",
+                depth == 0
+            );
             self.workload_running = false;
             eprintln!("spool_workload_complete {kind:?}:{count}");
             return;

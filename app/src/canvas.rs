@@ -27,8 +27,9 @@ gpui::actions!(
 
 use crate::{
     diagnostics,
-    operations::{OperationError, SemanticHistory, SemanticOperation},
-    source_document::NodeId, theme,
+    operations::{EditSession, OperationError, SemanticOperation},
+    source_document::{NodeId, PersistentDocument},
+    theme,
 };
 
 #[cfg(debug_assertions)]
@@ -495,19 +496,29 @@ impl DocumentCommand {
         match &self.operation {
             CommandOperation::Geometry(changes) => {
                 for change in changes {
-                    document.set_geometry(change.id, if forward { change.after } else { change.before });
+                    document.set_geometry(
+                        change.id,
+                        if forward { change.after } else { change.before },
+                    );
                 }
             }
             CommandOperation::Style(changes) => {
                 for change in changes {
-                    document.set_style(change.id, if forward { change.after } else { change.before });
+                    document.set_style(
+                        change.id,
+                        if forward { change.after } else { change.before },
+                    );
                 }
             }
             CommandOperation::Text(changes) => {
                 for change in changes {
                     document.set_text_content(
                         change.id,
-                        if forward { change.after.clone() } else { change.before.clone() },
+                        if forward {
+                            change.after.clone()
+                        } else {
+                            change.before.clone()
+                        },
                     );
                 }
             }
@@ -516,16 +527,20 @@ impl DocumentCommand {
                 if forward {
                     document.insert_objects(objects);
                 } else {
-                    let ids: Vec<ObjectId> =
-                        objects.iter().map(|placement| placement.object.id).collect();
+                    let ids: Vec<ObjectId> = objects
+                        .iter()
+                        .map(|placement| placement.object.id)
+                        .collect();
                     document.remove_objects(&ids);
                 }
             }
             CommandOperation::Delete(objects) => {
                 // Undoing a delete puts the removed objects back.
                 if forward {
-                    let ids: Vec<ObjectId> =
-                        objects.iter().map(|placement| placement.object.id).collect();
+                    let ids: Vec<ObjectId> = objects
+                        .iter()
+                        .map(|placement| placement.object.id)
+                        .collect();
                     document.remove_objects(&ids);
                 } else {
                     document.insert_objects(objects);
@@ -535,7 +550,11 @@ impl DocumentCommand {
     }
 
     /// A copy with the no-op entries removed.
-    fn normalized(mut self) -> Self {
+    ///
+    /// Public because the semantic boundary is the right place to trim a
+    /// partially-changed command: a multi-object gesture where some objects
+    /// did not actually move should record only the ones that did.
+    pub fn normalized(mut self) -> Self {
         match &mut self.operation {
             CommandOperation::Geometry(changes) => changes.retain(|c| c.before != c.after),
             CommandOperation::Style(changes) => changes.retain(|c| c.before != c.after),
@@ -544,17 +563,6 @@ impl DocumentCommand {
         }
         self
     }
-}
-
-#[derive(Default)]
-pub struct History {
-    /// The unified stack. Every canvas command goes through this, and so does
-    /// every persistent operation, so there is exactly one undo model.
-    ///
-    /// This struct has no other field on purpose. It holds no stacks of its
-    /// own, so a canvas undo and a metadata undo cannot diverge into two
-    /// implementations; see `canvas_history_and_metadata_share_one_stack`.
-    inner: SemanticHistory,
 }
 
 #[derive(Clone, Debug)]
@@ -690,8 +698,10 @@ impl Document {
     pub fn snapshot_objects(&self, ids: &[ObjectId]) -> Vec<ObjectSnapshot> {
         ids.iter()
             .filter_map(|id| {
-                self.object(*id)
-                    .map(|object| ObjectSnapshot { id: *id, geometry: object.geometry() })
+                self.object(*id).map(|object| ObjectSnapshot {
+                    id: *id,
+                    geometry: object.geometry(),
+                })
             })
             .collect()
     }
@@ -856,60 +866,6 @@ impl Document {
             .filter(|object| bounds.contains_object(object))
             .map(|object| object.id)
             .collect()
-    }
-}
-
-impl History {
-    /// Commit a canvas command.
-    ///
-    /// This is a facade over the unified `SemanticHistory` stack, kept so the
-    /// canvas call sites and their tests are unchanged. No-op commands are
-    /// dropped before they reach a stack.
-    pub fn record(&mut self, command: DocumentCommand) {
-        let command = command.normalized();
-        if command.is_noop() {
-            return;
-        }
-        self.inner.record(SemanticOperation::Runtime(command));
-    }
-
-    pub fn can_undo(&self) -> bool {
-        self.inner.can_undo()
-    }
-
-    pub fn can_redo(&self) -> bool {
-        self.inner.can_redo()
-    }
-
-    /// Number of committed operations currently undoable.
-    pub fn undo_len(&self) -> usize {
-        self.inner.undo_len()
-    }
-
-    /// Number of operations currently redoable.
-    pub fn redo_len(&self) -> usize {
-        self.inner.redo_len()
-    }
-
-    /// The command the next undo would reverse, without removing it.
-    pub fn peek_undo_command(&self) -> Option<&DocumentCommand> {
-        match self.inner.peek_undo() {
-            Some(SemanticOperation::Runtime(command)) => Some(command),
-            Some(SemanticOperation::Rename(_)) => None,
-            None => None,
-        }
-    }
-
-    pub fn undo(&mut self, document: &mut Document) -> bool {
-        self.inner
-            .undo(&mut crate::operations::OperationTarget::Runtime(document))
-            .unwrap_or(false)
-    }
-
-    pub fn redo(&mut self, document: &mut Document) -> bool {
-        self.inner
-            .redo(&mut crate::operations::OperationTarget::Runtime(document))
-            .unwrap_or(false)
     }
 }
 
@@ -1325,8 +1281,20 @@ struct TextEditState {
 
 pub struct CanvasView {
     camera: Camera,
-    document: Document,
-    history: History,
+    /// The single mutation and history boundary for the live editor.
+    ///
+    /// This used to be two fields here: `document: Document` and
+    /// `history: History`, which meant the canvas owned a runtime document
+    /// and a history stack beside it while the persistent document and the
+    /// semantic operation layer sat unused. Now every committed canvas edit
+    /// goes through `EditSession::execute`, so the live path is
+    /// canvas -> EditSession -> SemanticOperation -> SemanticHistory.
+    ///
+    /// No project is loaded yet, so `session.document` is empty metadata.
+    /// That is the honest state: there is no `lamine.yaml` behind the starter
+    /// scene. When project opening lands, that document is populated here and
+    /// metadata operations become reachable from the same stack.
+    session: EditSession,
     selection: Selection,
     pan: Option<PanGesture>,
     interaction: Interaction,
@@ -1340,6 +1308,9 @@ pub struct CanvasView {
     workload_started: bool,
     #[cfg(debug_assertions)]
     workload_running: bool,
+    /// Debug-only: true pre-gesture positions for the runtime history probe.
+    #[cfg(debug_assertions)]
+    drag_start_positions: Vec<(f32, f32)>,
 }
 
 impl CanvasView {
@@ -1357,8 +1328,7 @@ impl CanvasView {
     pub fn new() -> Self {
         Self {
             camera: Camera::default(),
-            document: Document::default(),
-            history: History::default(),
+            session: EditSession::new(PersistentDocument::default(), Document::default()),
             selection: Selection::default(),
             pan: None,
             interaction: Interaction::None,
@@ -1372,6 +1342,8 @@ impl CanvasView {
             workload_started: false,
             #[cfg(debug_assertions)]
             workload_running: false,
+            #[cfg(debug_assertions)]
+            drag_start_positions: Vec::new(),
         }
     }
 
@@ -1383,12 +1355,25 @@ impl CanvasView {
         view
     }
 
+    /// The live commit path for every canvas mutation.
+    ///
+    /// One call is one history entry, however many objects it touched. The
+    /// command is normalized first so a gesture that changed nothing, or that
+    /// changed only some of a multi-selection, records only the real change.
+    /// The canvas has already applied the mutation eagerly, and replaying the
+    /// command forward here is safe because every replay is idempotent.
+    fn commit(&mut self, command: DocumentCommand) -> bool {
+        self.session
+            .execute(SemanticOperation::Runtime(command.normalized()))
+            .unwrap_or(false)
+    }
+
     pub fn is_text_editing(&self) -> bool {
         self.text_edit.is_some()
     }
 
     fn begin_text_edit(&mut self, id: ObjectId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.document.text_content(id).map(str::to_owned) else {
+        let Some(text) = self.session.runtime.text_content(id).map(str::to_owned) else {
             return;
         };
         let end = text.len();
@@ -1440,12 +1425,13 @@ impl CanvasView {
             return false;
         }
         if !self
-            .document
+            .session
+            .runtime
             .set_text_content(edit.id, edit.editing_text.clone())
         {
             return false;
         }
-        self.history.record(DocumentCommand::text(vec![TextChange {
+        self.commit(DocumentCommand::text(vec![TextChange {
             id: edit.id,
             before: edit.original_text,
             after: edit.editing_text,
@@ -1639,30 +1625,57 @@ impl CanvasView {
     }
 
     pub fn layer_structure_revision(&self) -> u64 {
-        self.document.layer_structure_revision()
+        self.session.runtime.layer_structure_revision()
     }
 
     pub fn document_objects(&self) -> &[DesignObject] {
-        self.document.objects()
+        self.session.runtime.objects()
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.commit_text_edit();
-        self.interaction.restore(&mut self.document);
+        self.interaction.restore(&mut self.session.runtime);
         self.tool = tool;
         self.interaction = Interaction::None;
         self.marquee = None;
     }
 
-    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+    /// Undo the last committed semantic operation.
+    ///
+    /// This is the whole live undo path minus repainting, split out so the
+    /// integration tests can drive it without a GPUI window. Everything that
+    /// decides *what* changes happens here; [`CanvasView::undo`] only adds the
+    /// notification.
+    fn undo_history(&mut self) -> bool {
         self.commit_text_edit();
         if self.interaction.is_active() {
-            self.interaction.restore(&mut self.document);
+            self.interaction.restore(&mut self.session.runtime);
             self.interaction = Interaction::None;
         }
-        let changed = self.history.can_undo() && self.history.undo(&mut self.document);
+        let changed = self.session.undo().unwrap_or(false);
         if changed {
             self.retain_existing_selection();
+        }
+        changed
+    }
+
+    /// Redo the last undone operation. See [`CanvasView::undo_history`].
+    fn redo_history(&mut self) -> bool {
+        self.commit_text_edit();
+        if self.interaction.is_active() {
+            self.interaction.restore(&mut self.session.runtime);
+            self.interaction = Interaction::None;
+        }
+        let changed = self.session.redo().unwrap_or(false);
+        if changed {
+            self.retain_existing_selection();
+        }
+        changed
+    }
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self.undo_history();
+        if changed {
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -1670,14 +1683,8 @@ impl CanvasView {
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
-        self.commit_text_edit();
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.document);
-            self.interaction = Interaction::None;
-        }
-        let changed = self.history.can_redo() && self.history.redo(&mut self.document);
+        let changed = self.redo_history();
         if changed {
-            self.retain_existing_selection();
             diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
@@ -1688,7 +1695,7 @@ impl CanvasView {
         self.selection
             .ids()
             .iter()
-            .filter_map(|id| self.document.object(*id).cloned())
+            .filter_map(|id| self.session.runtime.object(*id).cloned())
             .collect()
     }
 
@@ -1705,7 +1712,7 @@ impl CanvasView {
 
     fn apply_selected_style(&mut self, edit: StyleEdit) -> bool {
         if self.interaction.is_active() {
-            self.interaction.restore(&mut self.document);
+            self.interaction.restore(&mut self.session.runtime);
             self.interaction = Interaction::None;
         }
         let changes: Vec<_> = self
@@ -1713,7 +1720,7 @@ impl CanvasView {
             .ids()
             .iter()
             .filter_map(|id| {
-                let before = self.document.style(*id)?;
+                let before = self.session.runtime.style(*id)?;
                 let after = edited_style(before, edit);
                 (before != after).then_some(StyleChange {
                     id: *id,
@@ -1726,9 +1733,9 @@ impl CanvasView {
             return false;
         }
         for change in &changes {
-            self.document.set_style(change.id, change.after);
+            self.session.runtime.set_style(change.id, change.after);
         }
-        self.history.record(DocumentCommand::style(changes));
+        self.commit(DocumentCommand::style(changes));
         true
     }
 
@@ -1839,7 +1846,7 @@ impl CanvasView {
         window: &mut Window,
     ) -> Option<usize> {
         let edit = self.text_edit.as_ref().filter(|edit| edit.id == id)?;
-        let object = self.document.object(id)?;
+        let object = self.session.runtime.object(id)?;
         let local = screen_to_object_local(self.camera, screen, object.position);
         text_offset_at_local_point(&edit.editing_text, local, self.camera.zoom, window)
     }
@@ -1863,12 +1870,16 @@ impl CanvasView {
         self.marquee = None;
 
         if let Some(editing_id) = self.text_edit.as_ref().map(|edit| edit.id) {
-            let inside_editing_object = self.document.object(editing_id).is_some_and(|object| {
-                world.x >= object.position.x
-                    && world.x <= object.position.x + object.size.width
-                    && world.y >= object.position.y
-                    && world.y <= object.position.y + object.size.height
-            });
+            let inside_editing_object =
+                self.session
+                    .runtime
+                    .object(editing_id)
+                    .is_some_and(|object| {
+                        world.x >= object.position.x
+                            && world.x <= object.position.x + object.size.width
+                            && world.y >= object.position.y
+                            && world.y <= object.position.y + object.size.height
+                    });
             if inside_editing_object {
                 if let Some(focus_handle) = &self.focus_handle {
                     window.focus(focus_handle, cx);
@@ -1883,9 +1894,10 @@ impl CanvasView {
         }
 
         if self.tool == Tool::Text {
-            if let Some(id) = self.document.hit_test(world) {
+            if let Some(id) = self.session.runtime.hit_test(world) {
                 if self
-                    .document
+                    .session
+                    .runtime
                     .object(id)
                     .is_some_and(|object| object.object_type == ObjectType::Text)
                 {
@@ -1897,9 +1909,10 @@ impl CanvasView {
             }
         }
         if self.tool == Tool::Select && event.click_count >= 2 {
-            if let Some(id) = self.document.hit_test(world) {
+            if let Some(id) = self.session.runtime.hit_test(world) {
                 if self
-                    .document
+                    .session
+                    .runtime
                     .object(id)
                     .is_some_and(|object| object.object_type == ObjectType::Text)
                 {
@@ -1927,7 +1940,7 @@ impl CanvasView {
 
         if let Some(handle) = self.hit_test_resize_handle(screen) {
             let id = self.selection.ids()[0];
-            if let Some(object) = self.document.object(id) {
+            if let Some(object) = self.session.runtime.object(id) {
                 self.interaction = Interaction::PotentialResize(ResizeGesture {
                     pointer_start_screen: screen,
                     pointer_start_world: world,
@@ -1942,7 +1955,7 @@ impl CanvasView {
             return;
         }
 
-        if let Some(id) = self.document.hit_test(world) {
+        if let Some(id) = self.session.runtime.hit_test(world) {
             let target_is_selected = self.selection.contains(id);
             let selected_ids = if target_is_selected {
                 self.selection.ids().to_vec()
@@ -1956,7 +1969,8 @@ impl CanvasView {
             let objects = selected_ids
                 .iter()
                 .filter_map(|selected_id| {
-                    self.document
+                    self.session
+                        .runtime
                         .object(*selected_id)
                         .map(|object| ObjectSnapshot {
                             id: *selected_id,
@@ -2005,7 +2019,7 @@ impl CanvasView {
         if self.selection.ids().len() != 1 {
             return None;
         }
-        let object = self.document.object(self.selection.ids()[0])?;
+        let object = self.session.runtime.object(self.selection.ids()[0])?;
         ResizeHandle::ALL.into_iter().find(|handle| {
             let handle_position = handle.screen_position(self.camera, object);
             (screen.x - handle_position.x).abs() <= RESIZE_HANDLE_HIT_RADIUS
@@ -2024,7 +2038,7 @@ impl CanvasView {
                 }
                 self.selection.replace(gesture.selected_ids.clone());
                 apply_move(
-                    &mut self.document,
+                    &mut self.session.runtime,
                     &gesture.objects,
                     movement_delta(self.camera, gesture.pointer_start_world, screen),
                 );
@@ -2033,7 +2047,7 @@ impl CanvasView {
             }
             Interaction::Moving(gesture) => {
                 apply_move(
-                    &mut self.document,
+                    &mut self.session.runtime,
                     &gesture.objects,
                     movement_delta(self.camera, gesture.pointer_start_world, screen),
                 );
@@ -2045,12 +2059,12 @@ impl CanvasView {
                     self.interaction = Interaction::PotentialResize(gesture);
                     return false;
                 }
-                apply_resize(&mut self.document, &gesture, self.camera, screen);
+                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
                 self.interaction = Interaction::Resizing(gesture);
                 true
             }
             Interaction::Resizing(gesture) => {
-                apply_resize(&mut self.document, &gesture, self.camera, screen);
+                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
                 self.interaction = Interaction::Resizing(gesture);
                 true
             }
@@ -2080,19 +2094,19 @@ impl CanvasView {
             },
             Interaction::Moving(gesture) => {
                 apply_move(
-                    &mut self.document,
+                    &mut self.session.runtime,
                     &gesture.objects,
                     movement_delta(self.camera, gesture.pointer_start_world, screen),
                 );
-                let command = geometry_command(&self.document, &gesture.objects);
-                self.history.record(command);
+                let command = geometry_command(&self.session.runtime, &gesture.objects);
+                self.commit(command);
             }
             Interaction::PotentialResize(_) => {}
             Interaction::Resizing(gesture) => {
-                apply_resize(&mut self.document, &gesture, self.camera, screen);
+                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
                 let command =
-                    geometry_command(&self.document, std::slice::from_ref(&gesture.object));
-                self.history.record(command);
+                    geometry_command(&self.session.runtime, std::slice::from_ref(&gesture.object));
+                self.commit(command);
             }
             Interaction::PotentialCreate(gesture) => {
                 if gesture.object_type == ObjectType::Text {
@@ -2123,13 +2137,13 @@ impl CanvasView {
         object_size: Size<f32>,
     ) {
         let text_content = (object_type == ObjectType::Text).then(|| "Type something".to_string());
-        let object = self
-            .document
-            .create_object(object_type, position, object_size, text_content);
-        let placement = self.document.placement(object.id).unwrap();
+        let object =
+            self.session
+                .runtime
+                .create_object(object_type, position, object_size, text_content);
+        let placement = self.session.runtime.placement(object.id).unwrap();
         self.selection.click(Some(object.id), false);
-        self.history
-            .record(DocumentCommand::insert(vec![placement]));
+        self.commit(DocumentCommand::insert(vec![placement]));
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2145,16 +2159,16 @@ impl CanvasView {
     fn delete_selected_objects(&mut self) -> bool {
         self.commit_text_edit();
         if self.interaction.is_active() {
-            self.interaction.restore(&mut self.document);
+            self.interaction.restore(&mut self.session.runtime);
             self.interaction = Interaction::None;
         }
         let ids = self.selection.ids().to_vec();
-        let deleted = self.document.remove_objects(&ids);
+        let deleted = self.session.runtime.remove_objects(&ids);
         if deleted.is_empty() {
             self.retain_existing_selection();
             return false;
         }
-        self.history.record(DocumentCommand::delete(deleted));
+        self.commit(DocumentCommand::delete(deleted));
         self.retain_existing_selection();
         true
     }
@@ -2172,11 +2186,11 @@ impl CanvasView {
     fn duplicate_selected_objects(&mut self) -> bool {
         self.commit_text_edit();
         if self.interaction.is_active() {
-            self.interaction.restore(&mut self.document);
+            self.interaction.restore(&mut self.session.runtime);
             self.interaction = Interaction::None;
         }
         let ids = self.selection.ids().to_vec();
-        let duplicates = self.document.duplicate_objects(&ids);
+        let duplicates = self.session.runtime.duplicate_objects(&ids);
         if duplicates.is_empty() {
             self.retain_existing_selection();
             return false;
@@ -2186,7 +2200,7 @@ impl CanvasView {
             .map(|placement| placement.object.id)
             .collect();
         self.selection.replace(duplicate_ids);
-        self.history.record(DocumentCommand::insert(duplicates));
+        self.commit(DocumentCommand::insert(duplicates));
         true
     }
 
@@ -2196,7 +2210,7 @@ impl CanvasView {
             .ids()
             .iter()
             .copied()
-            .filter(|id| self.document.object(*id).is_some())
+            .filter(|id| self.session.runtime.object(*id).is_some())
             .collect();
         self.selection.replace(existing);
     }
@@ -2205,7 +2219,7 @@ impl CanvasView {
         if !self.interaction.is_active() {
             return false;
         }
-        self.interaction.restore(&mut self.document);
+        self.interaction.restore(&mut self.session.runtime);
         self.interaction = Interaction::None;
         true
     }
@@ -2236,7 +2250,8 @@ impl CanvasView {
         }
 
         let contained = self
-            .document
+            .session
+            .runtime
             .objects_in(WorldRect::from_points(marquee.start, end));
         if marquee.additive {
             self.selection.replace(marquee.initial_selection);
@@ -2312,7 +2327,7 @@ impl Render for CanvasView {
         let entity_for_paint = entity.clone();
         let hitbox_slot = self.hitbox.clone();
         let current_camera = self.camera;
-        let document = &self.document;
+        let document = &self.session.runtime;
         let selection = &self.selection;
         let marquee = self.marquee.clone();
         let preview = self.interaction.preview();
@@ -2482,9 +2497,9 @@ impl Render for CanvasView {
                                     this.finish_interaction(screen);
                                     if this.tool == Tool::Text {
                                         if let Some(id) = this.selection.ids().last().copied() {
-                                            if this.document.object(id).is_some_and(|object| {
-                                                object.object_type == ObjectType::Text
-                                            }) {
+                                            if this.session.runtime.object(id).is_some_and(
+                                                |object| object.object_type == ObjectType::Text,
+                                            ) {
                                                 this.begin_text_edit(id, window, cx);
                                             }
                                         }
@@ -3723,6 +3738,7 @@ fn mobile_frame(zoom: f32, frame_size: Size<f32>) -> impl IntoElement {
 mod tests {
     use super::*;
     use crate::layers::test_support::RetainedLayers;
+    use crate::operations::{OperationTarget, SemanticHistory};
 
     fn starter_layer_rows() -> Vec<(ObjectId, SharedString)> {
         vec![
@@ -3740,55 +3756,58 @@ mod tests {
         let starter = starter_layer_rows();
         assert_eq!(layers.synchronize(&canvas), starter);
 
-        let text = canvas.document.create_object(
+        let text = canvas.session.runtime.create_object(
             ObjectType::Text,
             point(10.0, 20.0),
             size(80.0, 30.0),
             Some("Content, not the layer name".into()),
         );
-        canvas.history.record(DocumentCommand::insert(vec![canvas
-            .document
+        canvas.commit(DocumentCommand::insert(vec![canvas
+            .session
+            .runtime
             .placement(text.id)
             .unwrap()]));
         let mut created = starter.clone();
         created.push((text.id, "Text 1".into()));
         assert_eq!(layers.synchronize(&canvas), created);
-        assert!(canvas.history.undo(&mut canvas.document));
+        assert!(canvas.session.undo().unwrap());
         assert_eq!(layers.synchronize(&canvas), starter);
-        assert!(canvas.history.redo(&mut canvas.document));
+        assert!(canvas.session.redo().unwrap());
         assert_eq!(layers.synchronize(&canvas), created);
 
         // Reverse selection order must not reverse document/projected order.
         let duplicates = canvas
-            .document
+            .session
+            .runtime
             .duplicate_objects(&[text.id, ObjectId::EDITOR]);
         assert_eq!(duplicates.len(), 2);
-        canvas
-            .history
-            .record(DocumentCommand::insert(duplicates.clone()));
+        canvas.commit(DocumentCommand::insert(duplicates.clone()));
         let mut duplicated = created.clone();
         duplicated.extend([
             (duplicates[0].object.id, "Frame 1".into()),
             (duplicates[1].object.id, "Text 2".into()),
         ]);
         assert_eq!(layers.synchronize(&canvas), duplicated);
-        assert!(canvas.history.undo(&mut canvas.document));
+        assert!(canvas.session.undo().unwrap());
         assert_eq!(layers.synchronize(&canvas), created);
-        assert!(canvas.history.redo(&mut canvas.document));
+        assert!(canvas.session.redo().unwrap());
         assert_eq!(layers.synchronize(&canvas), duplicated);
 
         // Non-adjacent deletions must restore their original positions and names.
-        let removed = canvas.document.remove_objects(&[text.id, ObjectId::EDITOR]);
-        canvas.history.record(DocumentCommand::delete(removed));
+        let removed = canvas
+            .session
+            .runtime
+            .remove_objects(&[text.id, ObjectId::EDITOR]);
+        canvas.commit(DocumentCommand::delete(removed));
         let deleted: Vec<_> = duplicated
             .iter()
             .filter(|(id, _)| *id != text.id && *id != ObjectId::EDITOR)
             .cloned()
             .collect();
         assert_eq!(layers.synchronize(&canvas), deleted);
-        assert!(canvas.history.undo(&mut canvas.document));
+        assert!(canvas.session.undo().unwrap());
         assert_eq!(layers.synchronize(&canvas), duplicated);
-        assert!(canvas.history.redo(&mut canvas.document));
+        assert!(canvas.session.redo().unwrap());
         assert_eq!(layers.synchronize(&canvas), deleted);
         assert_eq!(layers.document_walks(), 10);
     }
@@ -3796,7 +3815,7 @@ mod tests {
     #[test]
     fn retained_layer_rows_keep_names_and_skip_walks_for_selection_and_transient_changes() {
         let mut canvas = CanvasView::new();
-        let text = canvas.document.create_object(
+        let text = canvas.session.runtime.create_object(
             ObjectType::Text,
             point(10.0, 20.0),
             size(80.0, 30.0),
@@ -3828,24 +3847,30 @@ mod tests {
             ]
         );
 
-        let before = canvas.document.geometry(text.id).unwrap();
-        canvas.document.set_position(text.id, point(100.0, 200.0));
-        canvas.document.set_size(text.id, size(120.0, 40.0));
-        assert_eq!(layers.synchronize(&canvas), expected);
-        let after = canvas.document.geometry(text.id).unwrap();
+        let before = canvas.session.runtime.geometry(text.id).unwrap();
         canvas
-            .history
-            .record(DocumentCommand::geometry(vec![GeometryChange {
-                id: text.id,
-                before,
-                after,
-            }]));
-        assert!(canvas.history.undo(&mut canvas.document));
+            .session
+            .runtime
+            .set_position(text.id, point(100.0, 200.0));
+        canvas.session.runtime.set_size(text.id, size(120.0, 40.0));
         assert_eq!(layers.synchronize(&canvas), expected);
-        assert!(canvas.history.redo(&mut canvas.document));
+        let after = canvas.session.runtime.geometry(text.id).unwrap();
+        canvas
+            .session
+            .history
+            .record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+                GeometryChange {
+                    id: text.id,
+                    before,
+                    after,
+                },
+            ])));
+        assert!(canvas.session.undo().unwrap());
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert!(canvas.session.redo().unwrap());
         assert_eq!(layers.synchronize(&canvas), expected);
 
-        canvas.document.set_style(
+        canvas.session.runtime.set_style(
             text.id,
             ObjectStyle {
                 fill: None,
@@ -3854,19 +3879,18 @@ mod tests {
         );
         assert_eq!(layers.synchronize(&canvas), expected);
         canvas
-            .document
+            .session
+            .runtime
             .set_text_content(text.id, "Changed content must not replace Text 1".into());
         assert_eq!(layers.synchronize(&canvas), expected);
-        canvas
-            .history
-            .record(DocumentCommand::text(vec![TextChange {
-                id: text.id,
-                before: "hello".into(),
-                after: "Changed content must not replace Text 1".into(),
-            }]));
-        assert!(canvas.history.undo(&mut canvas.document));
+        canvas.commit(DocumentCommand::text(vec![TextChange {
+            id: text.id,
+            before: "hello".into(),
+            after: "Changed content must not replace Text 1".into(),
+        }]));
+        assert!(canvas.session.undo().unwrap());
         assert_eq!(layers.synchronize(&canvas), expected);
-        assert!(canvas.history.redo(&mut canvas.document));
+        assert!(canvas.session.redo().unwrap());
         assert_eq!(layers.synchronize(&canvas), expected);
 
         canvas.camera.offset = point(300.0, 400.0);
@@ -3882,7 +3906,7 @@ mod tests {
     #[test]
     fn layer_structure_revision_tracks_successful_mutations_and_history_order() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         assert_eq!(document.layer_structure_revision(), 0);
         let object = document.create_object(
             ObjectType::Text,
@@ -3897,8 +3921,12 @@ mod tests {
         let original_order: Vec<_> = document.objects().iter().map(|object| object.id).collect();
         let duplicates = document.duplicate_objects(&[ObjectId::EDITOR, object.id]);
         assert_eq!(document.layer_structure_revision(), 3);
-        history.record(DocumentCommand::insert(duplicates.clone()));
-        history.undo(&mut document);
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(
+            duplicates.clone(),
+        )));
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.layer_structure_revision(), 5);
         assert_eq!(
             document
@@ -3908,7 +3936,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             original_order
         );
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.layer_structure_revision(), 7);
         let order: Vec<_> = document.objects().iter().map(|object| object.id).collect();
         assert_eq!(
@@ -3920,8 +3950,10 @@ mod tests {
         );
         let removed = document.remove_objects(&[ObjectId::EDITOR, object.id]);
         assert_eq!(document.layer_structure_revision(), 9);
-        history.record(DocumentCommand::delete(removed));
-        history.undo(&mut document);
+        history.record(SemanticOperation::Runtime(DocumentCommand::delete(removed)));
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.layer_structure_revision(), 11);
         assert_eq!(
             document
@@ -3931,34 +3963,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             order
         );
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.layer_structure_revision(), 13);
     }
 
     #[test]
     fn layer_structure_revision_ignores_geometry_style_text_selection_and_camera() {
         let mut canvas = CanvasView::new();
-        let object = canvas.document.create_object(
+        let object = canvas.session.runtime.create_object(
             ObjectType::Text,
             point(1.0, 2.0),
             size(80.0, 30.0),
             Some("hello".into()),
         );
         let revision = canvas.layer_structure_revision();
-        let before = canvas.document.geometry(object.id).unwrap();
-        canvas.document.set_position(object.id, point(20.0, 30.0));
-        let after = canvas.document.geometry(object.id).unwrap();
+        let before = canvas.session.runtime.geometry(object.id).unwrap();
         canvas
+            .session
+            .runtime
+            .set_position(object.id, point(20.0, 30.0));
+        let after = canvas.session.runtime.geometry(object.id).unwrap();
+        canvas
+            .session
             .history
-            .record(DocumentCommand::geometry(vec![GeometryChange {
-                id: object.id,
-                before,
-                after,
-            }]));
-        canvas.history.undo(&mut canvas.document);
-        canvas.history.redo(&mut canvas.document);
-        canvas.document.set_size(object.id, size(100.0, 50.0));
-        canvas.document.set_style(
+            .record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+                GeometryChange {
+                    id: object.id,
+                    before,
+                    after,
+                },
+            ])));
+        canvas.session.undo().unwrap();
+        canvas.session.redo().unwrap();
+        canvas
+            .session
+            .runtime
+            .set_size(object.id, size(100.0, 50.0));
+        canvas.session.runtime.set_style(
             object.id,
             ObjectStyle {
                 fill: None,
@@ -3966,17 +4009,16 @@ mod tests {
             },
         );
         canvas
-            .document
+            .session
+            .runtime
             .set_text_content(object.id, "changed".into());
-        canvas
-            .history
-            .record(DocumentCommand::text(vec![TextChange {
-                id: object.id,
-                before: "hello".into(),
-                after: "changed".into(),
-            }]));
-        canvas.history.undo(&mut canvas.document);
-        canvas.history.redo(&mut canvas.document);
+        canvas.commit(DocumentCommand::text(vec![TextChange {
+            id: object.id,
+            before: "hello".into(),
+            after: "changed".into(),
+        }]));
+        canvas.session.undo().unwrap();
+        canvas.session.redo().unwrap();
         canvas.selection.click(Some(object.id), false);
         canvas.set_zoom_percent(200);
         canvas.camera.offset = point(100.0, 200.0);
@@ -4169,8 +4211,8 @@ mod tests {
         canvas.update_interaction(point(3.0, 0.0));
         canvas.finish_interaction(point(3.0, 0.0));
 
-        assert_eq!(canvas.document.objects().len(), 4);
-        assert!(canvas.history.undo_len() == 0);
+        assert_eq!(canvas.session.runtime.objects().len(), 4);
+        assert!(canvas.session.history.undo_len() == 0);
     }
 
     #[test]
@@ -4194,14 +4236,14 @@ mod tests {
 
             assert!(canvas.update_interaction(end_screen));
             assert!(canvas.interaction.preview().is_some());
-            assert_eq!(canvas.document.objects().len(), 4);
+            assert_eq!(canvas.session.runtime.objects().len(), 4);
             canvas.finish_interaction(end_screen);
 
-            let created = canvas.document.objects().last().unwrap();
+            let created = canvas.session.runtime.objects().last().unwrap();
             assert_eq!(created.object_type, object_type);
             assert_eq!(created.size, size(60.0, 40.0));
             assert_eq!(canvas.selection.ids(), &[created.id]);
-            assert_eq!(canvas.history.undo_len(), 1);
+            assert_eq!(canvas.session.history.undo_len(), 1);
         }
     }
 
@@ -4220,8 +4262,8 @@ mod tests {
 
         assert!(canvas.cancel_interaction());
 
-        assert_eq!(canvas.document.objects().len(), 4);
-        assert!(canvas.history.undo_len() == 0);
+        assert_eq!(canvas.session.runtime.objects().len(), 4);
+        assert!(canvas.session.history.undo_len() == 0);
         assert_eq!(canvas.selection.ids(), &[ObjectId::LANDING]);
         assert!(canvas.interaction.preview().is_none());
     }
@@ -4239,12 +4281,12 @@ mod tests {
 
         canvas.finish_interaction(point(100.0, 120.0));
 
-        let text = canvas.document.objects().last().unwrap();
+        let text = canvas.session.runtime.objects().last().unwrap();
         assert_eq!(text.object_type, ObjectType::Text);
         assert_eq!(text.text_content.as_deref(), Some("Type something"));
         assert_eq!(text.position, point(100.0, 120.0));
         assert_eq!(canvas.selection.ids(), &[text.id]);
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(canvas.session.history.undo_len(), 1);
     }
 
     #[test]
@@ -4570,89 +4612,425 @@ mod tests {
         );
     }
 
-    fn record_position(history: &mut History, document: &mut Document, id: ObjectId, x: f32) {
+    fn record_position(
+        history: &mut SemanticHistory,
+        document: &mut Document,
+        id: ObjectId,
+        x: f32,
+    ) {
         let before = document.geometry(id).unwrap();
         let after = Geometry {
             position: point(x, before.position.y),
             size: before.size,
         };
         document.set_geometry(id, after);
-        history.record(DocumentCommand::geometry(vec![GeometryChange {
-            id,
-            before,
-            after,
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+            GeometryChange { id, before, after },
+        ])));
     }
 
-    /// Architectural invariant: the canvas facade and the persistent document
-    /// must not become two independent history implementations.
+    /// Start a move gesture the way a pointer-down on a selected object does.
+    fn begin_live_move(canvas: &mut CanvasView, ids: &[ObjectId]) {
+        let start = point(0.0, 0.0);
+        canvas.interaction = Interaction::PotentialMove(MoveGesture {
+            pointer_start_screen: start,
+            pointer_start_world: start,
+            objects: snapshots(&canvas.session.runtime, ids),
+            selected_ids: ids.to_vec(),
+            click_selection: ClickSelection::SelectOnly(ids[0]),
+        });
+    }
+
+    /// Drive a gesture to `end` and commit it, exactly as pointer-up does.
     ///
-    /// This is the observable consequence of `History` holding nothing but a
-    /// `SemanticHistory`. A canvas command and a metadata rename pushed into
-    /// the same facade must undo as one LIFO sequence: if the two stacks were
-    /// ever separate, the rename would either be invisible to the canvas
-    /// facade or would undo out of order relative to the move.
+    /// Returns whether the gesture was considered live, which is false for a
+    /// click that never moved.
+    fn drag_to(canvas: &mut CanvasView, end: Point<f32>) -> bool {
+        let live = canvas.update_interaction(end);
+        canvas.finish_interaction(end);
+        live
+    }
+
+    fn positions(canvas: &CanvasView, ids: &[ObjectId]) -> Vec<(f32, f32)> {
+        ids.iter()
+            .map(|id| {
+                let g = canvas.session.runtime.geometry(*id).expect("object");
+                (g.position.x, g.position.y)
+            })
+            .collect()
+    }
+
     #[test]
-    fn canvas_history_and_metadata_share_one_stack() {
-        use crate::operations::{apply, OperationTarget};
-        use crate::source_document::PersistentDocument;
+    fn live_move_commits_exactly_one_entry_and_undo_redo_round_trips() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let before = canvas.session.runtime.geometry(id).unwrap();
+        assert_eq!(canvas.session.history.undo_len(), 0);
 
-        let mut canvas_document = Document::default();
-        let mut metadata = PersistentDocument {
-            structure: crate::source_document::LamineStructure {
-                nodes: vec![crate::source_document::StructuralNode {
-                    id: crate::source_document::NodeId::new("spool-shared").unwrap(),
-                    name: "Shared".into(),
-                    kind: "frame".into(),
-                    parent: None,
-                    children: vec![],
-                    source: crate::source_document::SourceBinding {
-                        file: "index.html".into(),
-                        selector: "[data-spool-id=\"spool-shared\"]".into(),
-                    },
-                }],
-            },
-            sources: Default::default(),
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(37.0, 23.0));
+
+        let moved = canvas.session.runtime.geometry(id).unwrap();
+        assert_eq!(
+            moved.position,
+            point(before.position.x + 37.0, before.position.y + 23.0)
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "one committed gesture is one entry, not one per pointer event"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), before);
+        assert!(canvas.redo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), moved);
+    }
+
+    #[test]
+    fn live_resize_commits_exactly_one_entry_and_undo_redo_round_trips() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let before = canvas.session.runtime.geometry(id).unwrap();
+
+        let start = point(0.0, 0.0);
+        canvas.interaction = Interaction::PotentialResize(ResizeGesture {
+            pointer_start_screen: start,
+            pointer_start_world: start,
+            object: snapshots(&canvas.session.runtime, &[id])[0],
+            handle: ResizeHandle::BottomRight,
+        });
+        drag_to(&mut canvas, point(30.0, 15.0));
+
+        let resized = canvas.session.runtime.geometry(id).unwrap();
+        assert_ne!(resized, before, "the live resize changed the object");
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "one committed resize is one entry"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), before);
+        assert!(canvas.redo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), resized);
+    }
+
+    #[test]
+    fn live_multi_object_move_is_one_entry_and_undo_restores_all() {
+        let mut canvas = CanvasView::new();
+        let ids = [ObjectId::LANDING, ObjectId::EDITOR, ObjectId::FEATURES];
+        let before = positions(&canvas, &ids);
+
+        begin_live_move(&mut canvas, &ids);
+        drag_to(&mut canvas, point(25.0, 12.0));
+
+        let moved = positions(&canvas, &ids);
+        for (id, (x, y)) in moved.iter().enumerate() {
+            assert_eq!(*x, before[id].0 + 25.0, "object {id} moved horizontally");
+            assert_eq!(*y, before[id].1 + 12.0, "object {id} moved vertically");
+        }
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "three objects dragged together is still one semantic edit"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(
+            positions(&canvas, &ids),
+            before,
+            "undo restored every object"
+        );
+        assert!(canvas.redo_history());
+        assert_eq!(positions(&canvas, &ids), moved);
+    }
+
+    #[test]
+    fn live_gesture_cancel_restores_geometry_and_records_nothing() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let before = canvas.session.runtime.geometry(id).unwrap();
+
+        begin_live_move(&mut canvas, &[id]);
+        // Transient mutation happens exactly as it would during a real drag.
+        assert!(canvas.update_interaction(point(80.0, 45.0)));
+        assert_ne!(
+            canvas.session.runtime.geometry(id).unwrap(),
+            before,
+            "the preview really moved the object"
+        );
+
+        assert!(canvas.cancel_interaction(), "the gesture was active");
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap(),
+            before,
+            "cancel restored the exact pre-gesture geometry"
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            0,
+            "a cancelled gesture must not become a history entry"
+        );
+        assert!(!canvas.session.history.can_undo());
+        assert!(!canvas.session.history.can_redo());
+    }
+
+    #[test]
+    fn live_selection_camera_pan_and_zoom_never_enter_history() {
+        let mut canvas = CanvasView::new();
+        // Commit one real edit so the stack is non-empty and any stray entry
+        // from runtime state would be visible.
+        begin_live_move(&mut canvas, &[ObjectId::LANDING]);
+        drag_to(&mut canvas, point(10.0, 10.0));
+        let depth = canvas.session.history.undo_len();
+        assert_eq!(depth, 1);
+
+        // Selection changes.
+        canvas.selection.click(Some(ObjectId::EDITOR), false);
+        canvas.selection.click(Some(ObjectId::FEATURES), true);
+        // Camera changes: pan offset and zoom.
+        canvas.camera.offset = point(-140.0, 92.0);
+        canvas.camera.set_zoom_at_center(2.5);
+        canvas.camera.fit();
+        canvas.pan = Some(PanGesture {
+            button: MouseButton::Left,
+            pointer_start: point(0.0, 0.0),
+            offset_start: point(0.0, 0.0),
+        });
+
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            depth,
+            "selection, camera, pan and zoom are runtime state, not history"
+        );
+        assert_eq!(canvas.selection.ids().len(), 2);
+    }
+
+    #[test]
+    fn live_canvas_edit_then_rename_undoes_in_commit_order() {
+        use crate::operations::SemanticOperation;
+        use crate::source_document::{LamineStructure, RenameNode, SourceBinding, StructuralNode};
+
+        let mut canvas = CanvasView::new();
+        canvas.session.document.structure = LamineStructure {
+            nodes: vec![StructuralNode {
+                id: NodeId::new("spool-order").unwrap(),
+                name: "Ordered".into(),
+                kind: "frame".into(),
+                parent: None,
+                children: vec![],
+                source: SourceBinding {
+                    file: "index.html".into(),
+                    selector: "[data-spool-id=\"spool-order\"]".into(),
+                },
+            }],
         };
+        let id = ObjectId::LANDING;
+        let resting = canvas.session.runtime.geometry(id).unwrap();
 
-        // Commit a canvas move, then a metadata rename, into the one facade.
-        let mut history = History::default();
-        record_position(&mut history, &mut canvas_document, ObjectId::LANDING, 100.0);
+        // Opposite order from the sibling test: canvas edit FIRST.
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(18.0, 9.0));
+        let moved = canvas.session.runtime.geometry(id).unwrap();
 
-        let rename = SemanticOperation::Rename(crate::source_document::RenameNode {
-            id: crate::source_document::NodeId::new("spool-shared").unwrap(),
+        canvas
+            .session
+            .execute(SemanticOperation::Rename(RenameNode {
+                id: NodeId::new("spool-order").unwrap(),
+                before: "Ordered".into(),
+                after: "Reordered".into(),
+            }))
+            .unwrap();
+        assert_eq!(canvas.session.history.undo_len(), 2);
+
+        // First undo pops the rename (committed last) and must leave the
+        // canvas move completely untouched.
+        assert!(canvas.undo_history());
+        assert_eq!(canvas.session.document.structure.nodes[0].name, "Ordered");
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), moved);
+
+        // Second undo pops the canvas move.
+        assert!(canvas.undo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), resting);
+        assert_eq!(canvas.session.history.undo_len(), 0);
+
+        // Redo replays in the same order.
+        assert!(canvas.redo_history());
+        assert_eq!(canvas.session.runtime.geometry(id).unwrap(), moved);
+        assert!(canvas.redo_history());
+        assert_eq!(canvas.session.document.structure.nodes[0].name, "Reordered");
+    }
+
+    #[test]
+    fn live_no_op_gesture_records_nothing_and_preserves_redo() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+
+        begin_live_move(&mut canvas, &[id]);
+        // Pointer goes down and up in the same place: a real click, not a drag.
+        assert!(
+            !drag_to(&mut canvas, point(0.0, 0.0)),
+            "a pointer that never moved is a click, not a drag"
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            0,
+            "a gesture that ends where it started is not a committed edit"
+        );
+
+        // A real edit, undone, leaves a redo branch.
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(12.0, 0.0));
+        let moved_x = canvas.session.runtime.geometry(id).unwrap().position.x;
+        assert!(canvas.undo_history());
+        assert!(canvas.session.history.can_redo());
+
+        // A no-op afterwards must not destroy that redo branch.
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(0.0, 0.0));
+        assert!(
+            canvas.session.history.can_redo(),
+            "a no-op must not clear the redo branch"
+        );
+        assert!(canvas.redo_history());
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap().position.x,
+            moved_x,
+            "redo restored the undone drag"
+        );
+    }
+
+    /// Architectural invariant, proven through the live editor path.
+    ///
+    /// This drives a real [`CanvasView`] through the real gesture entry
+    /// points (`update_interaction` / `finish_interaction` / `undo`) rather
+    /// than calling [`EditSession`] directly, so it fails if the canvas ever
+    /// stops routing committed edits through the semantic boundary.
+    ///
+    /// The claim under test: a canvas move and a metadata rename live in one
+    /// stack and undo as one LIFO sequence. If the canvas kept a private
+    /// history beside the session, the rename would be invisible here.
+    #[test]
+    fn live_canvas_and_metadata_share_one_history_stack() {
+        use crate::operations::SemanticOperation;
+        use crate::source_document::{LamineStructure, RenameNode, SourceBinding, StructuralNode};
+
+        let mut canvas = CanvasView::new();
+
+        // Give the session a real node so a metadata rename has a target.
+        canvas.session.document.structure = LamineStructure {
+            nodes: vec![StructuralNode {
+                id: NodeId::new("spool-shared").unwrap(),
+                name: "Shared".into(),
+                kind: "frame".into(),
+                parent: None,
+                children: vec![],
+                source: SourceBinding {
+                    file: "index.html".into(),
+                    selector: "[data-spool-id=\"spool-shared\"]".into(),
+                },
+            }],
+        };
+        assert_eq!(canvas.session.history.undo_len(), 0);
+
+        // --- Live canvas gesture: pointer down, move, pointer up. ---
+        let origin = point(0.0, 0.0);
+        let pointer_end = point(60.0, 40.0);
+        let resting = canvas
+            .session
+            .runtime
+            .geometry(ObjectId::LANDING)
+            .unwrap()
+            .position;
+        let expected = point(resting.x + 60.0, resting.y + 40.0);
+        canvas.interaction = Interaction::PotentialMove(MoveGesture {
+            pointer_start_screen: origin,
+            pointer_start_world: origin,
+            objects: snapshots(&canvas.session.runtime, &[ObjectId::LANDING]),
+            selected_ids: vec![ObjectId::LANDING],
+            click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+        });
+        assert!(canvas.update_interaction(pointer_end));
+        canvas.finish_interaction(pointer_end);
+
+        assert_eq!(
+            canvas
+                .session
+                .runtime
+                .geometry(ObjectId::LANDING)
+                .unwrap()
+                .position,
+            expected,
+            "the live gesture moved the object"
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "one entry for the move"
+        );
+
+        // --- A metadata rename on the same session, through the boundary. ---
+        // `execute` is the single mutation entry point: it validates, records,
+        // and applies. No separate apply call, or the rename would be applied
+        // twice and the second attempt would correctly fail as stale.
+        let rename = SemanticOperation::Rename(RenameNode {
+            id: NodeId::new("spool-shared").unwrap(),
             before: "Shared".into(),
             after: "Renamed".into(),
         });
-        assert!(history.inner.record(rename.clone()));
-        apply(
-            &rename,
-            &mut OperationTarget::Document(&mut metadata),
-            ReplayDirection::Redo,
-        )
-        .expect("the rename applies");
-        assert_eq!(metadata.structure.nodes[0].name, "Renamed");
-        assert_eq!(history.undo_len(), 2, "both operations share one depth");
-
-        // Undo order is strictly LIFO across the two kinds: the rename, which
-        // was committed second, comes off first.
-        assert!(history
-            .inner
-            .undo(&mut OperationTarget::Document(&mut metadata))
-            .expect("rename undoes"));
-        assert_eq!(metadata.structure.nodes[0].name, "Shared");
-        assert_eq!(canvas_document.geometry(ObjectId::LANDING).unwrap().position.x, 100.0);
-
-        assert!(history.undo(&mut canvas_document), "then the move undoes");
+        assert!(canvas.session.execute(rename).unwrap());
+        assert_eq!(canvas.session.document.structure.nodes[0].name, "Renamed");
         assert_eq!(
-            canvas_document.geometry(ObjectId::LANDING).unwrap().position.x,
-            0.0
+            canvas.session.history.undo_len(),
+            2,
+            "the rename and the move share one depth"
         );
 
-        // And the canvas facade reports the stack empty afterwards, proving
-        // both entries were in the same place rather than one being hidden.
-        assert_eq!(history.undo_len(), 0);
-        assert!(!history.can_undo());
+        // --- Undo is strictly LIFO across both kinds. ---
+        assert!(canvas.undo_history());
+        assert_eq!(
+            canvas.session.document.structure.nodes[0].name, "Shared",
+            "the rename, committed second, undoes first"
+        );
+        assert_eq!(
+            canvas
+                .session
+                .runtime
+                .geometry(ObjectId::LANDING)
+                .unwrap()
+                .position,
+            expected,
+            "the move is untouched until the rename is undone"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(
+            canvas
+                .session
+                .runtime
+                .geometry(ObjectId::LANDING)
+                .unwrap()
+                .position,
+            resting,
+            "then the live canvas move undoes"
+        );
+        assert_eq!(canvas.session.history.undo_len(), 0);
+
+        // --- And redo replays both in the same order. ---
+        assert!(canvas.redo_history());
+        assert_eq!(
+            canvas
+                .session
+                .runtime
+                .geometry(ObjectId::LANDING)
+                .unwrap()
+                .position,
+            expected
+        );
+        assert!(canvas.redo_history());
+        assert_eq!(canvas.session.document.structure.nodes[0].name, "Renamed");
+        assert_eq!(canvas.session.history.redo_len(), 0);
     }
 
     fn snapshots(document: &Document, ids: &[ObjectId]) -> Vec<ObjectSnapshot> {
@@ -4667,7 +5045,7 @@ mod tests {
     #[test]
     fn history_records_a_geometry_command() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
 
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
 
@@ -4679,26 +5057,30 @@ mod tests {
     #[test]
     fn create_command_can_be_undone_and_redone_with_the_same_id() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let created = document.create_object(
             ObjectType::Rectangle,
             point(40.0, 50.0),
             size(120.0, 80.0),
             None,
         );
-        history.record(DocumentCommand::insert(vec![document
-            .placement(created.id)
-            .unwrap()]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            document.placement(created.id).unwrap(),
+        ])));
         assert_eq!(document.objects().len(), 5);
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.objects().len(), 4);
         assert!(document.object(created.id).is_none());
         let after_undo =
             document.create_object(ObjectType::Ellipse, point(0.0, 0.0), size(50.0, 50.0), None);
         assert_ne!(after_undo.id, created.id);
 
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.object(created.id), Some(&created));
         assert_eq!(document.objects()[4].id, created.id);
         assert_eq!(document.objects().last().unwrap().id, after_undo.id);
@@ -4707,7 +5089,7 @@ mod tests {
     #[test]
     fn create_move_undoes_geometry_before_creation() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let object = document.create_object(
             ObjectType::Rectangle,
             point(40.0, 50.0),
@@ -4715,29 +5097,39 @@ mod tests {
             None,
         );
         let initial = object.geometry();
-        history.record(DocumentCommand::insert(vec![document
-            .placement(object.id)
-            .unwrap()]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            document.placement(object.id).unwrap(),
+        ])));
         let moved = Geometry {
             position: point(90.0, 110.0),
             size: initial.size,
         };
         document.set_geometry(object.id, moved);
-        history.record(DocumentCommand::geometry(vec![GeometryChange {
-            id: object.id,
-            before: initial,
-            after: moved,
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+            GeometryChange {
+                id: object.id,
+                before: initial,
+                after: moved,
+            },
+        ])));
 
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.geometry(object.id), Some(initial));
         assert_eq!(document.objects().len(), 5);
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert!(document.object(object.id).is_none());
 
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.geometry(object.id), Some(initial));
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(document.geometry(object.id), Some(moved));
     }
 
@@ -4745,10 +5137,12 @@ mod tests {
     fn undo_restores_a_move_snapshot() {
         let mut document = Document::default();
         let original = document.geometry(ObjectId::LANDING).unwrap();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
 
         assert_eq!(document.geometry(ObjectId::LANDING), Some(original));
     }
@@ -4756,11 +5150,15 @@ mod tests {
     #[test]
     fn redo_reapplies_a_move_snapshot() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
 
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
 
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
@@ -4771,16 +5169,20 @@ mod tests {
     #[test]
     fn multiple_commands_undo_in_reverse_order() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
         record_position(&mut history, &mut document, ObjectId::LANDING, 200.0);
 
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
             100.0
         );
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
             0.0
@@ -4790,18 +5192,26 @@ mod tests {
     #[test]
     fn multiple_commands_redo_in_forward_order() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
         record_position(&mut history, &mut document, ObjectId::LANDING, 200.0);
-        history.undo(&mut document);
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
 
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
             100.0
         );
-        history.redo(&mut document);
+        history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert_eq!(
             document.geometry(ObjectId::LANDING).unwrap().position.x,
             200.0
@@ -4812,7 +5222,7 @@ mod tests {
     fn multi_object_move_commits_as_one_command_and_undoes_together() {
         let mut canvas = CanvasView::new();
         let ids = [ObjectId::LANDING, ObjectId::EDITOR];
-        let before = snapshots(&canvas.document, &ids);
+        let before = snapshots(&canvas.session.runtime, &ids);
         let gesture = MoveGesture {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(0.0, 0.0),
@@ -4823,24 +5233,27 @@ mod tests {
         canvas.interaction = Interaction::Moving(gesture);
         canvas.finish_interaction(point(50.0, 25.0));
 
-        assert_eq!(canvas.history.undo_len(), 1);
-        match &canvas.history.peek_undo_command().expect("an entry").operation {
+        assert_eq!(canvas.session.history.undo_len(), 1);
+        match &match canvas.session.history.peek_undo() {
+            Some(SemanticOperation::Runtime(command)) => &command.operation,
+            _ => panic!("expected a recorded canvas command"),
+        } {
             CommandOperation::Geometry(changes) => assert_eq!(changes.len(), 2),
             _ => panic!("expected geometry command"),
         }
         assert_eq!(
-            canvas.document.geometry(ids[0]).unwrap().position,
+            canvas.session.runtime.geometry(ids[0]).unwrap().position,
             point(50.0, 49.0)
         );
         assert_eq!(
-            canvas.document.geometry(ids[1]).unwrap().position,
+            canvas.session.runtime.geometry(ids[1]).unwrap().position,
             point(504.0, 49.0)
         );
 
-        canvas.history.undo(&mut canvas.document);
+        canvas.session.undo().unwrap();
         for snapshot in before {
             assert_eq!(
-                canvas.document.geometry(snapshot.id),
+                canvas.session.runtime.geometry(snapshot.id),
                 Some(snapshot.geometry)
             );
         }
@@ -4850,7 +5263,7 @@ mod tests {
     fn redo_restores_every_object_in_a_multi_object_move() {
         let mut canvas = CanvasView::new();
         let ids = [ObjectId::LANDING, ObjectId::EDITOR];
-        let before = snapshots(&canvas.document, &ids);
+        let before = snapshots(&canvas.session.runtime, &ids);
         canvas.interaction = Interaction::Moving(MoveGesture {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(0.0, 0.0),
@@ -4861,23 +5274,25 @@ mod tests {
         canvas.finish_interaction(point(50.0, 25.0));
         let after: Vec<_> = ids
             .iter()
-            .map(|id| canvas.document.geometry(*id).unwrap())
+            .map(|id| canvas.session.runtime.geometry(*id).unwrap())
             .collect();
-        canvas.history.undo(&mut canvas.document);
+        canvas.session.undo().unwrap();
 
-        assert!(canvas.history.redo(&mut canvas.document));
+        assert!(canvas.session.redo().unwrap());
 
         for (id, geometry) in ids.into_iter().zip(after) {
-            assert_eq!(canvas.document.geometry(id), Some(geometry));
+            assert_eq!(canvas.session.runtime.geometry(id), Some(geometry));
         }
     }
 
     #[test]
     fn new_command_invalidates_redo_branch() {
         let mut document = Document::default();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         record_position(&mut history, &mut document, ObjectId::LANDING, 100.0);
-        history.undo(&mut document);
+        history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap();
         assert!(history.can_redo());
 
         record_position(&mut history, &mut document, ObjectId::LANDING, 250.0);
@@ -4892,14 +5307,16 @@ mod tests {
 
     #[test]
     fn no_op_geometry_change_is_not_recorded() {
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let geometry = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        history.record(DocumentCommand::geometry(vec![GeometryChange {
-            id: ObjectId::LANDING,
-            before: geometry,
-            after: geometry,
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+            GeometryChange {
+                id: ObjectId::LANDING,
+                before: geometry,
+                after: geometry,
+            },
+        ])));
 
         assert!(!history.can_undo());
     }
@@ -4907,7 +5324,7 @@ mod tests {
     #[test]
     fn resize_interaction_can_be_undone_and_redone() {
         let mut canvas = CanvasView::new();
-        let snapshot = snapshots(&canvas.document, &[ObjectId::LANDING])[0];
+        let snapshot = snapshots(&canvas.session.runtime, &[ObjectId::LANDING])[0];
         canvas.interaction = Interaction::Resizing(ResizeGesture {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(0.0, 0.0),
@@ -4915,16 +5332,19 @@ mod tests {
             handle: ResizeHandle::Right,
         });
         canvas.finish_interaction(point(24.0, 0.0));
-        let resized = canvas.document.geometry(ObjectId::LANDING).unwrap();
+        let resized = canvas.session.runtime.geometry(ObjectId::LANDING).unwrap();
 
-        assert_eq!(canvas.history.undo_len(), 1);
-        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(canvas.session.history.undo_len(), 1);
+        assert!(canvas.session.undo().unwrap());
         assert_eq!(
-            canvas.document.geometry(ObjectId::LANDING),
+            canvas.session.runtime.geometry(ObjectId::LANDING),
             Some(snapshot.geometry)
         );
-        assert!(canvas.history.redo(&mut canvas.document));
-        assert_eq!(canvas.document.geometry(ObjectId::LANDING), Some(resized));
+        assert!(canvas.session.redo().unwrap());
+        assert_eq!(
+            canvas.session.runtime.geometry(ObjectId::LANDING),
+            Some(resized)
+        );
     }
 
     #[test]
@@ -4940,7 +5360,7 @@ mod tests {
         };
         apply_move(&mut document, &gesture.objects, point(80.0, 30.0));
         let interaction = Interaction::Moving(gesture);
-        let history = History::default();
+        let history = SemanticHistory::default();
 
         interaction.restore(&mut document);
 
@@ -4955,7 +5375,7 @@ mod tests {
     #[test]
     fn click_or_return_to_start_does_not_create_history() {
         let mut canvas = CanvasView::new();
-        let snapshot = snapshots(&canvas.document, &[ObjectId::LANDING])[0];
+        let snapshot = snapshots(&canvas.session.runtime, &[ObjectId::LANDING])[0];
         canvas.interaction = Interaction::PotentialMove(MoveGesture {
             pointer_start_screen: point(10.0, 10.0),
             pointer_start_world: point(0.0, 0.0),
@@ -4964,7 +5384,7 @@ mod tests {
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
         });
         canvas.finish_interaction(point(10.0, 10.0));
-        assert!(!canvas.history.can_undo());
+        assert!(!canvas.session.history.can_undo());
 
         canvas.interaction = Interaction::Moving(MoveGesture {
             pointer_start_screen: point(0.0, 0.0),
@@ -4974,7 +5394,7 @@ mod tests {
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
         });
         canvas.finish_interaction(point(0.0, 0.0));
-        assert!(!canvas.history.can_undo());
+        assert!(!canvas.session.history.can_undo());
     }
 
     #[test]
@@ -4988,8 +5408,8 @@ mod tests {
             .pan_from(point(0.0, 0.0), point(0.0, 0.0), point(40.0, 20.0));
         canvas.camera.fit();
 
-        assert!(!canvas.history.can_undo());
-        assert!(!canvas.history.can_redo());
+        assert!(!canvas.session.history.can_undo());
+        assert!(!canvas.session.history.can_redo());
     }
 
     #[test]
@@ -5079,16 +5499,22 @@ mod tests {
             None,
         );
         let original_node_id = original.spool_id.clone();
-        let mut history = History::default();
-        history.record(DocumentCommand::insert(vec![document
-            .placement(original.id)
-            .unwrap()]));
+        let mut history = SemanticHistory::default();
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            document.placement(original.id).unwrap(),
+        ])));
 
         let duplicate = document.duplicate_objects(&[original.id]).remove(0);
         assert_ne!(duplicate.object.spool_id, original_node_id);
-        history.record(DocumentCommand::insert(vec![duplicate.clone()]));
-        assert!(history.undo(&mut document));
-        assert!(history.redo(&mut document));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            duplicate.clone(),
+        ])));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
 
         assert_eq!(
             document.object(original.id).unwrap().spool_id,
@@ -5202,13 +5628,15 @@ mod tests {
             None,
         );
         let expected = document.objects().to_vec();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let deleted = document.remove_objects(&[first.id, second.id]);
-        history.record(DocumentCommand::delete(deleted));
+        history.record(SemanticOperation::Runtime(DocumentCommand::delete(deleted)));
 
         assert_eq!(history.undo_len(), 1);
         assert_eq!(document.objects().len(), 4);
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.objects(), expected);
         assert_eq!(
             document.object(first.id).unwrap().text_content.as_deref(),
@@ -5225,18 +5653,22 @@ mod tests {
             size(100.0, 50.0),
             None,
         );
-        let mut history = History::default();
-        history.record(DocumentCommand::insert(vec![document
-            .placement(created.id)
-            .unwrap()]));
-        history.record(DocumentCommand::delete(
+        let mut history = SemanticHistory::default();
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            document.placement(created.id).unwrap(),
+        ])));
+        history.record(SemanticOperation::Runtime(DocumentCommand::delete(
             document.remove_objects(&[created.id]),
-        ));
+        )));
 
         assert!(document.object(created.id).is_none());
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.object(created.id), Some(&created));
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(document.object(created.id).is_none());
     }
 
@@ -5249,16 +5681,22 @@ mod tests {
             size(80.0, 60.0),
             None,
         );
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let duplicate_objects = document.duplicate_objects(&[original.id]);
         let duplicate_id = duplicate_objects[0].object.id;
-        history.record(DocumentCommand::insert(duplicate_objects));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(
+            duplicate_objects,
+        )));
         assert_eq!(history.undo_len(), 1);
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(document.object(original.id).is_some());
         assert!(document.object(duplicate_id).is_none());
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.objects().last().unwrap().id, duplicate_id);
     }
 
@@ -5271,11 +5709,13 @@ mod tests {
             size(40.0, 40.0),
             None,
         );
-        let mut history = History::default();
-        history.record(DocumentCommand::delete(
+        let mut history = SemanticHistory::default();
+        history.record(SemanticOperation::Runtime(DocumentCommand::delete(
             document.remove_objects(&[target.id]),
-        ));
-        assert!(history.undo(&mut document));
+        )));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(history.can_redo());
 
         let created = document.create_object(
@@ -5284,9 +5724,9 @@ mod tests {
             size(50.0, 50.0),
             None,
         );
-        history.record(DocumentCommand::insert(vec![document
-            .placement(created.id)
-            .unwrap()]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(vec![
+            document.placement(created.id).unwrap(),
+        ])));
 
         assert!(!history.can_redo());
         assert!(document.object(target.id).is_some());
@@ -5302,25 +5742,33 @@ mod tests {
             size(80.0, 60.0),
             None,
         );
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let duplicates = document.duplicate_objects(&[original.id]);
         let duplicate = duplicates[0].object.clone();
-        history.record(DocumentCommand::insert(duplicates));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(
+            duplicates,
+        )));
         let before_move = duplicate.geometry();
         let after_move = Geometry {
             position: point(before_move.position.x + 22.0, before_move.position.y + 9.0),
             size: before_move.size,
         };
         document.set_geometry(duplicate.id, after_move);
-        history.record(DocumentCommand::geometry(vec![GeometryChange {
-            id: duplicate.id,
-            before: before_move,
-            after: after_move,
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::geometry(vec![
+            GeometryChange {
+                id: duplicate.id,
+                before: before_move,
+                after: after_move,
+            },
+        ])));
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.geometry(duplicate.id), Some(before_move));
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(document.object(duplicate.id).is_none());
         assert!(document.object(original.id).is_some());
     }
@@ -5328,7 +5776,7 @@ mod tests {
     #[test]
     fn selection_delete_clears_ids_and_selection_reconciliation_drops_missing_objects() {
         let mut canvas = CanvasView::new();
-        let created = canvas.document.create_object(
+        let created = canvas.session.runtime.create_object(
             ObjectType::Rectangle,
             point(10.0, 10.0),
             size(60.0, 40.0),
@@ -5337,13 +5785,13 @@ mod tests {
         canvas.selection.click(Some(created.id), false);
         assert!(canvas.delete_selected_objects());
         assert!(canvas.selection.is_empty());
-        assert!(canvas.document.object(created.id).is_none());
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert!(canvas.session.runtime.object(created.id).is_none());
+        assert_eq!(canvas.session.history.undo_len(), 1);
 
-        canvas.history.undo(&mut canvas.document);
+        canvas.session.undo().unwrap();
         canvas.retain_existing_selection();
         assert!(canvas.selection.is_empty());
-        canvas.history.redo(&mut canvas.document);
+        canvas.session.redo().unwrap();
         canvas.retain_existing_selection();
         assert!(canvas.selection.is_empty());
     }
@@ -5351,13 +5799,13 @@ mod tests {
     #[test]
     fn duplication_selects_only_the_duplicates_and_is_one_command() {
         let mut canvas = CanvasView::new();
-        let first = canvas.document.create_object(
+        let first = canvas.session.runtime.create_object(
             ObjectType::Rectangle,
             point(10.0, 10.0),
             size(60.0, 40.0),
             None,
         );
-        let second = canvas.document.create_object(
+        let second = canvas.session.runtime.create_object(
             ObjectType::Ellipse,
             point(100.0, 100.0),
             size(60.0, 40.0),
@@ -5371,35 +5819,45 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(!selected.contains(&first.id));
         assert!(!selected.contains(&second.id));
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(canvas.session.history.undo_len(), 1);
         assert_eq!(
-            canvas.document.object(selected[0]).unwrap().object_type,
+            canvas
+                .session
+                .runtime
+                .object(selected[0])
+                .unwrap()
+                .object_type,
             ObjectType::Rectangle
         );
         assert_eq!(
-            canvas.document.object(selected[1]).unwrap().object_type,
+            canvas
+                .session
+                .runtime
+                .object(selected[1])
+                .unwrap()
+                .object_type,
             ObjectType::Ellipse
         );
         assert!(selected
             .iter()
-            .all(|id| canvas.document.object(*id).is_some()));
+            .all(|id| canvas.session.runtime.object(*id).is_some()));
     }
 
     #[test]
     fn deleting_multiple_selected_objects_is_one_command_and_undo_restores_them() {
         let mut canvas = CanvasView::new();
         let ids = [ObjectId::LANDING, ObjectId::EDITOR];
-        let before = canvas.document.objects().to_vec();
+        let before = canvas.session.runtime.objects().to_vec();
         canvas.selection.replace(ids.to_vec());
 
         assert!(canvas.delete_selected_objects());
 
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(canvas.session.history.undo_len(), 1);
         assert!(canvas.selection.is_empty());
-        assert!(canvas.document.object(ids[0]).is_none());
-        assert!(canvas.document.object(ids[1]).is_none());
-        assert!(canvas.history.undo(&mut canvas.document));
-        assert_eq!(canvas.document.objects(), before);
+        assert!(canvas.session.runtime.object(ids[0]).is_none());
+        assert!(canvas.session.runtime.object(ids[1]).is_none());
+        assert!(canvas.session.undo().unwrap());
+        assert_eq!(canvas.session.runtime.objects(), before);
     }
 
     #[test]
@@ -5408,8 +5866,8 @@ mod tests {
 
         assert!(!canvas.delete_selected_objects());
         assert!(!canvas.duplicate_selected_objects());
-        assert_eq!(canvas.document.objects().len(), 4);
-        assert!(!canvas.history.can_undo());
+        assert_eq!(canvas.session.runtime.objects().len(), 4);
+        assert!(!canvas.session.history.can_undo());
     }
 
     #[test]
@@ -5440,7 +5898,7 @@ mod tests {
 
     fn apply_style_to_document(
         document: &mut Document,
-        history: &mut History,
+        history: &mut SemanticHistory,
         ids: &[ObjectId],
         edit: StyleEdit,
     ) {
@@ -5459,7 +5917,7 @@ mod tests {
         for change in &changes {
             document.set_style(change.id, change.after);
         }
-        history.record(DocumentCommand::style(changes));
+        history.record(SemanticOperation::Runtime(DocumentCommand::style(changes)));
     }
 
     #[test]
@@ -5473,7 +5931,7 @@ mod tests {
         );
         let green = Color::from_rgb(theme::SAGE);
         let red = Color::from_rgb(0xc45d5d);
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
 
         apply_style_to_document(
             &mut document,
@@ -5531,7 +5989,7 @@ mod tests {
             None,
         );
         let default = document.style(object.id).unwrap();
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let blue = Color::from_rgb(0x6689c7);
 
         apply_style_to_document(
@@ -5542,9 +6000,13 @@ mod tests {
         );
         let changed = document.style(object.id).unwrap();
         assert_eq!(history.undo_len(), 1);
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.style(object.id), Some(default));
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.style(object.id), Some(changed));
 
         let commands = history.undo_len();
@@ -5560,13 +6022,13 @@ mod tests {
     #[test]
     fn style_changes_are_one_command_for_multi_selection_and_preserve_selection() {
         let mut canvas = CanvasView::new();
-        let rectangle = canvas.document.create_object(
+        let rectangle = canvas.session.runtime.create_object(
             ObjectType::Rectangle,
             point(10.0, 10.0),
             size(80.0, 60.0),
             None,
         );
-        let text = canvas.document.create_object(
+        let text = canvas.session.runtime.create_object(
             ObjectType::Text,
             point(110.0, 10.0),
             size(80.0, 60.0),
@@ -5578,27 +6040,29 @@ mod tests {
 
         assert!(canvas.apply_selected_style(StyleEdit::Fill(Some(fill))));
 
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(canvas.session.history.undo_len(), 1);
         assert_eq!(canvas.selection.ids(), selected);
-        assert!(selected
-            .iter()
-            .all(|id| { canvas.document.object(*id).unwrap().fill == Some(Fill { color: fill }) }));
-        assert!(
-            matches!(canvas.history.peek_undo_command().expect("an entry").operation, CommandOperation::Style(ref changes) if changes.len() == 2)
-        );
+        assert!(selected.iter().all(|id| {
+            canvas.session.runtime.object(*id).unwrap().fill == Some(Fill { color: fill })
+        }));
+        assert!(matches!(match canvas.session.history.peek_undo() {
+                Some(SemanticOperation::Runtime(command)) => &command.operation,
+                _ => panic!("expected a recorded canvas command"),
+            }, CommandOperation::Style(ref changes) if changes.len() == 2));
 
         let stroke = Color::from_rgb(0xc45d5d);
         assert!(canvas.apply_selected_style(StyleEdit::Stroke(Some(stroke))));
         assert!(selected.iter().all(|id| {
             canvas
-                .document
+                .session
+                .runtime
                 .object(*id)
                 .unwrap()
                 .stroke
                 .map(|value| value.color)
                 == Some(stroke)
         }));
-        assert_eq!(canvas.history.undo_len(), 2);
+        assert_eq!(canvas.session.history.undo_len(), 2);
     }
 
     #[test]
@@ -5610,7 +6074,7 @@ mod tests {
             size(80.0, 60.0),
             None,
         );
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let default_style = document.style(object.id).unwrap();
         apply_style_to_document(
             &mut document,
@@ -5621,10 +6085,14 @@ mod tests {
         let styled = document.style(object.id).unwrap();
         record_position(&mut history, &mut document, object.id, 140.0);
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.object(object.id).unwrap().position.x, 20.0);
         assert_eq!(document.style(object.id), Some(styled));
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.style(object.id), Some(default_style));
     }
 
@@ -5637,7 +6105,7 @@ mod tests {
             size(180.0, 48.0),
             Some("styled text".to_string()),
         );
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         let fill = Color::from_rgb(0x9576b8);
         apply_style_to_document(
             &mut document,
@@ -5652,19 +6120,27 @@ mod tests {
             duplicate_object.text_content.as_deref(),
             Some("styled text")
         );
-        history.record(DocumentCommand::insert(duplicate));
+        history.record(SemanticOperation::Runtime(DocumentCommand::insert(
+            duplicate,
+        )));
 
-        history.record(DocumentCommand::delete(
+        history.record(SemanticOperation::Runtime(DocumentCommand::delete(
             document.remove_objects(&[original.id]),
-        ));
-        assert!(history.undo(&mut document));
+        )));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(
             document.object(original.id).unwrap().fill,
             Some(Fill { color: fill })
         );
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(document.object(duplicate_object.id).is_none());
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(
             document.object(original.id).unwrap().fill,
             default_style(ObjectType::Text).fill
@@ -5672,7 +6148,7 @@ mod tests {
     }
 
     fn create_test_text(canvas: &mut CanvasView, text: &str) -> DesignObject {
-        canvas.document.create_object(
+        canvas.session.runtime.create_object(
             ObjectType::Text,
             point(45.0, 60.0),
             size(180.0, 48.0),
@@ -5709,17 +6185,23 @@ mod tests {
             size(180.0, 48.0),
             Some("before".to_owned()),
         );
-        let mut history = History::default();
+        let mut history = SemanticHistory::default();
         document.set_text_content(object.id, "after 🧵".to_owned());
-        history.record(DocumentCommand::text(vec![TextChange {
-            id: object.id,
-            before: "before".to_owned(),
-            after: "after 🧵".to_owned(),
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::text(vec![
+            TextChange {
+                id: object.id,
+                before: "before".to_owned(),
+                after: "after 🧵".to_owned(),
+            },
+        ])));
 
-        assert!(history.undo(&mut document));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.text_content(object.id), Some("before"));
-        assert!(history.redo(&mut document));
+        assert!(history
+            .redo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert_eq!(document.text_content(object.id), Some("after 🧵"));
     }
 
@@ -5732,28 +6214,36 @@ mod tests {
             size(180.0, 48.0),
             Some("same".to_owned()),
         );
-        let mut history = History::default();
-        history.record(DocumentCommand::text(vec![TextChange {
-            id: object.id,
-            before: "same".to_owned(),
-            after: "same".to_owned(),
-        }]));
+        let mut history = SemanticHistory::default();
+        history.record(SemanticOperation::Runtime(DocumentCommand::text(vec![
+            TextChange {
+                id: object.id,
+                before: "same".to_owned(),
+                after: "same".to_owned(),
+            },
+        ])));
         assert!(!history.can_undo());
 
         document.set_text_content(object.id, "edited".to_owned());
-        history.record(DocumentCommand::text(vec![TextChange {
-            id: object.id,
-            before: "same".to_owned(),
-            after: "edited".to_owned(),
-        }]));
-        assert!(history.undo(&mut document));
+        history.record(SemanticOperation::Runtime(DocumentCommand::text(vec![
+            TextChange {
+                id: object.id,
+                before: "same".to_owned(),
+                after: "edited".to_owned(),
+            },
+        ])));
+        assert!(history
+            .undo(&mut OperationTarget::Runtime(&mut document))
+            .unwrap());
         assert!(history.can_redo());
         document.set_text_content(object.id, "new edit".to_owned());
-        history.record(DocumentCommand::text(vec![TextChange {
-            id: object.id,
-            before: "same".to_owned(),
-            after: "new edit".to_owned(),
-        }]));
+        history.record(SemanticOperation::Runtime(DocumentCommand::text(vec![
+            TextChange {
+                id: object.id,
+                before: "same".to_owned(),
+                after: "new edit".to_owned(),
+            },
+        ])));
         assert!(!history.can_redo());
         assert_eq!(document.text_content(object.id), Some("new edit"));
     }
@@ -5790,11 +6280,17 @@ mod tests {
         });
 
         assert!(canvas.commit_text_edit());
-        assert_eq!(canvas.document.text_content(object.id), Some("Hello world"));
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(
+            canvas.session.runtime.text_content(object.id),
+            Some("Hello world")
+        );
+        assert_eq!(canvas.session.history.undo_len(), 1);
         assert_eq!(canvas.selection.ids(), &[object.id]);
         assert!(matches!(
-            canvas.history.peek_undo_command().expect("an entry").operation,
+            match canvas.session.history.peek_undo() {
+                Some(SemanticOperation::Runtime(command)) => &command.operation,
+                _ => panic!("expected a recorded canvas command"),
+            },
             CommandOperation::Text(_)
         ));
     }
@@ -5815,8 +6311,11 @@ mod tests {
 
         assert!(canvas.discard_text_edit());
         assert!(!canvas.is_text_editing());
-        assert_eq!(canvas.document.text_content(object.id), Some("Original"));
-        assert!(!canvas.history.can_undo());
+        assert_eq!(
+            canvas.session.runtime.text_content(object.id),
+            Some("Original")
+        );
+        assert!(!canvas.session.history.can_undo());
     }
 
     #[test]
@@ -5824,7 +6323,7 @@ mod tests {
         let mut canvas = CanvasView::new();
         let object = create_test_text(&mut canvas, "before");
         let geometry = object.geometry();
-        let style = canvas.document.style(object.id).unwrap();
+        let style = canvas.session.runtime.style(object.id).unwrap();
         canvas.selection.click(Some(object.id), false);
         canvas.text_edit = Some(TextEditState {
             id: object.id,
@@ -5837,8 +6336,8 @@ mod tests {
         });
         canvas.commit_text_edit();
 
-        assert_eq!(canvas.document.geometry(object.id), Some(geometry));
-        assert_eq!(canvas.document.style(object.id), Some(style));
+        assert_eq!(canvas.session.runtime.geometry(object.id), Some(geometry));
+        assert_eq!(canvas.session.runtime.style(object.id), Some(style));
     }
 
     #[test]
@@ -5954,7 +6453,7 @@ mod tests {
         let mut canvas = CanvasView::new();
         let object = create_test_text(&mut canvas, "Hello world");
         let geometry = object.geometry();
-        let style = canvas.document.style(object.id).unwrap();
+        let style = canvas.session.runtime.style(object.id).unwrap();
         let selection = selection_from_anchor_and_caret("Hello world", 1, 7);
         canvas.text_edit = Some(TextEditState {
             id: object.id,
@@ -5966,10 +6465,13 @@ mod tests {
             pointer_anchor: Some(1),
         });
 
-        assert_eq!(canvas.document.text_content(object.id), Some("Hello world"));
-        assert_eq!(canvas.document.geometry(object.id), Some(geometry));
-        assert_eq!(canvas.document.style(object.id), Some(style));
-        assert!(!canvas.history.can_undo());
+        assert_eq!(
+            canvas.session.runtime.text_content(object.id),
+            Some("Hello world")
+        );
+        assert_eq!(canvas.session.runtime.geometry(object.id), Some(geometry));
+        assert_eq!(canvas.session.runtime.style(object.id), Some(style));
+        assert!(!canvas.session.history.can_undo());
     }
 
     #[test]
@@ -5993,9 +6495,12 @@ mod tests {
         edit.selection_reversed = selection_reversed;
 
         assert!(canvas.commit_text_edit());
-        assert_eq!(canvas.document.text_content(object.id), Some("Hello"));
+        assert_eq!(
+            canvas.session.runtime.text_content(object.id),
+            Some("Hello")
+        );
         assert_eq!(canvas.selection.ids(), &[object.id]);
-        assert_eq!(canvas.history.undo_len(), 1);
+        assert_eq!(canvas.session.history.undo_len(), 1);
     }
 
     #[test]
@@ -6014,8 +6519,11 @@ mod tests {
         });
 
         assert!(canvas.discard_text_edit());
-        assert_eq!(canvas.document.text_content(object.id), Some("Original"));
-        assert!(!canvas.history.can_undo());
+        assert_eq!(
+            canvas.session.runtime.text_content(object.id),
+            Some("Original")
+        );
+        assert!(!canvas.session.history.can_undo());
     }
 
     #[test]
