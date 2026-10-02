@@ -1,6 +1,7 @@
 mod canvas;
 mod diagnostics;
 mod layers;
+pub mod project;
 mod shell;
 pub mod source_document;
 mod theme;

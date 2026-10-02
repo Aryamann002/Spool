@@ -209,16 +209,24 @@ impl HtmlSource {
     /// its metadata binding. General CSS selector evaluation is intentionally
     /// deferred; the first source contract uses data-spool-id selectors.
     pub fn binding_is_present(&self, node: &StructuralNode) -> bool {
+        self.binding_occurrences(node) > 0
+    }
+
+    /// Count the authored identity markers a node's binding resolves to.
+    /// Callers distinguish zero (no match) from more than one (ambiguous);
+    /// an ambiguous binding must be reported rather than resolved by guessing.
+    pub fn binding_occurrences(&self, node: &StructuralNode) -> usize {
         if self.file != node.source.file {
-            return false;
+            return 0;
         }
         let expected_selector = format!("[data-spool-id=\"{}\"]", node.id.as_str());
         if node.source.selector != expected_selector {
-            return false;
+            return 0;
         }
         let marker = format!("data-spool-id=\"{}\"", node.id.as_str());
         let single_quoted = format!("data-spool-id='{}'", node.id.as_str());
-        self.contents.contains(&marker) || self.contents.contains(&single_quoted)
+        self.contents.matches(&marker).count()
+            + self.contents.matches(&single_quoted).count()
     }
 }
 
