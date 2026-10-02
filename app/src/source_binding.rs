@@ -618,14 +618,10 @@ fn collect_identity_problems(node: Node, source: &[u8], out: &mut Vec<(ByteRange
             .and_then(|name| name.utf8_text(source).ok());
         if name == Some(IDENTITY_ATTRIBUTE) {
             let mut cursor = node.walk();
-            // `has_value` distinguishes a bare attribute from a quoted one,
-            // which the error message reports differently via the range below.
-            let mut has_value = false;
             let mut raw: Option<(String, ByteRange)> = None;
             for child in node.children(&mut cursor) {
                 match child.kind() {
                     "quoted_attribute_value" => {
-                        has_value = true;
                         if let Some(value) = child.named_child(0) {
                             raw = value
                                 .utf8_text(source)
@@ -634,7 +630,6 @@ fn collect_identity_problems(node: Node, source: &[u8], out: &mut Vec<(ByteRange
                         }
                     }
                     "attribute_value" => {
-                        has_value = true;
                         raw = child
                             .utf8_text(source)
                             .ok()
