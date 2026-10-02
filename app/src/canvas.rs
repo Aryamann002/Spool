@@ -25,7 +25,15 @@ gpui::actions!(
     ]
 );
 
-use crate::theme;
+use crate::{diagnostics, theme};
+
+#[cfg(debug_assertions)]
+#[path = "canvas_workloads.rs"]
+mod workloads;
+
+#[cfg(test)]
+#[path = "canvas_benchmarks.rs"]
+mod benchmarks;
 
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 4.0;
@@ -36,6 +44,22 @@ const MIN_OBJECT_SIZE: f32 = 20.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const RESIZE_HANDLE_SIZE: f32 = 8.0;
 const RESIZE_HANDLE_HIT_RADIUS: f32 = 7.0;
+
+/// Conservative world-space padding applied to every side of an object's
+/// geometry box for Phase 14 viewport culling. An object's element tree is
+/// constructed only when its padded box intersects the viewport (inclusive
+/// edges, the same axis-aligned model as `diagnostics::intersects`).
+///
+/// The padding must cover visual overflow beyond the geometry box: frame and
+/// starter-artboard labels paint `LABEL_HEIGHT` (24) world units above the
+/// box, strokes add a few world units on each side, and text content can
+/// overflow its box. All of that overflow is specified in world units scaled
+/// by zoom (`px!(value, zoom)`), so a world-space padding stays conservative
+/// at every zoom level from `MIN_ZOOM` to `MAX_ZOOM`. 64 world units covers
+/// the 24-unit label plus roughly 40 world units (about two to three 14-unit
+/// text lines at zoom 1) of additional margin. Objects whose box lies
+/// entirely beyond this padding are skipped; everything else is constructed.
+const CULL_PADDING: f32 = 64.0;
 
 macro_rules! px {
     ($value:expr, $zoom:ident) => {
@@ -137,10 +161,62 @@ impl Camera {
             start_offset.y - delta.y / self.zoom,
         );
     }
+
+    /// Phase 14 conservative culling predicate: true when the object's
+    /// geometry can affect the current viewport, in which case its element
+    /// tree must be constructed.
+    ///
+    /// This is exactly the `diagnostics::intersects` model — inclusive
+    /// axis-aligned geometry-box intersection with the viewport in screen
+    /// space — applied to the object's box expanded by `CULL_PADDING` world
+    /// units on every side, so the constructed set is always a superset of
+    /// the diagnostic visibility model. Padding is world space, so the
+    /// predicate follows the actual camera zoom and offset rather than
+    /// assuming zoom = 1.
+    ///
+    /// Conservative on uncertainty: any input the intersection model cannot
+    /// evaluate (non-finite geometry, camera offset, zoom or viewport;
+    /// non-positive zoom or viewport; negative size) returns true so that
+    /// unevaluable state constructs the object instead of culling it. This
+    /// includes the pre-prepaint render where the viewport is still empty.
+    fn affects_viewport(&self, position: Point<f32>, object_size: Size<f32>) -> bool {
+        let padded_position = point(position.x - CULL_PADDING, position.y - CULL_PADDING);
+        let padded_size = size(
+            object_size.width + 2.0 * CULL_PADDING,
+            object_size.height + 2.0 * CULL_PADDING,
+        );
+        let evaluable = self.zoom > 0.0
+            && self.viewport.width > 0.0
+            && self.viewport.height > 0.0
+            && object_size.width >= 0.0
+            && object_size.height >= 0.0
+            && [
+                self.zoom,
+                self.viewport.width,
+                self.viewport.height,
+                self.offset.x,
+                self.offset.y,
+                padded_position.x,
+                padded_position.y,
+                padded_size.width,
+                padded_size.height,
+            ]
+            .iter()
+            .all(|value| value.is_finite()); // Not evaluable -> construct (conservative); otherwise the padded
+                                             // intersection decides.
+        !evaluable
+            || diagnostics::intersects(
+                padded_position,
+                padded_size,
+                self.offset,
+                self.viewport,
+                self.zoom,
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ObjectId(u64);
+pub struct ObjectId(pub u64);
 
 impl ObjectId {
     pub const LANDING: Self = Self(1);
@@ -356,6 +432,7 @@ pub struct Document {
     objects: Vec<DesignObject>,
     next_id: u64,
     next_names: [u64; 4],
+    layer_structure_revision: u64,
 }
 
 impl Default for Document {
@@ -369,11 +446,16 @@ impl Default for Document {
             ],
             next_id: 5,
             next_names: [1; 4],
+            layer_structure_revision: 0,
         }
     }
 }
 
 impl Document {
+    pub fn layer_structure_revision(&self) -> u64 {
+        self.layer_structure_revision
+    }
+
     pub fn objects(&self) -> &[DesignObject] {
         &self.objects
     }
@@ -422,8 +504,9 @@ impl Document {
         object_size: Size<f32>,
         text_content: Option<String>,
     ) -> DesignObject {
+        let id = self.allocate_id();
         let object = DesignObject {
-            id: self.allocate_id(),
+            id,
             name: self.allocate_name(object_type),
             position,
             size: size(
@@ -444,6 +527,7 @@ impl Document {
             return false;
         }
         self.objects.insert(index.min(self.objects.len()), object);
+        self.layer_structure_revision += 1;
         true
     }
 
@@ -475,6 +559,7 @@ impl Document {
             })
             .collect();
         self.objects.retain(|object| !ids.contains(&object.id));
+        self.layer_structure_revision += removed.len() as u64;
         removed
     }
 
@@ -1077,9 +1162,24 @@ pub struct CanvasView {
     hitbox: Rc<Cell<Option<CanvasHitbox>>>,
     focus_handle: Option<FocusHandle>,
     text_edit: Option<TextEditState>,
+    #[cfg(debug_assertions)]
+    workload_started: bool,
+    #[cfg(debug_assertions)]
+    workload_running: bool,
 }
 
 impl CanvasView {
+    pub(crate) fn workload_controls_input(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.workload_running
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             camera: Camera::default(),
@@ -1094,12 +1194,18 @@ impl CanvasView {
             hitbox: Rc::new(Cell::new(None)),
             focus_handle: None,
             text_edit: None,
+            #[cfg(debug_assertions)]
+            workload_started: false,
+            #[cfg(debug_assertions)]
+            workload_running: false,
         }
     }
 
     pub fn new_with_context(cx: &mut Context<Self>) -> Self {
         let mut view = Self::new();
         view.focus_handle = Some(cx.focus_handle());
+        #[cfg(debug_assertions)]
+        view.install_workload_fixture();
         view
     }
 
@@ -1126,12 +1232,14 @@ impl CanvasView {
         if let Some(focus_handle) = &self.focus_handle {
             window.focus(focus_handle, cx);
         }
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
     pub fn cancel_text_edit(&mut self, cx: &mut Context<Self>) -> bool {
         let cancelled = self.discard_text_edit();
         if cancelled {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         cancelled
@@ -1144,6 +1252,7 @@ impl CanvasView {
     pub fn commit_text_edit_session(&mut self, cx: &mut Context<Self>) -> bool {
         let committed = self.commit_text_edit();
         if committed {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         committed
@@ -1187,6 +1296,7 @@ impl CanvasView {
         edit.selected_range = range;
         edit.selection_reversed = reversed;
         edit.marked_range = None;
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1198,6 +1308,7 @@ impl CanvasView {
         edit.selected_range = offset..offset;
         edit.selection_reversed = false;
         edit.marked_range = None;
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1216,6 +1327,7 @@ impl CanvasView {
             edit.selected_range = edit.selected_range.end..edit.selected_range.start;
         }
         edit.marked_range = None;
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1239,6 +1351,7 @@ impl CanvasView {
         edit.selected_range = cursor..cursor;
         edit.selection_reversed = false;
         edit.marked_range = None;
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1305,6 +1418,7 @@ impl CanvasView {
             edit.selected_range = 0..edit.editing_text.len();
             edit.selection_reversed = false;
             edit.marked_range = None;
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
     }
@@ -1350,6 +1464,10 @@ impl CanvasView {
         &self.selection
     }
 
+    pub fn layer_structure_revision(&self) -> u64 {
+        self.document.layer_structure_revision()
+    }
+
     pub fn document_objects(&self) -> &[DesignObject] {
         self.document.objects()
     }
@@ -1371,6 +1489,7 @@ impl CanvasView {
         let changed = self.history.can_undo() && self.history.undo(&mut self.document);
         if changed {
             self.retain_existing_selection();
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         changed
@@ -1385,6 +1504,7 @@ impl CanvasView {
         let changed = self.history.can_redo() && self.history.redo(&mut self.document);
         if changed {
             self.retain_existing_selection();
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         changed
@@ -1403,6 +1523,7 @@ impl CanvasView {
         let had_interaction = self.interaction.is_active();
         let changed = self.apply_selected_style(edit);
         if changed || had_interaction {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         changed
@@ -1440,6 +1561,7 @@ impl CanvasView {
     pub fn select_object(&mut self, id: ObjectId, additive: bool, cx: &mut Context<Self>) {
         self.commit_text_edit();
         self.selection.click(Some(id), additive);
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1448,8 +1570,10 @@ impl CanvasView {
         let had_marquee = self.marquee.take().is_some();
         if !self.selection.is_empty() {
             self.selection.click(None, false);
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         } else if had_marquee {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
     }
@@ -1471,6 +1595,9 @@ impl CanvasView {
     }
 
     fn begin_pan(&mut self, button: MouseButton, event: &MouseDownEvent, window: &mut Window) {
+        if self.workload_controls_input() {
+            return;
+        }
         let should_pan =
             button == MouseButton::Middle || (button == MouseButton::Left && self.space_held);
         if !should_pan {
@@ -1549,6 +1676,9 @@ impl CanvasView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workload_controls_input() {
+            return;
+        }
         self.begin_pan(MouseButton::Left, event, window);
         if self.pan.is_some() {
             return;
@@ -1571,6 +1701,7 @@ impl CanvasView {
                 }
                 self.begin_text_pointer_selection(screen, event.modifiers.shift, window, cx);
                 cx.stop_propagation();
+                diagnostics::count("canvas_notify", 1);
                 cx.notify();
                 return;
             }
@@ -1686,6 +1817,7 @@ impl CanvasView {
             initial_selection,
         });
         self.capture_pointer(window);
+        diagnostics::count("canvas_notify", 1);
         cx.notify();
     }
 
@@ -1830,6 +1962,7 @@ impl CanvasView {
         let had_interaction = self.interaction.is_active();
         let changed = self.delete_selected_objects();
         if changed || had_interaction {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         changed
@@ -1856,6 +1989,7 @@ impl CanvasView {
         let had_interaction = self.interaction.is_active();
         let changed = self.duplicate_selected_objects();
         if changed || had_interaction {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         changed
@@ -1905,6 +2039,7 @@ impl CanvasView {
     pub fn cancel_manipulation(&mut self, cx: &mut Context<Self>) -> bool {
         let cancelled = self.cancel_interaction();
         if cancelled {
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
         cancelled
@@ -1982,13 +2117,29 @@ impl CanvasView {
 
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(debug_assertions)]
+        self.start_workload(_window, cx);
+        diagnostics::count("canvas_render", 1);
+        diagnostics::count(
+            "viewport_width_sum_px",
+            self.camera.viewport.width.round() as u64,
+        );
+        diagnostics::count(
+            "viewport_height_sum_px",
+            self.camera.viewport.height.round() as u64,
+        );
+        diagnostics::count(
+            "camera_zoom_sum_milli",
+            (self.camera.zoom * 1000.0).round() as u64,
+        );
+        let render_start = diagnostics::start();
         let entity = cx.entity();
         let entity_for_prepaint = entity.clone();
         let entity_for_paint = entity.clone();
         let hitbox_slot = self.hitbox.clone();
         let current_camera = self.camera;
-        let document = self.document.clone();
-        let selection = self.selection.clone();
+        let document = &self.document;
+        let selection = &self.selection;
         let marquee = self.marquee.clone();
         let preview = self.interaction.preview();
         let text_edit = self.text_edit.clone();
@@ -2025,6 +2176,9 @@ impl Render for CanvasView {
             .on_action(cx.listener(Self::text_copy))
             .on_action(cx.listener(Self::text_cut))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if this.workload_controls_input() {
+                    return;
+                }
                 if !event.modifiers.control && !event.modifiers.platform {
                     return;
                 }
@@ -2032,11 +2186,16 @@ impl Render for CanvasView {
                 let factor = (delta * 0.002).exp();
                 let cursor = this.cursor_in_viewport(event.position);
                 this.camera.zoom_at(factor, cursor);
+                diagnostics::count("canvas_notify", 1);
                 cx.notify();
             }))
             .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+                if this.workload_controls_input() {
+                    return;
+                }
                 let cursor = this.cursor_in_viewport(event.position);
                 this.camera.zoom_at(1.0 + event.delta, cursor);
+                diagnostics::count("canvas_notify", 1);
                 cx.notify();
             }))
             .child(
@@ -2051,6 +2210,8 @@ impl Render for CanvasView {
                             let viewport =
                                 size(f32::from(bounds.size.width), f32::from(bounds.size.height));
                             if this.camera.resize(viewport) {
+                                diagnostics::count("camera_resize_notify", 1);
+                                diagnostics::count("canvas_notify", 1);
                                 cx.notify();
                             }
                         });
@@ -2058,13 +2219,14 @@ impl Render for CanvasView {
                     },
                     move |bounds, hitbox, window, cx| {
                         let view_state = entity_for_paint.read(cx);
-                        if view_state.pan.is_some()
-                            || view_state.interaction.is_active()
-                            || view_state.marquee.is_some()
-                            || view_state
-                                .text_edit
-                                .as_ref()
-                                .is_some_and(|edit| edit.pointer_anchor.is_some())
+                        if !view_state.workload_controls_input()
+                            && (view_state.pan.is_some()
+                                || view_state.interaction.is_active()
+                                || view_state.marquee.is_some()
+                                || view_state
+                                    .text_edit
+                                    .as_ref()
+                                    .is_some_and(|edit| edit.pointer_anchor.is_some()))
                         {
                             window.capture_pointer(hitbox.id);
                         }
@@ -2075,6 +2237,9 @@ impl Render for CanvasView {
                                 return;
                             }
                             view.update(cx, |this, cx| {
+                                if this.workload_controls_input() {
+                                    return;
+                                }
                                 if let Some(pan) = this.pan {
                                     this.camera.pan_from(
                                         pan.offset_start,
@@ -2084,6 +2249,7 @@ impl Render for CanvasView {
                                             f32::from(event.position.y),
                                         ),
                                     );
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 } else if this
                                     .text_edit
@@ -2095,6 +2261,7 @@ impl Render for CanvasView {
                                 } else if this.interaction.is_active() {
                                     let screen = this.cursor_in_viewport(event.position);
                                     if this.update_interaction(screen) {
+                                        diagnostics::count("canvas_notify", 1);
                                         cx.notify();
                                     }
                                 } else if this.marquee.is_some() {
@@ -2103,6 +2270,7 @@ impl Render for CanvasView {
                                     if let Some(marquee) = this.marquee.as_mut() {
                                         marquee.current = world;
                                     }
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 }
                             });
@@ -2113,6 +2281,9 @@ impl Render for CanvasView {
                                 return;
                             }
                             view.update(cx, |this, cx| {
+                                if this.workload_controls_input() {
+                                    return;
+                                }
                                 if event.button == MouseButton::Left
                                     && this
                                         .text_edit
@@ -2124,9 +2295,11 @@ impl Render for CanvasView {
                                     if let Some(edit) = this.text_edit.as_mut() {
                                         edit.pointer_anchor = None;
                                     }
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 } else if this.pan.is_some_and(|pan| pan.button == event.button) {
                                     this.pan = None;
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 } else if event.button == MouseButton::Left
                                     && this.interaction.is_active()
@@ -2142,12 +2315,14 @@ impl Render for CanvasView {
                                             }
                                         }
                                     }
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 } else if event.button == MouseButton::Left
                                     && this.marquee.is_some()
                                 {
                                     let screen = this.cursor_in_viewport(event.position);
                                     this.finish_marquee(screen);
+                                    diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 }
                             });
@@ -2175,6 +2350,7 @@ impl Render for CanvasView {
         if let Some(focus_handle) = focus_handle.as_ref() {
             viewport = viewport.track_focus(focus_handle);
         }
+        diagnostics::record("canvas_render_build", render_start);
         viewport
     }
 }
@@ -2375,6 +2551,7 @@ impl EntityInputHandler for CanvasView {
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(edit) = self.text_edit.as_mut() {
             edit.marked_range = None;
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
     }
@@ -2406,6 +2583,7 @@ impl EntityInputHandler for CanvasView {
                 let selected = utf16_range_to_utf8(new_text, selected);
                 edit.selected_range = marked_start + selected.start..marked_start + selected.end;
             }
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
     }
@@ -2447,6 +2625,7 @@ impl EntityInputHandler for CanvasView {
         if let Some(edit) = self.text_edit.as_mut() {
             edit.selected_range = utf16_range_to_utf8(&edit.editing_text, range_utf16);
             edit.selection_reversed = false;
+            diagnostics::count("canvas_notify", 1);
             cx.notify();
         }
     }
@@ -2633,14 +2812,54 @@ fn render_text_input(
         })
 }
 
+/// Phase 14 construction decision for one document object.
+///
+/// The actively edited text object is always constructed so its editing
+/// overlay, focus tracking and caret stay coherent regardless of camera
+/// position. Everything else is gated by the padded viewport predicate.
+///
+/// Selection is deliberately not a parameter: selection outlines and resize
+/// handles are interaction chrome constructed in their own loops inside
+/// `artboards`, independent of the base element, so culling an unselected or
+/// selected object's base element never removes its chrome and never requires
+/// retaining it.
+fn should_construct(
+    camera: Camera,
+    object: &DesignObject,
+    editing_object: Option<ObjectId>,
+) -> bool {
+    editing_object == Some(object.id) || camera.affects_viewport(object.position, object.size)
+}
+
 fn artboards(
     camera: Camera,
-    document: Document,
-    selection: Selection,
+    document: &Document,
+    selection: &Selection,
     marquee: Option<MarqueeGesture>,
     preview: Option<CreationPreview>,
     text_input: TextInputRenderContext,
 ) -> impl IntoElement {
+    // Keep the diagnostic-only visibility scan outside the construction timer.
+    let visibility_start = diagnostics::start();
+    let visible = if diagnostics::enabled() {
+        document
+            .objects()
+            .iter()
+            .filter(|object| {
+                diagnostics::intersects(
+                    object.position,
+                    object.size,
+                    camera.offset,
+                    camera.viewport,
+                    camera.zoom,
+                )
+            })
+            .count() as u64
+    } else {
+        0
+    };
+    diagnostics::record("visibility_scan", visibility_start);
+    let build_start = diagnostics::start();
     let zoom = camera.zoom;
     let text_edit = text_input.edit;
     let focus_handle = text_input.focus_handle;
@@ -2653,7 +2872,14 @@ fn artboards(
         .bottom(gpui_px(0.0))
         .overflow_hidden();
 
-    for object in document.objects() {
+    let editing_object = text_edit.as_ref().map(|edit| edit.id);
+    let mut constructed = 0u64;
+    for object in document
+        .objects()
+        .iter()
+        .filter(|object| should_construct(camera, object, editing_object))
+    {
+        constructed += 1;
         let content = match object.id {
             ObjectId::LANDING => Some(landing_frame(zoom, object.size).into_any_element()),
             ObjectId::EDITOR => Some(editor_frame(zoom, object.size).into_any_element()),
@@ -2664,7 +2890,7 @@ fn artboards(
         if let Some(content) = content {
             world = world.child(positioned_frame(camera, object, content, zoom));
         } else {
-            let editing_this_object = text_edit.as_ref().is_some_and(|edit| edit.id == object.id);
+            let editing_this_object = editing_object == Some(object.id);
             world = world.child(render_object(camera, object, zoom, editing_this_object));
             if editing_this_object {
                 if let (Some(edit), Some(focus_handle)) =
@@ -2719,6 +2945,13 @@ fn artboards(
         );
     }
 
+    diagnostics::record("canvas_elements", build_start);
+    let considered = document.objects().len() as u64;
+    diagnostics::count("objects_considered", considered);
+    diagnostics::count("objects_constructed", constructed);
+    diagnostics::count("objects_culled", considered - constructed);
+    diagnostics::count("geometry_intersecting", visible);
+    diagnostics::count("geometry_offscreen", considered - visible);
     world
 }
 
@@ -3315,6 +3548,299 @@ fn mobile_frame(zoom: f32, frame_size: Size<f32>) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layers::test_support::RetainedLayers;
+
+    fn starter_layer_rows() -> Vec<(ObjectId, SharedString)> {
+        vec![
+            (ObjectId::LANDING, "Landing".into()),
+            (ObjectId::EDITOR, "Editor".into()),
+            (ObjectId::FEATURES, "Features".into()),
+            (ObjectId::MOBILE, "Mobile".into()),
+        ]
+    }
+
+    #[test]
+    fn retained_layer_rows_follow_create_delete_duplicate_and_history() {
+        let mut canvas = CanvasView::new();
+        let mut layers = RetainedLayers::default();
+        let starter = starter_layer_rows();
+        assert_eq!(layers.synchronize(&canvas), starter);
+
+        let text = canvas.document.create_object(
+            ObjectType::Text,
+            point(10.0, 20.0),
+            size(80.0, 30.0),
+            Some("Content, not the layer name".into()),
+        );
+        canvas.history.record(DocumentCommand::insert(vec![canvas
+            .document
+            .placement(text.id)
+            .unwrap()]));
+        let mut created = starter.clone();
+        created.push((text.id, "Text 1".into()));
+        assert_eq!(layers.synchronize(&canvas), created);
+        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), starter);
+        assert!(canvas.history.redo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), created);
+
+        // Reverse selection order must not reverse document/projected order.
+        let duplicates = canvas
+            .document
+            .duplicate_objects(&[text.id, ObjectId::EDITOR]);
+        assert_eq!(duplicates.len(), 2);
+        canvas
+            .history
+            .record(DocumentCommand::insert(duplicates.clone()));
+        let mut duplicated = created.clone();
+        duplicated.extend([
+            (duplicates[0].object.id, "Frame 1".into()),
+            (duplicates[1].object.id, "Text 2".into()),
+        ]);
+        assert_eq!(layers.synchronize(&canvas), duplicated);
+        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), created);
+        assert!(canvas.history.redo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), duplicated);
+
+        // Non-adjacent deletions must restore their original positions and names.
+        let removed = canvas.document.remove_objects(&[text.id, ObjectId::EDITOR]);
+        canvas.history.record(DocumentCommand::delete(removed));
+        let deleted: Vec<_> = duplicated
+            .iter()
+            .filter(|(id, _)| *id != text.id && *id != ObjectId::EDITOR)
+            .cloned()
+            .collect();
+        assert_eq!(layers.synchronize(&canvas), deleted);
+        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), duplicated);
+        assert!(canvas.history.redo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), deleted);
+        assert_eq!(layers.document_walks(), 10);
+    }
+
+    #[test]
+    fn retained_layer_rows_keep_names_and_skip_walks_for_selection_and_transient_changes() {
+        let mut canvas = CanvasView::new();
+        let text = canvas.document.create_object(
+            ObjectType::Text,
+            point(10.0, 20.0),
+            size(80.0, 30.0),
+            Some("hello".into()),
+        );
+        let mut layers = RetainedLayers::default();
+        let mut expected = starter_layer_rows();
+        expected.push((text.id, "Text 1".into()));
+        assert_eq!(layers.synchronize(&canvas), expected);
+
+        canvas.selection.replace(vec![text.id, ObjectId::EDITOR]);
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert_eq!(layers.selected(), &[text.id, ObjectId::EDITOR]);
+        // Selection changes report only the rows whose presentation changed,
+        // in row order; unchanged rows are not touched.
+        assert_eq!(
+            layers.presentation_updates(),
+            &[(ObjectId::EDITOR, true), (text.id, true)]
+        );
+        canvas.selection.replace(vec![ObjectId::LANDING]);
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert_eq!(layers.selected(), &[ObjectId::LANDING]);
+        assert_eq!(
+            layers.presentation_updates(),
+            &[
+                (ObjectId::LANDING, true),
+                (ObjectId::EDITOR, false),
+                (text.id, false),
+            ]
+        );
+
+        let before = canvas.document.geometry(text.id).unwrap();
+        canvas.document.set_position(text.id, point(100.0, 200.0));
+        canvas.document.set_size(text.id, size(120.0, 40.0));
+        assert_eq!(layers.synchronize(&canvas), expected);
+        let after = canvas.document.geometry(text.id).unwrap();
+        canvas
+            .history
+            .record(DocumentCommand::geometry(vec![GeometryChange {
+                id: text.id,
+                before,
+                after,
+            }]));
+        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert!(canvas.history.redo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), expected);
+
+        canvas.document.set_style(
+            text.id,
+            ObjectStyle {
+                fill: None,
+                stroke: None,
+            },
+        );
+        assert_eq!(layers.synchronize(&canvas), expected);
+        canvas
+            .document
+            .set_text_content(text.id, "Changed content must not replace Text 1".into());
+        assert_eq!(layers.synchronize(&canvas), expected);
+        canvas
+            .history
+            .record(DocumentCommand::text(vec![TextChange {
+                id: text.id,
+                before: "hello".into(),
+                after: "Changed content must not replace Text 1".into(),
+            }]));
+        assert!(canvas.history.undo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert!(canvas.history.redo(&mut canvas.document));
+        assert_eq!(layers.synchronize(&canvas), expected);
+
+        canvas.camera.offset = point(300.0, 400.0);
+        canvas.set_zoom_percent(200);
+        assert_eq!(layers.synchronize(&canvas), expected);
+        canvas.selection.replace(vec![]);
+        assert_eq!(layers.synchronize(&canvas), expected);
+        assert!(layers.selected().is_empty());
+        assert_eq!(layers.presentation_updates(), &[(ObjectId::LANDING, false)]);
+        assert_eq!(layers.document_walks(), 1);
+    }
+
+    #[test]
+    fn layer_structure_revision_tracks_successful_mutations_and_history_order() {
+        let mut document = Document::default();
+        let mut history = History::default();
+        assert_eq!(document.layer_structure_revision(), 0);
+        let object = document.create_object(
+            ObjectType::Text,
+            point(1.0, 2.0),
+            size(80.0, 30.0),
+            Some("hello".into()),
+        );
+        assert_eq!(document.layer_structure_revision(), 1);
+        assert!(!document.insert_object(object.clone(), 0));
+        assert!(document.remove_objects(&[ObjectId(9999)]).is_empty());
+        assert_eq!(document.layer_structure_revision(), 1);
+        let original_order: Vec<_> = document.objects().iter().map(|object| object.id).collect();
+        let duplicates = document.duplicate_objects(&[ObjectId::EDITOR, object.id]);
+        assert_eq!(document.layer_structure_revision(), 3);
+        history.record(DocumentCommand::insert(duplicates.clone()));
+        history.undo(&mut document);
+        assert_eq!(document.layer_structure_revision(), 5);
+        assert_eq!(
+            document
+                .objects()
+                .iter()
+                .map(|object| object.id)
+                .collect::<Vec<_>>(),
+            original_order
+        );
+        history.redo(&mut document);
+        assert_eq!(document.layer_structure_revision(), 7);
+        let order: Vec<_> = document.objects().iter().map(|object| object.id).collect();
+        assert_eq!(
+            &order[original_order.len()..],
+            &duplicates
+                .iter()
+                .map(|placement| placement.object.id)
+                .collect::<Vec<_>>()
+        );
+        let removed = document.remove_objects(&[ObjectId::EDITOR, object.id]);
+        assert_eq!(document.layer_structure_revision(), 9);
+        history.record(DocumentCommand::delete(removed));
+        history.undo(&mut document);
+        assert_eq!(document.layer_structure_revision(), 11);
+        assert_eq!(
+            document
+                .objects()
+                .iter()
+                .map(|object| object.id)
+                .collect::<Vec<_>>(),
+            order
+        );
+        history.redo(&mut document);
+        assert_eq!(document.layer_structure_revision(), 13);
+    }
+
+    #[test]
+    fn layer_structure_revision_ignores_geometry_style_text_selection_and_camera() {
+        let mut canvas = CanvasView::new();
+        let object = canvas.document.create_object(
+            ObjectType::Text,
+            point(1.0, 2.0),
+            size(80.0, 30.0),
+            Some("hello".into()),
+        );
+        let revision = canvas.layer_structure_revision();
+        let before = canvas.document.geometry(object.id).unwrap();
+        canvas.document.set_position(object.id, point(20.0, 30.0));
+        let after = canvas.document.geometry(object.id).unwrap();
+        canvas
+            .history
+            .record(DocumentCommand::geometry(vec![GeometryChange {
+                id: object.id,
+                before,
+                after,
+            }]));
+        canvas.history.undo(&mut canvas.document);
+        canvas.history.redo(&mut canvas.document);
+        canvas.document.set_size(object.id, size(100.0, 50.0));
+        canvas.document.set_style(
+            object.id,
+            ObjectStyle {
+                fill: None,
+                stroke: None,
+            },
+        );
+        canvas
+            .document
+            .set_text_content(object.id, "changed".into());
+        canvas
+            .history
+            .record(DocumentCommand::text(vec![TextChange {
+                id: object.id,
+                before: "hello".into(),
+                after: "changed".into(),
+            }]));
+        canvas.history.undo(&mut canvas.document);
+        canvas.history.redo(&mut canvas.document);
+        canvas.selection.click(Some(object.id), false);
+        canvas.set_zoom_percent(200);
+        canvas.camera.offset = point(100.0, 200.0);
+        assert_eq!(canvas.layer_structure_revision(), revision);
+    }
+
+    #[test]
+    fn borrowed_object_element_construction_preserves_document_at_all_zoom_limits() {
+        let mut document = Document::default();
+        for object_type in [
+            ObjectType::Frame,
+            ObjectType::Rectangle,
+            ObjectType::Ellipse,
+            ObjectType::Text,
+        ] {
+            document.create_object(
+                object_type,
+                point(20.0, 40.0),
+                size(100.0, 80.0),
+                (object_type == ObjectType::Text).then(|| "Unicode 🧵 text".to_string()),
+            );
+        }
+        let before = document.objects().to_vec();
+        for zoom in [MIN_ZOOM, 1.0, MAX_ZOOM] {
+            let camera = Camera {
+                zoom,
+                ..Camera::default()
+            };
+            for object in document.objects() {
+                let _element = render_object(camera, object, zoom, false).into_any_element();
+                let _outline = selection_outline(camera, object).into_any_element();
+                for handle in ResizeHandle::ALL {
+                    let _handle = resize_handle_element(camera, object, handle).into_any_element();
+                }
+            }
+        }
+        assert_eq!(document.objects(), before);
+    }
 
     #[test]
     fn camera_coordinates_round_trip() {
@@ -3599,6 +4125,7 @@ mod tests {
             ],
             next_id: 5,
             next_names: [1; 4],
+            layer_structure_revision: 0,
         };
 
         assert_eq!(document.hit_test(point(50.0, 50.0)), Some(ObjectId::EDITOR));
@@ -5199,5 +5726,183 @@ mod tests {
         assert_eq!(utf16_range_to_utf8(text, 1..3), 1..5);
         assert_eq!(utf8_range_to_utf16(text, 1..5), 1..3);
         assert_eq!(utf16_range_to_utf8(text, 3..4), 5..7);
+    }
+
+    // Phase 14: conservative viewport-aware culling.
+
+    fn culling_camera(zoom: f32, offset: Point<f32>) -> Camera {
+        Camera {
+            offset,
+            zoom,
+            viewport: size(400.0, 400.0),
+            initialized: true,
+        }
+    }
+
+    fn culling_object(id: u64, position: Point<f32>, object_size: Size<f32>) -> DesignObject {
+        DesignObject {
+            id: ObjectId(id),
+            name: "Cull probe".to_owned(),
+            position,
+            size: object_size,
+            object_type: ObjectType::Rectangle,
+            text_content: None,
+            fill: default_style(ObjectType::Rectangle).fill,
+            stroke: None,
+        }
+    }
+
+    #[test]
+    fn culling_predicate_covers_inside_partial_edge_and_outside_cases() {
+        let camera = culling_camera(1.0, point(0.0, 0.0));
+
+        // Fully inside.
+        assert!(camera.affects_viewport(point(100.0, 100.0), size(50.0, 50.0)));
+        // Partially intersecting the right edge.
+        assert!(camera.affects_viewport(point(370.0, 100.0), size(50.0, 50.0)));
+        // Touching the viewport edge exactly: inclusive model.
+        assert!(camera.affects_viewport(point(400.0, 100.0), size(50.0, 50.0)));
+        assert!(camera.affects_viewport(point(-50.0, 100.0), size(50.0, 50.0)));
+        // Fully outside the viewport but within the 64-unit padding.
+        assert!(camera.affects_viewport(point(460.0, 100.0), size(50.0, 50.0)));
+        assert!(camera.affects_viewport(point(100.0, 460.0), size(50.0, 50.0)));
+        // Exactly at the padding boundary stays inclusive.
+        assert!(camera.affects_viewport(point(464.0, 100.0), size(50.0, 50.0)));
+        // Just beyond the padding.
+        assert!(!camera.affects_viewport(point(465.0, 100.0), size(50.0, 50.0)));
+        assert!(!camera.affects_viewport(point(100.0, 465.0), size(50.0, 50.0)));
+        // Fully outside, far beyond the padding.
+        assert!(!camera.affects_viewport(point(600.0, 600.0), size(50.0, 50.0)));
+    }
+
+    #[test]
+    fn culling_predicate_handles_negative_world_coordinates() {
+        let camera = culling_camera(1.0, point(-500.0, -500.0));
+        // Maps to screen (10,10)-(60,60): inside.
+        assert!(camera.affects_viewport(point(-490.0, -490.0), size(50.0, 50.0)));
+        // Maps to screen (-60,-60): outside, but within padding of the edge.
+        assert!(camera.affects_viewport(point(-560.0, -560.0), size(50.0, 50.0)));
+        // Far outside the padded viewport in negative world space.
+        assert!(!camera.affects_viewport(point(-1100.0, -490.0), size(50.0, 50.0)));
+        // An object entirely in negative coordinates visible to a camera there.
+        let deep = culling_camera(1.0, point(-5_000.0, -5_000.0));
+        assert!(deep.affects_viewport(point(-4_990.0, -4_990.0), size(50.0, 50.0)));
+        assert!(!deep.affects_viewport(point(-6_000.0, -4_990.0), size(50.0, 50.0)));
+    }
+
+    #[test]
+    fn culling_predicate_keeps_large_spanning_objects() {
+        let camera = culling_camera(1.0, point(0.0, 0.0));
+        assert!(camera.affects_viewport(point(-10_000.0, -10_000.0), size(20_000.0, 20_000.0)));
+        // Origin far outside the viewport, box still spans it in x.
+        assert!(camera.affects_viewport(point(-1_000_000.0, 100.0), size(1_500_000.0, 50.0)));
+        let zoomed_out = culling_camera(0.25, point(0.0, 0.0));
+        assert!(zoomed_out.affects_viewport(point(-40_000.0, -40_000.0), size(80_000.0, 80_000.0)));
+    }
+
+    #[test]
+    fn culling_predicate_tracks_zoom_and_pan() {
+        let base = culling_camera(1.0, point(0.0, 0.0));
+        let zoomed_out = culling_camera(0.5, point(0.0, 0.0));
+        let zoomed_in = culling_camera(4.0, point(0.0, 0.0));
+        let far = point(600.0, 100.0);
+        let near = point(200.0, 100.0);
+
+        // Same world object: visible when zoomed out, culled at 1x and 4x.
+        assert!(zoomed_out.affects_viewport(far, size(50.0, 50.0)));
+        assert!(!base.affects_viewport(far, size(50.0, 50.0)));
+        assert!(!zoomed_in.affects_viewport(far, size(50.0, 50.0)));
+
+        // Same world object: visible at 1x and 0.5x, culled when zoomed to 4x.
+        assert!(base.affects_viewport(near, size(50.0, 50.0)));
+        assert!(zoomed_out.affects_viewport(near, size(50.0, 50.0)));
+        assert!(!zoomed_in.affects_viewport(near, size(50.0, 50.0)));
+
+        // Panning brings a culled object into the padded viewport...
+        let panned = culling_camera(1.0, point(300.0, 0.0));
+        assert!(panned.affects_viewport(far, size(50.0, 50.0)));
+        // ...and panning away culls it again.
+        let away = culling_camera(1.0, point(-1_000.0, 0.0));
+        assert!(base.affects_viewport(point(100.0, 100.0), size(50.0, 50.0)));
+        assert!(!away.affects_viewport(point(100.0, 100.0), size(50.0, 50.0)));
+    }
+
+    #[test]
+    fn culling_predicate_constructs_when_inputs_cannot_be_evaluated() {
+        // Empty viewport before the first prepaint resize: construct, never cull.
+        let uninitialized = Camera::default();
+        assert_eq!(uninitialized.viewport, size(0.0, 0.0));
+        assert!(uninitialized.affects_viewport(point(5_000.0, 5_000.0), size(50.0, 50.0)));
+
+        let camera = culling_camera(1.0, point(0.0, 0.0));
+        // Non-positive zoom.
+        assert!(Camera {
+            zoom: 0.0,
+            ..camera
+        }
+        .affects_viewport(point(5_000.0, 5_000.0), size(50.0, 50.0)));
+        // Non-finite camera offset.
+        assert!(Camera {
+            offset: point(f32::NAN, 0.0),
+            ..camera
+        }
+        .affects_viewport(point(5_000.0, 5_000.0), size(50.0, 50.0)));
+        // Non-finite geometry.
+        assert!(camera.affects_viewport(point(f32::NAN, 100.0), size(50.0, 50.0)));
+        assert!(camera.affects_viewport(point(5_000.0, 5_000.0), size(f32::INFINITY, 50.0),));
+        // Negative size.
+        assert!(camera.affects_viewport(point(5_000.0, 5_000.0), size(-50.0, -50.0),));
+    }
+
+    #[test]
+    fn culling_includes_every_object_the_diagnostic_model_sees() {
+        for zoom in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            for offset in [point(0.0, 0.0), point(-1_000.0, 500.0)] {
+                let camera = culling_camera(zoom, offset);
+                for position in [-300.0_f32, -150.0, 0.0, 150.0, 350.0, 399.0, 450.0, 700.0] {
+                    for object_size in [size(10.0, 10.0), size(80.0, 80.0), size(1_000.0, 60.0)] {
+                        if diagnostics::intersects(
+                            point(position, position),
+                            object_size,
+                            offset,
+                            camera.viewport,
+                            zoom,
+                        ) {
+                            assert!(
+                                camera.affects_viewport(point(position, position), object_size),
+                                "culling must retain every object the Phase 13 diagnostic \
+                                 visibility model sees: position {position} size {object_size:?} \
+                                 zoom {zoom} offset {offset:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn culling_exempts_only_the_active_text_edit_object() {
+        let camera = culling_camera(1.0, point(0.0, 0.0));
+        let inside = culling_object(5, point(100.0, 100.0), size(50.0, 50.0));
+        let outside = culling_object(6, point(5_000.0, 5_000.0), size(50.0, 50.0));
+
+        // Geometry gate without editing.
+        assert!(should_construct(camera, &inside, None));
+        assert!(!should_construct(camera, &outside, None));
+        // The actively edited object is constructed even far outside the viewport.
+        assert!(should_construct(camera, &outside, Some(outside.id)));
+        // A different object being edited does not exempt the offscreen one.
+        assert!(!should_construct(camera, &outside, Some(inside.id)));
+        // An inside object is constructed whether or not it is being edited.
+        assert!(should_construct(camera, &inside, Some(inside.id)));
+
+        // Selection must not gate base-element construction: selection outlines
+        // and resize handles are constructed separately in `artboards`, so an
+        // offscreen selected object stays culled without losing its chrome.
+        let mut selection = Selection::default();
+        selection.click(Some(outside.id), false);
+        assert_eq!(selection.ids(), &[outside.id]);
+        assert!(!should_construct(camera, &outside, None));
     }
 }

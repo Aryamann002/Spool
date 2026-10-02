@@ -1,4 +1,6 @@
 mod canvas;
+mod diagnostics;
+mod layers;
 mod shell;
 mod theme;
 

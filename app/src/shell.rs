@@ -1,6 +1,6 @@
 use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, SharedString, Window};
 
-use crate::{canvas, theme};
+use crate::{canvas, layers::LayersView, theme};
 
 const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
     ("↖", "Select", "V", canvas::Tool::Select),
@@ -77,6 +77,7 @@ fn shortcut_action(
 
 pub struct AppShell {
     canvas: Entity<canvas::CanvasView>,
+    layers: Entity<LayersView>,
     selected_tool: canvas::Tool,
     selected_page: usize,
     inspector_tab: usize,
@@ -90,8 +91,11 @@ pub struct AppShell {
 
 impl AppShell {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let canvas = cx.new(canvas::CanvasView::new_with_context);
+        let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
         Self {
-            canvas: cx.new(canvas::CanvasView::new_with_context),
+            canvas,
+            layers,
             selected_tool: canvas::Tool::Select,
             selected_page: 0,
             inspector_tab: 0,
@@ -414,52 +418,10 @@ impl AppShell {
             );
         }
 
-        let mut tree = div().flex().flex_col().gap_1().px(px(10.0)).pb(px(14.0));
-        let objects = self.canvas.read(cx).document_objects().to_vec();
-        for (index, object) in objects.iter().enumerate() {
-            let object_id = object.id;
-            let label = object.name.clone();
-            let icon = match object.object_type {
-                canvas::ObjectType::Frame => "▱",
-                canvas::ObjectType::Rectangle => "□",
-                canvas::ObjectType::Ellipse => "○",
-                canvas::ObjectType::Text => "T",
-            };
-            let selected = self.canvas.read(cx).selection().contains(object_id);
-            let background = if selected {
-                theme::ACCENT_WASH
-            } else {
-                theme::SURFACE
-            };
-            let foreground = if selected {
-                theme::ACCENT
-            } else {
-                theme::TEXT_SECONDARY
-            };
-            tree = tree.child(
-                div()
-                    .id(SharedString::from(format!("layer-{index}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(27.0))
-                    .pl(px(8.0))
-                    .pr(px(7.0))
-                    .rounded_md()
-                    .bg(rgb(background))
-                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
-                    .text_xs()
-                    .text_color(rgb(foreground))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.canvas.update(cx, |canvas, cx| {
-                            canvas.select_object(object_id, false, cx);
-                        });
-                        cx.notify();
-                    }))
-                    .child(icon)
-                    .child(label),
-            );
-        }
+        let tree = self
+            .layers
+            .clone()
+            .cached(self.layers.read(cx).cached_style());
 
         div()
             .flex()
@@ -1104,7 +1066,11 @@ impl AppShell {
     }
 
     fn design_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::diagnostics::count("inspector_build", 1);
+        let projection_start = crate::diagnostics::start();
         let selected = self.canvas.read(cx).selected_objects();
+        crate::diagnostics::record("inspector_projection", projection_start);
+        crate::diagnostics::count("inspector_objects_copied", selected.len() as u64);
         let content = match selected.as_slice() {
             [] => div()
                 .flex()
@@ -1287,7 +1253,20 @@ impl AppShell {
 
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        crate::diagnostics::count("shell_render", 1);
+        let render_start = crate::diagnostics::start();
+        self.layers.update(cx, |layers, cx| {
+            // Structure changes and selection changes both notify the Layers
+            // view so its subtree rebuilds. Selection changes are first
+            // reduced to an O(changed rows) presentation diff (counted as
+            // `row_presentation_updates`); applying the diff requires the
+            // subtree rebuild described in the Phase 15 report.
+            let outcome = layers.synchronize(self.canvas.read(cx));
+            if outcome.structure_changed || !outcome.presentation.is_empty() {
+                cx.notify();
+            }
+        });
+        let element = div()
             .id("spool-shell")
             .flex()
             .flex_col()
@@ -1297,6 +1276,9 @@ impl Render for AppShell {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.canvas.read(cx).workload_controls_input() {
+                        return;
+                    }
                     if this.canvas.read(cx).is_text_editing() {
                         this.canvas
                             .update(cx, |canvas, cx| canvas.commit_text_edit_session(cx));
@@ -1304,6 +1286,9 @@ impl Render for AppShell {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.canvas.read(cx).workload_controls_input() {
+                    return;
+                }
                 let key = event.keystroke.key.as_str();
                 let modifiers = event.keystroke.modifiers;
                 if this.canvas.read(cx).is_text_editing() {
@@ -1405,7 +1390,9 @@ impl Render for AppShell {
                 }
             }))
             .child(self.top_bar(cx))
-            .child(self.render_body(cx))
+            .child(self.render_body(cx));
+        crate::diagnostics::record("shell_render_build", render_start);
+        element
     }
 }
 
