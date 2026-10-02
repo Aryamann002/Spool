@@ -1840,10 +1840,10 @@ impl CanvasView {
             workload_running: false,
             project_root: None,
             source_snapshot: BTreeMap::new(),
-            #[cfg(debug_assertions)]
             constrain_drag: false,
             hovered: None,
             snap_guides: Vec::new(),
+            #[cfg(debug_assertions)]
             drag_start_positions: Vec::new(),
         }
     }
