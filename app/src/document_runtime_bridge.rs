@@ -31,16 +31,44 @@
 //!
 //! # Identity
 //!
-//! The canvas identifies objects by [`ObjectId`], a `u64` it allocates and
-//! reuses for its own purposes. That is a runtime lookup key, not durable
-//! identity. This module keeps the two apart with a [`RuntimeIdentityMap`]
-//! that assigns `ObjectId`s derived from the persistent [`NodeId`] order, so:
+//! There are two independent identities, and confusing them corrupts lookups.
 //!
-//! - the same `PersistentDocument` always projects to the same `ObjectId`s;
-//! - a rename never changes identity, because identity is the `NodeId`, not
-//!   the name;
-//! - deleting a node removes its runtime object without disturbing the
-//!   remaining assignments.
+//! **Persistent identity** is [`NodeId`], an opaque string owned by
+//! `lamine.yaml`. It is durable, is never derived from a name or position,
+//! and is the only identity that may be saved.
+//!
+//! **Runtime identity** is [`ObjectId`], a `u64` lookup key. Two unrelated
+//! allocators mint these, and this module owns one of them:
+//!
+//! 1. The canvas allocates low sequential keys from `Document::next_id`. Its
+//!    starter scene already occupies `ObjectId(1)..=ObjectId(4)`, and every
+//!    object a user draws takes the next number.
+//! 2. This module assigns keys derived from persistent [`NodeId`] order, so
+//!    that the same `PersistentDocument` always projects to the same keys and
+//!    a rename never disturbs them.
+//!
+//! Allocator 2 therefore starts at [`PROJECTED_OBJECT_ID_BASE`] instead of 1.
+//! Overlapping the ranges was a real defect, not a theoretical one: with a
+//! six-node document the projection assigned `ObjectId(5)` to a persistent
+//! node while the canvas independently minted `ObjectId(5)` for a newly drawn
+//! rectangle, so `object_of` resolved the rectangle to the wrong persistent
+//! node. The reserved base makes that collision unreachable while keeping
+//! projection reproducible.
+//!
+//! The long-term alternative is a single allocator authority with an opaque
+//! `ObjectId`. That is a wider identity change than this module should make
+//! alone, so it is recorded as a decision point rather than taken here.
+//!
+//! Note that a canvas-created `DesignObject::spool_id` is **not** persistent
+//! identity: the canvas mints those strings locally for objects that have no
+//! `lamine.yaml` node behind them yet. Only ids arriving through this
+//! projection are backed by a real structural node.
+
+/// First runtime key this module may assign.
+///
+/// Reserved high enough that the canvas's sequential allocator cannot reach
+/// it in practice, and disjoint from the canvas starter scene's `1..=4`.
+pub const PROJECTED_OBJECT_ID_BASE: u64 = 1 << 32;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -186,7 +214,7 @@ impl RuntimeProjection {
             // reproducible.
             let object_id = previous
                 .and_then(|prior| prior.identity_of(&node.id))
-                .unwrap_or_else(|| ObjectId(index as u64 + 1));
+                .unwrap_or_else(|| ObjectId(PROJECTED_OBJECT_ID_BASE + index as u64));
 
             projection.record(ProjectedNode {
                 node_id: node.id.clone(),
@@ -450,9 +478,9 @@ mod tests {
         // an allocator starting at an arbitrary number.
         let projection = RuntimeProjection::from_document(&document(), None);
         assert_eq!(projection.nodes[0].node_id, id("spool-root"));
-        assert_eq!(projection.nodes[0].object_id, ObjectId(1));
-        assert_eq!(projection.nodes[1].object_id, ObjectId(2));
-        assert_eq!(projection.nodes[2].object_id, ObjectId(3));
+        assert_eq!(projection.nodes[0].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE));
+        assert_eq!(projection.nodes[1].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE + 1));
+        assert_eq!(projection.nodes[2].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE + 2));
 
         // Two independently built projections must agree on those keys.
         let other = RuntimeProjection::from_document(&document(), None);
@@ -467,7 +495,10 @@ mod tests {
         // Rebuilding after a deletion must not renumber the survivors. This is
         // what stops a selection or hover from silently pointing elsewhere.
         let before = RuntimeProjection::from_document(&document(), None);
-        assert_eq!(before.identity_of(&id("spool-child")), Some(ObjectId(2)));
+        assert_eq!(
+            before.identity_of(&id("spool-child")),
+            Some(ObjectId(PROJECTED_OBJECT_ID_BASE + 1))
+        );
 
         let mut shrunk = document();
         shrunk.structure.nodes.remove(0); // drop the root
@@ -479,7 +510,7 @@ mod tests {
         assert_eq!(after.nodes[0].node_id, id("spool-child"));
         assert_eq!(
             after.identity_of(&id("spool-child")),
-            Some(ObjectId(2)),
+            Some(ObjectId(PROJECTED_OBJECT_ID_BASE + 1)),
             "a surviving node must keep its runtime key across a rebuild"
         );
     }
@@ -658,5 +689,95 @@ mod tests {
         let projection = RuntimeProjection::from_document(&document(), None);
         let binding = projection.binding_of(&id("spool-root")).expect("binding");
         assert_eq!(binding.0, "spool-root");
+    }
+
+    #[test]
+    fn projecting_never_changes_saved_metadata() {
+        // Architectural invariant: runtime keys are derived, disposable, and
+        // must not leak back into the persistent document. Projecting, reading
+        // identities, and building canvas objects must all be side-effect free
+        // with respect to `lamine.yaml`.
+        let before = document();
+        let yaml_before = before.structure.to_yaml().expect("serializes");
+
+        let projection = RuntimeProjection::from_document(&before, None);
+        let _ = projection.canvas_objects();
+        let _ = projection.identity_of(&id("spool-child"));
+        let _ = projection.object_of(ObjectId(PROJECTED_OBJECT_ID_BASE));
+
+        let after = document();
+        assert_eq!(after.structure.to_yaml().expect("serializes"), yaml_before);
+        // And no runtime key value appears anywhere in the saved form.
+        for node in &projection.nodes {
+            assert!(
+                !yaml_before.contains(&node.object_id.0.to_string()),
+                "runtime key {} leaked into saved metadata",
+                node.object_id.0
+            );
+        }
+    }
+
+    /// Architectural invariant: the two runtime-key allocators must not
+    /// overlap, or a drawn object would resolve to an unrelated persistent
+    /// node.
+    ///
+    /// This test exists because the overlap was a real defect. Deriving keys
+    /// from `index + 1` collided with the canvas starter scene (which owns
+    /// `1..=4`) and with everything the canvas allocates afterwards: with a
+    /// six-node document the projection assigned `ObjectId(5)` to a node while
+    /// the canvas minted `ObjectId(5)` for a new rectangle.
+    #[test]
+    fn projected_keys_never_collide_with_canvas_allocated_keys() {
+        // A document wide enough that its projected keys would have reached
+        // the canvas's allocation range under the old `index + 1` rule.
+        let wide: PersistentDocument = {
+            let mut document = self::document();
+            for i in 0..8 {
+                let nid = id(&format!("spool-extra-{i}"));
+                document.structure.nodes.push(crate::source_document::StructuralNode {
+                    id: nid.clone(),
+                    name: format!("Extra {i}"),
+                    kind: "frame".into(),
+                    parent: None,
+                    children: vec![],
+                    source: crate::source_document::SourceBinding {
+                        file: "index.html".into(),
+                        selector: format!("[data-spool-id=\"{}\"]", nid.as_str()),
+                    },
+                });
+            }
+            document
+        };
+        let projection = RuntimeProjection::from_document(&wide, None);
+
+        // Draw several objects in the canvas alongside the projection.
+        let mut canvas = crate::canvas::Document::default();
+        for _ in 0..6 {
+            canvas.create_object(
+                crate::canvas::ObjectType::Rectangle,
+                gpui::point(0.0, 0.0),
+                gpui::size(10.0, 10.0),
+                None,
+            );
+        }
+
+        // No canvas-allocated key may be claimed by the projection.
+        for object in canvas.objects() {
+            assert!(
+                projection.object_of(object.id).is_none(),
+                "canvas ObjectId({}) must not resolve to a persistent node",
+                object.id.0
+            );
+        }
+
+        // And the reverse: no projected key collides with the starter scene or
+        // anything it allocates.
+        for node in &projection.nodes {
+            assert!(
+                node.object_id.0 >= PROJECTED_OBJECT_ID_BASE,
+                "projected key {} escaped the reserved range",
+                node.object_id.0
+            );
+        }
     }
 }

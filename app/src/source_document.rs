@@ -253,6 +253,17 @@ pub struct PersistentDocument {
 
 /// State owned by the editor session. This is intentionally separate from
 /// PersistentDocument and has no persistence encoder.
+///
+/// **This is not the live editor state.** The running editor keeps its
+/// selection and camera on the `Canvas` entity as `canvas::Selection` (holding
+/// `Vec<ObjectId>` runtime keys) and `canvas::Camera`. This type is a
+/// model-level statement of the boundary in `docs/02`: it exists so the model
+/// tests can assert that selection, camera, and tool never enter persistent
+/// state, and it deliberately has no production caller.
+///
+/// Note the difference in element type is intentional rather than a mismatch:
+/// a live view selects runtime keys because that is what it can hit-test,
+/// while anything that must survive a reload refers to persistent `NodeId`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EditorRuntimeState {
     pub selection: Vec<NodeId>,
@@ -304,59 +315,18 @@ impl RenameNode {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct SemanticHistory {
-    undo: Vec<RenameNode>,
-    redo: Vec<RenameNode>,
-}
-
-impl SemanticHistory {
-    pub fn commit(
-        &mut self,
-        document: &mut PersistentDocument,
-        operation: RenameNode,
-    ) -> Result<bool, ModelError> {
-        if operation.before == operation.after {
-            return Ok(false);
-        }
-        operation.apply(document)?;
-        self.undo.push(operation);
-        self.redo.clear();
-        Ok(true)
-    }
-
-    pub fn undo(&mut self, document: &mut PersistentDocument) -> Result<bool, ModelError> {
-        let Some(operation) = self.undo.pop() else {
-            return Ok(false);
-        };
-        if let Err(error) = operation.inverse().apply(document) {
-            self.undo.push(operation);
-            return Err(error);
-        }
-        self.redo.push(operation);
-        Ok(true)
-    }
-
-    pub fn redo(&mut self, document: &mut PersistentDocument) -> Result<bool, ModelError> {
-        let Some(operation) = self.redo.pop() else {
-            return Ok(false);
-        };
-        if let Err(error) = operation.apply(document) {
-            self.redo.push(operation);
-            return Err(error);
-        }
-        self.undo.push(operation);
-        Ok(true)
-    }
-
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
-    }
-}
+// NOTE: this module deliberately has no history type of its own.
+//
+// An earlier `SemanticHistory` lived here, holding `Vec<RenameNode>` stacks.
+// It was a second implementation of the same concept as
+// `crate::operations::SemanticHistory`, and having two types with that name
+// made it unclear which stack an undo belonged to. It had no production
+// caller. History now lives in exactly one place: `crate::operations`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::{apply, OperationTarget, SemanticHistory, SemanticOperation};
 
     fn fixture() -> LamineStructure {
         let root = NodeId::new("spool-root-001").unwrap();
@@ -459,27 +429,43 @@ mod tests {
             structure: fixture(),
             sources: HashMap::from([("styles.css".into(), ".title { color: red; }\n".into())]),
         };
+        // The one and only history implementation, replayed against metadata
+        // alone via the metadata-only target.
         let mut history = SemanticHistory::default();
         let rename = |before: &str, after: &str| RenameNode {
             id: NodeId::new("spool-child-002").unwrap(),
             before: before.into(),
             after: after.into(),
         };
-        assert!(history
-            .commit(&mut document, rename("Title", "Hero"))
-            .unwrap());
+        let commit = |history: &mut SemanticHistory, document: &mut PersistentDocument, op: RenameNode| {
+            assert!(history.record(SemanticOperation::Rename(op.clone())));
+            apply(
+                &SemanticOperation::Rename(op),
+                &mut OperationTarget::Document(document),
+                crate::canvas::ReplayDirection::Redo,
+            )
+            .expect("the rename applies")
+        };
+
+        commit(&mut history, &mut document, rename("Title", "Hero"));
         assert_eq!(document.structure.nodes[1].name, "Hero");
         assert_eq!(document.sources["styles.css"], ".title { color: red; }\n");
-        assert!(history.undo(&mut document).unwrap());
+
+        assert!(history
+            .undo(&mut OperationTarget::Document(&mut document))
+            .unwrap());
         assert_eq!(document.structure.nodes[1].name, "Title");
         assert!(history.can_redo());
-        assert!(history.redo(&mut document).unwrap());
-        assert_eq!(document.structure.nodes[1].name, "Hero");
-        assert!(history.undo(&mut document).unwrap());
         assert!(history
-            .commit(&mut document, rename("Title", "Heading"))
+            .redo(&mut OperationTarget::Document(&mut document))
             .unwrap());
-        assert!(!history.can_redo());
+        assert_eq!(document.structure.nodes[1].name, "Hero");
+        assert!(history
+            .undo(&mut OperationTarget::Document(&mut document))
+            .unwrap());
+
+        commit(&mut history, &mut document, rename("Title", "Heading"));
+        assert!(!history.can_redo(), "a new commit clears the redo branch");
         assert_eq!(document.structure.nodes[1].name, "Heading");
     }
 

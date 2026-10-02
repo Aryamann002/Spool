@@ -321,9 +321,23 @@ pub enum StyleEdit {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesignObject {
+    /// Runtime lookup key. Never durable; allocated locally from `next_id`.
     pub id: ObjectId,
-    /// Stable source/document identity. `id` remains the current runtime lookup
-    /// key; this opaque value is persisted by `lamine.yaml`.
+    /// Carries a persistent identity, but only sometimes.
+    ///
+    /// Two distinct cases, and conflating them would let a runtime-local id be
+    /// mistaken for durable identity:
+    ///
+    /// - **Projected.** Objects built by
+    ///   `document_runtime_bridge::RuntimeProjection::canvas_objects` carry the
+    ///   `NodeId` of a real `lamine.yaml` structural node.
+    /// - **Locally minted.** Objects this `Document` creates or duplicates get
+    ///   an id from `allocate_node_id` (`spool-node-<16 hex>`). No structural
+    ///   node backs them yet and no save path writes them anywhere, so today
+    ///   they are runtime-local values that merely share the `NodeId` type.
+    ///
+    /// `NodeId` here means "opaque, well-formed identifier", not "exists in
+    /// the persistent document". Only the projected case may be persisted.
     pub spool_id: NodeId,
     pub name: String,
     pub position: Point<f32>,
@@ -536,6 +550,10 @@ impl DocumentCommand {
 pub struct History {
     /// The unified stack. Every canvas command goes through this, and so does
     /// every persistent operation, so there is exactly one undo model.
+    ///
+    /// This struct has no other field on purpose. It holds no stacks of its
+    /// own, so a canvas undo and a metadata undo cannot diverge into two
+    /// implementations; see `canvas_history_and_metadata_share_one_stack`.
     inner: SemanticHistory,
 }
 
@@ -4564,6 +4582,77 @@ mod tests {
             before,
             after,
         }]));
+    }
+
+    /// Architectural invariant: the canvas facade and the persistent document
+    /// must not become two independent history implementations.
+    ///
+    /// This is the observable consequence of `History` holding nothing but a
+    /// `SemanticHistory`. A canvas command and a metadata rename pushed into
+    /// the same facade must undo as one LIFO sequence: if the two stacks were
+    /// ever separate, the rename would either be invisible to the canvas
+    /// facade or would undo out of order relative to the move.
+    #[test]
+    fn canvas_history_and_metadata_share_one_stack() {
+        use crate::operations::{apply, OperationTarget};
+        use crate::source_document::PersistentDocument;
+
+        let mut canvas_document = Document::default();
+        let mut metadata = PersistentDocument {
+            structure: crate::source_document::LamineStructure {
+                nodes: vec![crate::source_document::StructuralNode {
+                    id: crate::source_document::NodeId::new("spool-shared").unwrap(),
+                    name: "Shared".into(),
+                    kind: "frame".into(),
+                    parent: None,
+                    children: vec![],
+                    source: crate::source_document::SourceBinding {
+                        file: "index.html".into(),
+                        selector: "[data-spool-id=\"spool-shared\"]".into(),
+                    },
+                }],
+            },
+            sources: Default::default(),
+        };
+
+        // Commit a canvas move, then a metadata rename, into the one facade.
+        let mut history = History::default();
+        record_position(&mut history, &mut canvas_document, ObjectId::LANDING, 100.0);
+
+        let rename = SemanticOperation::Rename(crate::source_document::RenameNode {
+            id: crate::source_document::NodeId::new("spool-shared").unwrap(),
+            before: "Shared".into(),
+            after: "Renamed".into(),
+        });
+        assert!(history.inner.record(rename.clone()));
+        apply(
+            &rename,
+            &mut OperationTarget::Document(&mut metadata),
+            ReplayDirection::Redo,
+        )
+        .expect("the rename applies");
+        assert_eq!(metadata.structure.nodes[0].name, "Renamed");
+        assert_eq!(history.undo_len(), 2, "both operations share one depth");
+
+        // Undo order is strictly LIFO across the two kinds: the rename, which
+        // was committed second, comes off first.
+        assert!(history
+            .inner
+            .undo(&mut OperationTarget::Document(&mut metadata))
+            .expect("rename undoes"));
+        assert_eq!(metadata.structure.nodes[0].name, "Shared");
+        assert_eq!(canvas_document.geometry(ObjectId::LANDING).unwrap().position.x, 100.0);
+
+        assert!(history.undo(&mut canvas_document), "then the move undoes");
+        assert_eq!(
+            canvas_document.geometry(ObjectId::LANDING).unwrap().position.x,
+            0.0
+        );
+
+        // And the canvas facade reports the stack empty afterwards, proving
+        // both entries were in the same place rather than one being hidden.
+        assert_eq!(history.undo_len(), 0);
+        assert!(!history.can_undo());
     }
 
     fn snapshots(document: &Document, ids: &[ObjectId]) -> Vec<ObjectSnapshot> {

@@ -152,7 +152,18 @@ impl std::error::Error for OperationError {}
 /// chosen at replay time.
 pub enum OperationTarget<'a> {
     /// Only canvas document state is available.
+    ///
+    /// This is what the live canvas entity has: it owns a `Document` and no
+    /// persistent metadata.
     Runtime(&'a mut Document),
+    /// Only persistent metadata state is available.
+    ///
+    /// A bundle-level caller such as a save/reload cycle has a
+    /// [`PersistentDocument`] and no canvas runtime. Without this variant a
+    /// rename could only be replayed by also constructing a throwaway
+    /// `Document` to satisfy [`OperationTarget::Full`], which would be a lie
+    /// about what the caller owns.
+    Document(&'a mut PersistentDocument),
     /// Both metadata and canvas state are available.
     Full {
         document: &'a mut PersistentDocument,
@@ -247,14 +258,21 @@ impl SemanticHistory {
 }
 
 /// Apply one operation in the given direction.
-fn apply(
+///
+/// This is the low-level replay primitive behind [`SemanticHistory::undo`],
+/// [`SemanticHistory::redo`], and [`EditSession::execute`]. It is public so a
+/// caller that owns only some of the state can still commit: [`EditSession`]
+/// requires both a persistent document and a canvas runtime, so a
+/// bundle-level caller holding only a [`PersistentDocument`] would otherwise
+/// have no way to apply an operation it has just recorded.
+pub fn apply(
     operation: &SemanticOperation,
     target: &mut OperationTarget<'_>,
     direction: ReplayDirection,
 ) -> Result<(), OperationError> {
     match operation {
         SemanticOperation::Rename(rename) => match target {
-            OperationTarget::Full { document, .. } => {
+            OperationTarget::Full { document, .. } | OperationTarget::Document(document) => {
                 // Undo replays the inverse, which restores the previous name.
                 // Replaying the operation itself would be a no-op at best and
                 // a stale-edit error at worst.
@@ -272,6 +290,9 @@ fn apply(
             let runtime = match target {
                 OperationTarget::Runtime(document) => document,
                 OperationTarget::Full { runtime, .. } => runtime,
+                OperationTarget::Document(_) => {
+                    return Err(OperationError::WrongTarget("a canvas command"))
+                }
             };
             command.replay(runtime, direction);
             Ok(())
@@ -909,6 +930,43 @@ mod tests {
             session.document.structure.nodes.iter().map(|node| node.name.clone()).collect();
         assert_ne!(names, after, "the successful rename is still in place");
         assert_eq!(session.document.structure.nodes[0].name, "Renamed");
+    }
+
+    #[test]
+    fn edit_session_undoes_metadata_and_runtime_as_one_lifo_sequence() {
+        // Architectural invariant: `EditSession` holds a `SemanticHistory`, the
+        // same type `canvas::History` is a facade over. A session therefore
+        // undoes a rename and a move as one interleaved stack, which is what
+        // distinguishes "one history implementation" from "two stacks that
+        // happen to look alike".
+        let mut session = session();
+        let id = seed_rect(&mut session);
+        let baseline = session.history.undo_len();
+
+        let first = move_nodes(&mut session.runtime, &[id], 12.0, 0.0);
+        session.execute(first).unwrap();
+        session
+            .execute(
+                rename_node_in(&session.document, NodeId::new("spool-a").unwrap(), "Alpha X".into())
+                    .unwrap(),
+            )
+            .unwrap();
+        let second = move_nodes(&mut session.runtime, &[id], 0.0, 7.0);
+        session.execute(second).unwrap();
+        assert_eq!(session.history.undo_len(), baseline + 3);
+
+        // Strict LIFO across both kinds: the second move, then the rename, then
+        // the first move.
+        assert!(session.undo().unwrap());
+        assert_eq!(geometry_of(&session, id).position.y, 0.0);
+        assert_eq!(session.document.structure.nodes[0].name, "Alpha X");
+
+        assert!(session.undo().unwrap());
+        assert_eq!(session.document.structure.nodes[0].name, "Alpha");
+
+        assert!(session.undo().unwrap());
+        assert_eq!(geometry_of(&session, id).position.x, 0.0);
+        assert_eq!(session.history.undo_len(), baseline);
     }
 
     #[test]
