@@ -5,7 +5,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PinchEvent, Pixels,
     Point, Render, ScrollWheelEvent, SharedString, Size, Style, TextRun, UTF16Selection, Window,
 };
-use std::{cell::Cell, ops::Range, rc::Rc};
+use std::{cell::Cell, collections::BTreeMap, ops::Range, rc::Rc};
 
 gpui::actions!(
     spool_text,
@@ -345,6 +345,14 @@ pub struct DesignObject {
     pub size: Size<f32>,
     pub object_type: ObjectType,
     pub text_content: Option<String>,
+    /// Authored CSS `color` for this object's text, when source declared one.
+    ///
+    /// `None` means "nobody authored a colour", which is different from a
+    /// painted colour: the renderer picks its own in that case. Keeping the
+    /// distinction is what stops a guess from silently overriding source.
+    pub text_color: Option<Color>,
+    /// Authored CSS `font-size` in pixels, when source declared one.
+    pub font_size: Option<f32>,
     pub fill: Option<Fill>,
     pub stroke: Option<Stroke>,
 }
@@ -731,10 +739,30 @@ impl Document {
         id
     }
 
+    /// Mint an identity for a newly created or duplicated object.
+    ///
+    /// The counter alone is not sufficient. A loaded project brings its own
+    /// `NodeId`s from `lamine.yaml`, and those are arbitrary authored strings —
+    /// not necessarily produced by this counter. Restarting the counter at 1 in
+    /// [`Document::from_design_objects`] therefore risked minting an identity a
+    /// live node already owns, which would make two objects share one durable
+    /// identity.
+    ///
+    /// So the allocator checks against what is actually present and skips
+    /// collisions. That is authoritative and deterministic regardless of how
+    /// the document was built.
     fn allocate_node_id(&mut self) -> NodeId {
-        let id = self.next_node_id;
-        self.next_node_id += 1;
-        node_id(format!("spool-node-{id:016x}"))
+        loop {
+            let candidate = node_id(format!("spool-node-{:016x}", self.next_node_id));
+            self.next_node_id += 1;
+            if !self
+                .objects
+                .iter()
+                .any(|object| object.spool_id == candidate)
+            {
+                return candidate;
+            }
+        }
     }
 
     fn allocate_name(&mut self, object_type: ObjectType) -> String {
@@ -797,6 +825,8 @@ impl Document {
             ),
             object_type,
             text_content,
+            text_color: None,
+            font_size: None,
             fill: default_style(object_type).fill,
             stroke: default_style(object_type).stroke,
         };
@@ -945,6 +975,8 @@ fn frame(
         size: size(width, height),
         object_type: ObjectType::Frame,
         text_content: None,
+        text_color: None,
+        font_size: None,
         fill: default_style(ObjectType::Frame).fill,
         stroke: default_style(ObjectType::Frame).stroke,
     }
@@ -1338,6 +1370,29 @@ struct TextEditState {
     pointer_anchor: Option<usize>,
 }
 
+/// The runtime appearance an object had the moment its project was opened.
+///
+/// Used only to decide what a save needs to write. Keeping it derived state on
+/// the view — not in the persistent document — is what lets save answer "did the
+/// user change this?" without recording anything new in the document.
+#[derive(Clone, Debug, PartialEq)]
+struct SourceSnapshot {
+    position: Point<f32>,
+    size: Size<f32>,
+    text: Option<String>,
+    fill: Option<Fill>,
+    stroke: Option<Stroke>,
+}
+
+/// Format a colour the way source spells it.
+///
+/// Written back into CSS as `#rrggbb`. Alpha is not supported by the style
+/// module, so a colour with one is left to the reader rather than written as a
+/// value that means something narrower than what the editor holds.
+fn css_color(color: Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
+}
+
 pub struct CanvasView {
     camera: Camera,
     /// The single mutation and history boundary for the live editor.
@@ -1367,6 +1422,18 @@ pub struct CanvasView {
     workload_started: bool,
     #[cfg(debug_assertions)]
     workload_running: bool,
+    /// Where the open project lives on disk, if one is open.
+    ///
+    /// Kept beside the document rather than inside it: the persistent document
+    /// describes content, not where it came from.
+    project_root: Option<std::path::PathBuf>,
+    /// What each loaded object looked like when the project was opened.
+    ///
+    /// Save diffs against this. Without it, saving an untouched project would
+    /// rewrite every element with absolute geometry — the file would change on
+    /// disk for a session in which the user did nothing, which is exactly the
+    /// behaviour source-preserving save exists to prevent.
+    source_snapshot: BTreeMap<NodeId, SourceSnapshot>,
     /// Debug-only: true pre-gesture positions for the runtime history probe.
     #[cfg(debug_assertions)]
     drag_start_positions: Vec<(f32, f32)>,
@@ -1401,6 +1468,8 @@ impl CanvasView {
             workload_started: false,
             #[cfg(debug_assertions)]
             workload_running: false,
+            project_root: None,
+            source_snapshot: BTreeMap::new(),
             #[cfg(debug_assertions)]
             drag_start_positions: Vec::new(),
         }
@@ -1425,6 +1494,26 @@ impl CanvasView {
     /// whatever was open before, and replaying an old operation against it
     /// would be meaningless rather than merely stale.
     pub fn load_project(&mut self, loaded: crate::project_open::LoadedProject) {
+        self.project_root = Some(loaded.root.clone());
+        // Snapshot the runtime appearance before any edit, so save can tell an
+        // authored value from a change the user made in this session.
+        self.source_snapshot = loaded
+            .runtime
+            .objects()
+            .iter()
+            .map(|object| {
+                (
+                    object.spool_id.clone(),
+                    SourceSnapshot {
+                        position: object.position,
+                        size: object.size,
+                        text: object.text_content.clone(),
+                        fill: object.fill,
+                        stroke: object.stroke,
+                    },
+                )
+            })
+            .collect();
         self.session = EditSession::new(loaded.document, loaded.runtime);
         // A freshly loaded document has no selection, and keeping stale ids
         // would let hit-testing and layers refer to objects that no longer
@@ -1436,6 +1525,148 @@ impl CanvasView {
         // Projected objects are laid out by the projection's own placeholder
         // rule, so fitting the camera is what actually brings them on screen.
         self.camera.fit();
+    }
+
+    /// Where a node's containing block starts, in world coordinates.
+    ///
+    /// Zero for a root, because a root's containing block is the page. Resolved
+    /// through the persistent document rather than the runtime object list so
+    /// it is the authored hierarchy that decides, not the order things happen
+    /// to be drawn in.
+    fn parent_origin(&self, node: &NodeId) -> Point<f32> {
+        let parent = self
+            .session
+            .document
+            .structure
+            .nodes
+            .iter()
+            .find(|candidate| &candidate.id == node)
+            .and_then(|candidate| candidate.parent.clone());
+        let Some(parent) = parent else {
+            return point(0.0, 0.0);
+        };
+        let object = self
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id == parent);
+        object
+            .and_then(|object| self.session.runtime.geometry(object.id))
+            .map(|geometry| geometry.position)
+            .unwrap_or(point(0.0, 0.0))
+    }
+
+    /// Write the current editor state back to the project's authored source.
+    ///
+    /// This is the save half of the product loop. It diffs each managed object
+    /// against [`Self::source_snapshot`] and emits one [`SourceEdit`] per real
+    /// change, and the save layer turns each into the smallest authored edit it
+    /// can:
+    ///
+    /// - geometry becomes an inline `style` on the element
+    /// - text replaces the element's authored text
+    /// - fill and stroke rewrite the CSS declaration that already owns them
+    /// - metadata is written by the existing bundle writer
+    ///
+    /// Objects created during the session have no authored element yet, so they
+    /// are reported as unsupported rather than silently dropped. That is a real
+    /// limitation of this milestone, not a silent success.
+    ///
+    /// Returns the outcome, including what could not be written.
+    pub fn save_project(
+        &self,
+    ) -> Result<crate::project_save::SaveOutcome, crate::project_bundle::BundleError> {
+        let mut outcome = crate::project_save::SaveOutcome::default();
+        let Some(root) = self.project_root.as_deref() else {
+            // No project open: nothing to write, and nothing invented.
+            return Ok(outcome);
+        };
+        let mut edits = Vec::new();
+        for object in self.session.runtime.objects() {
+            // Only objects that came from authored source can be written back.
+            let bound = self
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.id == object.spool_id);
+            if !bound {
+                outcome
+                    .unsupported
+                    .push(crate::project_save::UnsupportedEdit {
+                        node: object.spool_id.clone(),
+                        kind: "object",
+                        reason: "created in this session, so it has no authored element yet".into(),
+                    });
+                continue;
+            }
+            // No snapshot means this object was not the one that was loaded —
+            // an object recreated under the same identity. Writing it would be a
+            // guess, so it is reported instead.
+            let Some(before) = self.source_snapshot.get(&object.spool_id) else {
+                outcome
+                    .unsupported
+                    .push(crate::project_save::UnsupportedEdit {
+                        node: object.spool_id.clone(),
+                        kind: "object",
+                        reason: "no opened state to compare against".into(),
+                    });
+                continue;
+            };
+
+            let geometry = self.session.runtime.geometry(object.id);
+            if let Some(geometry) = geometry {
+                // Only what actually changed. Writing an unchanged size back
+                // would pin the element to an explicit box the author never
+                // wrote, which stops following the stylesheet from then on.
+                let moved = before.position != geometry.position;
+                let resized = before.size != geometry.size;
+                if moved || resized {
+                    // An absolute `left`/`top` is measured from the containing
+                    // block, which is the parent element. The editor works in
+                    // world coordinates, so a child has to be written relative
+                    // to where its parent now sits or it would jump on reopen.
+                    let parent_origin = self.parent_origin(&object.spool_id);
+                    edits.push(crate::project_save::SourceEdit::Geometry {
+                        node: object.spool_id.clone(),
+                        x: moved.then_some(geometry.position.x - parent_origin.x),
+                        y: moved.then_some(geometry.position.y - parent_origin.y),
+                        width: resized.then_some(geometry.size.width),
+                        height: resized.then_some(geometry.size.height),
+                    });
+                }
+            }
+            let text = object.text_content.as_ref().filter(|t| !t.is_empty());
+            if let Some(text) = text.filter(|text| Some(*text) != before.text.as_ref()) {
+                edits.push(crate::project_save::SourceEdit::Text {
+                    node: object.spool_id.clone(),
+                    text: text.clone(),
+                });
+            }
+            if before.fill != object.fill {
+                if let Some(fill) = object.fill {
+                    edits.push(crate::project_save::SourceEdit::Style {
+                        node: object.spool_id.clone(),
+                        property: "background-color".into(),
+                        value: css_color(fill.color),
+                    });
+                }
+            }
+            if before.stroke != object.stroke {
+                if let Some(stroke) = object.stroke {
+                    edits.push(crate::project_save::SourceEdit::Style {
+                        node: object.spool_id.clone(),
+                        property: "border".into(),
+                        value: format!("{}px {}", stroke.width, css_color(stroke.color)),
+                    });
+                }
+            }
+        }
+        let mut written = crate::project_save::save_project(root, &self.session.document, &edits)?;
+        written.unsupported.append(&mut outcome.unsupported);
+        Ok(written)
     }
 
     /// The live commit path for every canvas mutation.
@@ -3290,13 +3521,66 @@ fn render_object(
             body = body
                 .flex()
                 .items_start()
-                .text_size(px!(14.0, zoom))
-                .text_color(rgb(theme::TEXT))
+                .text_size(px!(text_size_of(object), zoom))
+                .text_color(ink_of(object))
                 .child(object.text_content.clone().unwrap_or_default());
         }
         ObjectType::Text => {}
     }
+
+    // Authored text is drawn for any object that has it, not only for objects
+    // typed as text. Metadata declares a button as `frame` while its element
+    // is an `<a>` with a label; hiding that label would make a correctly
+    // loaded project look emptier than its source.
+    if let Some(text) = object.text_content.as_ref().filter(|t| !t.is_empty()) {
+        if object.object_type != ObjectType::Text {
+            body = body
+                .flex()
+                .items_start()
+                .text_size(px!(text_size_of(object), zoom))
+                .text_color(ink_of(object))
+                .child(text.clone());
+        }
+    }
     body
+}
+
+/// Text size for an object: the authored one when source declared it.
+///
+/// Provisional: an authored size is applied as the renderer font size, with no
+/// line-height model and no scaling against the element's own box.
+fn text_size_of(object: &DesignObject) -> f32 {
+    object.font_size.unwrap_or(14.0)
+}
+
+/// Text colour for an object: authored first, contrast guess second.
+///
+/// The authored `color` wins because source is authoritative. Only when no
+/// colour was authored does the renderer choose one, because an unreadable
+/// label is worse than an arbitrary choice.
+fn ink_of(object: &DesignObject) -> gpui::Rgba {
+    if let Some(color) = object.text_color {
+        return rgb(color.to_rgb());
+    }
+    object
+        .fill
+        .map(|fill| rgb(contrasting_ink(fill.color)))
+        .unwrap_or_else(|| rgb(theme::TEXT))
+}
+
+/// Pick black or white text for legibility against a background.
+///
+/// Provisional: the authored `color` should win once style resolution is
+/// plumbed through to the renderer.
+fn contrasting_ink(background: Color) -> u32 {
+    let luminance = 0.299 * background.red as f32
+        + 0.587 * background.green as f32
+        + 0.114 * background.blue as f32;
+    if luminance > 140.0 {
+        0x1a1a1a
+    } else {
+        0xffffff
+    }
 }
 
 fn render_preview(camera: Camera, preview: CreationPreview, zoom: f32) -> impl IntoElement {
@@ -6653,6 +6937,8 @@ mod tests {
             size: object_size,
             object_type: ObjectType::Rectangle,
             text_content: None,
+            text_color: None,
+            font_size: None,
             fill: default_style(ObjectType::Rectangle).fill,
             stroke: None,
         }
@@ -6810,5 +7096,524 @@ mod tests {
         selection.click(Some(outside.id), false);
         assert_eq!(selection.ids(), &[outside.id]);
         assert!(!should_construct(camera, &outside, None));
+    }
+
+    // ---------------------------------------------------------------------
+    // Editing a source-backed project
+    //
+    // These cover the product loop the milestone is about: a loaded project is
+    // an ordinary editable document, and what the editor changes is written
+    // back to the authored source it came from.
+    // ---------------------------------------------------------------------
+
+    /// Copy a fixture into a temp directory so a save cannot touch the repo.
+    fn project_scratch(fixture: &str) -> std::path::PathBuf {
+        let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(fixture);
+        let to = std::env::temp_dir().join(format!(
+            "spool-canvas-{fixture}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&to);
+        copy_tree(&from, &to).expect("copy fixture");
+        to
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn project_view(root: &std::path::Path) -> CanvasView {
+        let loaded = crate::project_open::open_project(root).expect("project opens");
+        let mut view = CanvasView::new();
+        view.load_project(loaded);
+        view
+    }
+
+    fn object_with_node(view: &CanvasView, node: &str) -> DesignObject {
+        view.document_objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == node)
+            .unwrap_or_else(|| panic!("{node} is projected"))
+            .clone()
+    }
+
+    #[test]
+    fn a_created_object_never_reuses_a_loaded_identity() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let loaded_ids: Vec<String> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            loaded_ids.len(),
+            3,
+            "the fixture has three projected objects"
+        );
+
+        // The counter behind `allocate_node_id` restarts at 1 when a project is
+        // loaded, so a freshly created object's candidate identity collides with
+        // an authored one unless allocation checks what is live.
+        for index in 0..5 {
+            let created = view.session.runtime.create_object(
+                ObjectType::Rectangle,
+                point(index as f32 * 10.0, 0.0),
+                size(10.0, 10.0),
+                None,
+            );
+            assert!(
+                !loaded_ids.contains(&created.spool_id.as_str().to_owned()),
+                "a new object must not take the identity of {:?}",
+                created.spool_id.as_str()
+            );
+        }
+
+        // And identities stay unique across the whole document, not just against
+        // the loaded set.
+        let all: Vec<&str> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str())
+            .collect();
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "every live identity is unique");
+    }
+
+    #[test]
+    fn a_new_identity_is_never_one_that_is_already_live() {
+        // The counter that feeds `allocate_node_id` is set from scratch when a
+        // projected document is loaded, so its next value can name an identity
+        // that is already in the scene. Allocation has to notice and move on;
+        // without that check the editor would end up with two objects claiming
+        // one identity, and every later lookup by identity would be ambiguous.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let first = view.session.runtime.create_object(
+            ObjectType::Rectangle,
+            point(0.0, 0.0),
+            size(10.0, 10.0),
+            None,
+        );
+
+        // Rewind the counter to the value it would hand out next time.
+        view.session.runtime.next_node_id = 1;
+        let second = view.session.runtime.create_object(
+            ObjectType::Rectangle,
+            point(10.0, 0.0),
+            size(10.0, 10.0),
+            None,
+        );
+        assert_ne!(
+            first.spool_id, second.spool_id,
+            "a live identity was handed out twice"
+        );
+        assert_eq!(
+            first.spool_id,
+            node_id(format!("spool-node-{:016x}", 1)),
+            "the first object took the identity the counter offered"
+        );
+    }
+
+    #[test]
+    fn deleting_an_object_does_not_free_its_identity_for_reuse() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+
+        let removed = view.session.runtime.remove_objects(&[cta.id]);
+        view.commit(DocumentCommand::delete(removed));
+        assert!(
+            view.document_objects()
+                .iter()
+                .all(|object| object.spool_id != cta.spool_id),
+            "the deleted object is gone from the runtime"
+        );
+        assert!(
+            view.session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.id == cta.spool_id),
+            "and its identity is still live in the persistent document"
+        );
+
+        // A new object minted after the deletion must still not land on it: the
+        // identity belongs to the document, not to the runtime object that used
+        // to hold it.
+        let created = view.session.runtime.create_object(
+            ObjectType::Rectangle,
+            point(0.0, 0.0),
+            size(10.0, 10.0),
+            None,
+        );
+        assert_ne!(created.spool_id, cta.spool_id);
+    }
+
+    #[test]
+    fn duplicating_a_projected_object_gives_it_new_identities() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let originals: Vec<String> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str().to_owned())
+            .collect();
+
+        let duplicates = view.session.runtime.duplicate_objects(&[cta.id]);
+        view.commit(DocumentCommand::insert(duplicates.clone()));
+        assert_eq!(duplicates.len(), 1);
+
+        let copy = &duplicates[0].object;
+        assert_ne!(copy.id, cta.id, "a new runtime key");
+        assert_ne!(copy.spool_id, cta.spool_id, "a new persistent identity");
+        assert!(
+            !originals.contains(&copy.spool_id.as_str().to_owned()),
+            "the duplicate does not take an existing identity"
+        );
+        assert_eq!(
+            copy.text_content, cta.text_content,
+            "and it carries the same authored text"
+        );
+
+        // The original is untouched and both remain in the scene.
+        let after: Vec<String> = view
+            .document_objects()
+            .iter()
+            .map(|object| object.spool_id.as_str().to_owned())
+            .collect();
+        assert!(after.contains(&cta.spool_id.as_str().to_owned()));
+        assert!(after.contains(&copy.spool_id.as_str().to_owned()));
+    }
+
+    #[test]
+    fn a_moved_object_survives_undo_redo_and_then_the_save_loop() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let resting = cta.position;
+
+        // A real gesture: select, drag, release. The move goes through the
+        // canvas commit path, so it is one history entry.
+        view.selection.replace(vec![cta.id]);
+        let depth_before = view.session.history.undo_len();
+        begin_live_move(&mut view, &[cta.id]);
+        drag_to(&mut view, point(120.0, 40.0));
+        assert_eq!(
+            view.session.history.undo_len() - depth_before,
+            1,
+            "one drag is one history entry"
+        );
+        let committed = object_with_node(&view, "spool-cta-primary").position;
+        assert_ne!(committed, resting, "the object actually moved");
+
+        assert!(view.undo_history());
+        assert_eq!(
+            object_with_node(&view, "spool-cta-primary").position,
+            resting,
+            "undo restored the authored position"
+        );
+        assert!(view.redo_history());
+        assert_eq!(
+            object_with_node(&view, "spool-cta-primary").position,
+            committed,
+            "redo re-applied the move"
+        );
+
+        // Save, then reopen from disk through the ordinary loader.
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(
+            outcome.unsupported.is_empty(),
+            "nothing about this edit was dropped: {:?}",
+            outcome.unsupported
+        );
+        let reopened = project_view(&root);
+        let after = object_with_node(&reopened, "spool-cta-primary");
+        assert_eq!(
+            after.position, committed,
+            "the saved position came back from disk"
+        );
+        assert_eq!(
+            after.size, cta.size,
+            "an untouched size is not rewritten as a new one"
+        );
+        assert_eq!(
+            reopened.persistent_document().structure.nodes.len(),
+            3,
+            "identity and hierarchy survive the loop"
+        );
+        assert_eq!(
+            after.text_content, cta.text_content,
+            "authored text survives the loop"
+        );
+    }
+
+    #[test]
+    fn moving_a_frame_and_its_children_survives_the_round_trip() {
+        // The regression this covers: a child's absolute position is measured
+        // from the element that contains it, so saving a moved frame and its
+        // children has to write the children relative to where the frame ended
+        // up. Writing world coordinates as `left` put every child twice as far
+        // from the origin as it should be once the parent itself moved.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let ids: Vec<ObjectId> = view.document_objects().iter().map(|o| o.id).collect();
+        let resting: Vec<(f32, f32)> = view
+            .document_objects()
+            .iter()
+            .map(|o| (o.position.x, o.position.y))
+            .collect();
+
+        view.selection.replace(ids.clone());
+        begin_live_move(&mut view, &ids);
+        drag_to(&mut view, point(120.0, 90.0));
+        let committed: Vec<(f32, f32)> = view
+            .document_objects()
+            .iter()
+            .map(|o| (o.position.x, o.position.y))
+            .collect();
+        assert_ne!(committed, resting);
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let reopened = project_view(&root);
+        let after: Vec<(f32, f32)> = reopened
+            .document_objects()
+            .iter()
+            .map(|o| (o.position.x, o.position.y))
+            .collect();
+        for ((want_x, want_y), (got_x, got_y)) in committed.iter().zip(&after) {
+            assert!(
+                (want_x - got_x).abs() < 0.01 && (want_y - got_y).abs() < 0.01,
+                "every object came back where it was left: want ({want_x}, {want_y}), got ({got_x}, {got_y})"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_an_untouched_project_writes_nothing() {
+        let root = project_scratch("landing");
+        let before: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(&root)
+            .expect("read project")
+            .map(|entry| entry.expect("entry"))
+            .map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("read file");
+                (entry.path(), bytes)
+            })
+            .collect();
+
+        let view = project_view(&root);
+        let outcome = view.save_project().expect("save succeeds");
+
+        assert!(
+            outcome.written.is_empty(),
+            "no file should be rewritten for a session that changed nothing: {:?}",
+            outcome.written
+        );
+        for (path, bytes) in before {
+            assert_eq!(
+                std::fs::read(&path).expect("read file"),
+                bytes,
+                "{} is byte-for-byte unchanged",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_created_object_is_reported_rather_than_silently_dropped() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let created = view.session.runtime.create_object(
+            ObjectType::Rectangle,
+            point(400.0, 400.0),
+            size(60.0, 60.0),
+            None,
+        );
+        view.commit(DocumentCommand::insert(vec![view
+            .session
+            .runtime
+            .placement(created.id)
+            .expect("new object is placed")]));
+
+        let outcome = view.save_project().expect("save succeeds");
+        let reported: Vec<&str> = outcome
+            .unsupported
+            .iter()
+            .map(|edit| edit.node.as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            vec![created.spool_id.as_str()],
+            "the object with no authored element is named, not quietly skipped"
+        );
+        assert!(
+            outcome.unsupported[0].reason.contains("authored element"),
+            "and the reason says why: {}",
+            outcome.unsupported[0].reason
+        );
+        assert!(
+            !std::fs::read_to_string(root.join("index.html"))
+                .expect("html readable")
+                .contains("spool-node"),
+            "nothing was invented in the source to stand in for it"
+        );
+    }
+
+    #[test]
+    fn a_style_change_rewrites_the_declaration_that_already_owns_it() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        assert_eq!(
+            cta.fill.map(|fill| fill.color),
+            Some(Color::from_rgb(0x3b5bfd)),
+            "the CTA's colour comes from the authored stylesheet"
+        );
+
+        // The inspector writes a new fill through the ordinary style path.
+        let red = Color::from_rgb(0xff0000);
+        view.selection.replace(vec![cta.id]);
+        assert!(
+            view.apply_selected_style(StyleEdit::Fill(Some(red))),
+            "the inspector path applies and commits the fill"
+        );
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(
+            outcome.unsupported.is_empty(),
+            "the fill had an authored owner: {:?}",
+            outcome.unsupported
+        );
+        let css = std::fs::read_to_string(root.join("styles.css")).expect("css readable");
+        assert!(
+            css.contains("background: #ff0000"),
+            "the owning declaration was rewritten in place: {css}"
+        );
+        assert_eq!(
+            css.matches(":root").count(),
+            1,
+            "no rule was added to make room for the edit"
+        );
+        assert_eq!(
+            css.matches("background").count(),
+            1,
+            "the edit replaced a value rather than adding a declaration"
+        );
+
+        // And it comes back as what was authored.
+        let reopened = project_view(&root);
+        assert_eq!(
+            object_with_node(&reopened, "spool-cta-primary")
+                .fill
+                .map(|fill| fill.color),
+            Some(red)
+        );
+    }
+
+    #[test]
+    fn what_the_renderer_would_draw_comes_from_source_not_from_editor_defaults() {
+        // The strongest statement about appearance that does not need a screen:
+        // these are the exact values the render path hands to GPUI for a loaded
+        // project. If the editor defaults were still winning, the CTA would draw
+        // in the theme's blue-on-paper instead of its authored white-on-accent.
+        let root = project_scratch("landing");
+        let view = project_view(&root);
+
+        let cta = object_with_node(&view, "spool-cta-primary");
+        assert_eq!(
+            ink_of(&cta),
+            rgb(0xffffff),
+            "the CTA's label is authored white, not a contrast guess"
+        );
+        assert_eq!(
+            cta.fill.map(|fill| fill.color),
+            Some(Color::from_rgb(0x3b5bfd))
+        );
+        assert_eq!(
+            text_size_of(&cta),
+            16.0,
+            "no authored font size, so the renderer's own default applies"
+        );
+
+        let headline = object_with_node(&view, "spool-text-headline");
+        assert_eq!(
+            ink_of(&headline),
+            rgb(0x16161d),
+            "the headline is the ink colour body authored"
+        );
+        assert_eq!(
+            text_size_of(&headline),
+            16.0,
+            "and uses the inherited font size"
+        );
+
+        // A node the source gave no paint still falls back, and says so.
+        let frame = object_with_node(&view, "spool-frame-root");
+        assert!(frame.fill.is_some(), "the editor default still paints it");
+        assert_eq!(ink_of(&frame), rgb(0x16161d), "from the inherited colour");
+    }
+
+    #[test]
+    fn a_loaded_project_renders_its_authored_text_style_and_geometry() {
+        let root = project_scratch("landing");
+        let view = project_view(&root);
+
+        let headline = object_with_node(&view, "spool-text-headline");
+        assert_eq!(
+            headline.text_content.as_deref(),
+            Some("Design in source, structure in Spool"),
+            "authored text reaches the runtime"
+        );
+        assert_eq!(
+            headline.text_color,
+            // `body { color: var(--ink) }` inherited by the headline.
+            Some(Color::from_rgb(0x16161d)),
+            "an inherited colour is still an authored colour"
+        );
+
+        let cta = object_with_node(&view, "spool-cta-primary");
+        assert_eq!(cta.text_content.as_deref(), Some("Start designing"));
+        assert_eq!(cta.text_color, Some(Color::from_rgb(0xffffff)));
+        assert_eq!(
+            cta.fill.map(|fill| fill.color),
+            Some(Color::from_rgb(0x3b5bfd))
+        );
+        // Padding from `.cta` is part of the box, not a decoration.
+        assert!(
+            cta.size.height >= 40.0,
+            "the CTA's box accounts for its padding, got {}",
+            cta.size.height
+        );
+
+        // Children flow inside their parent's content box.
+        let frame = object_with_node(&view, "spool-frame-root");
+        assert_eq!(frame.size.width, crate::visual::DEFAULT_CONTENT_WIDTH);
+        assert!(
+            headline.position.y >= frame.position.y,
+            "the headline is laid out below the frame's origin"
+        );
+        assert!(
+            cta.position.y >= headline.position.y,
+            "and the CTA follows the headline in document order"
+        );
     }
 }

@@ -51,6 +51,8 @@ fn fixture(count: usize) -> Document {
             size: size(80.0, 80.0),
             object_type: ObjectType::Rectangle,
             text_content: None,
+            text_color: None,
+            font_size: None,
             fill: default_style(ObjectType::Rectangle).fill,
             stroke: None,
         })
@@ -155,6 +157,7 @@ impl CanvasView {
                     return;
                 };
                 self.selection.replace(vec![root_id]);
+                self.drag_start_positions = self.positions_of(&[root_id]).into_iter().collect();
                 self.interaction = Interaction::PotentialMove(MoveGesture {
                     pointer_start_screen: point(0.0, 0.0),
                     pointer_start_world: point(0.0, 0.0),
@@ -192,26 +195,9 @@ impl CanvasView {
             );
         }
         if step == STEPS && kind == Workload::Project {
-            // End-to-end probe against the document that was actually opened
-            // from disk. Everything reported here is read back out of the live
-            // canvas, not from a parallel copy.
-            let objects: Vec<(String, String, u64)> = self
-                .document_objects()
-                .iter()
-                .map(|o| (o.spool_id.as_str().to_owned(), o.name.clone(), o.id.0))
-                .collect();
-            let persistent: Vec<String> = self
-                .persistent_document()
-                .structure
-                .nodes
-                .iter()
-                .map(|n| n.id.as_str().to_owned())
-                .collect();
-            let selected = self.selection().ids().to_vec();
-            eprintln!(
-                "spool_project_probe persistent_nodes={:?} runtime_objects={objects:?} selected={selected:?}",
-                persistent
-            );
+            // The whole product loop, against the project that was actually
+            // opened from disk: move, undo, redo, save, reopen.
+            self.project_loop_probe();
             self.workload_running = false;
             eprintln!("spool_workload_complete {kind:?}:{count}");
             return;
@@ -319,6 +305,119 @@ redo_ok={redid} redo_matches_commit={}",
         cx.on_next_frame(window, move |this, window, cx| {
             this.workload_frame(kind, count, frame + 1, window, cx)
         });
+    }
+
+    /// running binary actually did.
+    ///
+    /// This is deliberately the production path — [`CanvasView::save_project`] and
+    /// [`crate::project_open::open_project`] — so the probe proves the shipped
+    /// lifecycle rather than a parallel imitation of it. Every value printed is read
+    /// back out of the live canvas or off the filesystem after the write.
+    fn project_loop_probe(&mut self) {
+        let Some(root) = self.project_root.clone() else {
+            eprintln!("spool_project_probe failed=no_project_open");
+            return;
+        };
+        let dragged = self.selection().ids().to_vec();
+        let resting = std::mem::take(&mut self.drag_start_positions);
+        let depth_before = self.session.history.undo_len();
+
+        self.finish_interaction(point(STEPS as f32 * 5.0, STEPS as f32 * 3.0));
+        let depth_after = self.session.history.undo_len();
+        let committed = self.positions_of(&dragged);
+
+        let undid = self.undo_history();
+        let after_undo = self.positions_of(&dragged);
+        let redid = self.redo_history();
+        let after_redo = self.positions_of(&dragged);
+
+        let objects: Vec<(String, String, u64)> = self
+            .document_objects()
+            .iter()
+            .map(|o| (o.spool_id.as_str().to_owned(), o.name.clone(), o.id.0))
+            .collect();
+        let appearance: Vec<(String, Option<String>, Option<u32>, u32)> = self
+            .document_objects()
+            .iter()
+            .map(|o| {
+                (
+                    o.spool_id.as_str().to_owned(),
+                    o.text_content.clone(),
+                    o.fill.map(|fill| fill.color.to_rgb()),
+                    o.font_size.unwrap_or(0.0) as u32,
+                )
+            })
+            .collect();
+        let persistent: Vec<String> = self
+            .persistent_document()
+            .structure
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str().to_owned())
+            .collect();
+
+        let save = match self.save_project() {
+            Ok(outcome) => {
+                let written: Vec<String> = outcome
+                    .written
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                let unsupported: Vec<String> = outcome
+                    .unsupported
+                    .iter()
+                    .map(|edit| format!("{}:{}", edit.node.as_str(), edit.kind))
+                    .collect();
+                eprintln!("spool_save_probe written={written:?} unsupported={unsupported:?}");
+                true
+            }
+            Err(error) => {
+                eprintln!("spool_save_probe failed={error}");
+                false
+            }
+        };
+
+        // Reopen from disk through the ordinary loader, not from memory.
+        let reopened = match crate::project_open::open_project(&root) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                eprintln!("spool_reopen_probe failed={error}");
+                return;
+            }
+        };
+        let reopened_geometry: Vec<(String, f32, f32, f32, f32)> = reopened
+            .runtime
+            .objects()
+            .iter()
+            .map(|o| {
+                (
+                    o.spool_id.as_str().to_owned(),
+                    o.position.x,
+                    o.position.y,
+                    o.size.width,
+                    o.size.height,
+                )
+            })
+            .collect();
+        let reopened_text: Vec<(String, Option<String>)> = reopened
+            .runtime
+            .objects()
+            .iter()
+            .map(|o| (o.spool_id.as_str().to_owned(), o.text_content.clone()))
+            .collect();
+
+        eprintln!(
+        "spool_project_probe persistent_nodes={persistent:?} runtime_objects={objects:?}\n\
+spool_project_appearance {appearance:?}\n\
+spool_project_move_probe resting={resting:?} committed={committed:?} after_undo={after_undo:?} after_redo={after_redo:?} \
+exactly_one_history_entry={} undo_restored_start={} redo_matches_commit={} undo_ok={undid} redo_ok={redid}",
+        depth_after - depth_before == 1,
+        after_undo == resting,
+        after_redo == committed,
+    );
+        eprintln!(
+            "spool_reopen_probe geometry={reopened_geometry:?} text={reopened_text:?} saved={save}"
+        );
     }
 }
 

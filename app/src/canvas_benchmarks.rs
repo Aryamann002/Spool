@@ -31,6 +31,8 @@ fn core_workload_baseline() {
                 size: size(30.0, 30.0),
                 object_type: ObjectType::Text,
                 text_content: Some("Representative text content".repeat(4)),
+                text_color: None,
+                font_size: None,
                 fill: default_style(ObjectType::Text).fill,
                 stroke: None,
             })

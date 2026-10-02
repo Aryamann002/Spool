@@ -38,6 +38,7 @@ enum ShortcutAction {
     Redo,
     Delete,
     Duplicate,
+    Save,
     Tool(canvas::Tool),
 }
 
@@ -59,6 +60,9 @@ fn shortcut_action(
     }
     if (platform || control) && key == "d" {
         return Some(ShortcutAction::Duplicate);
+    }
+    if (platform || control) && key == "s" {
+        return Some(ShortcutAction::Save);
     }
     match key {
         "delete" | "backspace" => Some(ShortcutAction::Delete),
@@ -87,6 +91,12 @@ pub struct AppShell {
     export_open: bool,
     zoom_open: bool,
     color_picker: Option<StyleProperty>,
+    /// Result of the last save, shown over the canvas.
+    ///
+    /// Save reports what it wrote and what it could not, so the message has to
+    /// be visible: a save that silently dropped an edit would look identical to
+    /// one that persisted everything.
+    save_status: Option<(SharedString, bool)>,
 }
 
 /// Open the project named by `SPOOL_PROJECT`, if one was requested.
@@ -108,11 +118,12 @@ fn open_requested_project(view: &mut canvas::CanvasView) {
             // Reported so a launch log shows what actually opened, rather than
             // leaving the operator to infer it from pixels.
             eprintln!(
-                "spool_project_open ok root={} persistent_nodes={} runtime_objects={} unrendered={:?}",
+                "spool_project_open ok root={} persistent_nodes={} runtime_objects={} unrendered={:?} unstyled={:?}",
                 loaded.root.display(),
                 loaded.document.structure.nodes.len(),
                 loaded.runtime.objects().len(),
                 loaded.unrendered,
+                loaded.unstyled,
             );
             view.load_project(loaded);
         }
@@ -139,7 +150,38 @@ impl AppShell {
             export_open: false,
             zoom_open: false,
             color_picker: None,
+            save_status: None,
         }
+    }
+
+    /// Save the open project and report what actually happened.
+    ///
+    /// Goes through the canvas so there is exactly one save path, and says what
+    /// could not be written rather than implying everything persisted.
+    fn save_project(&mut self, cx: &mut Context<Self>) {
+        let status = match self.canvas.update(cx, |canvas, _| canvas.save_project()) {
+            Ok(outcome) if outcome.written.is_empty() && outcome.unsupported.is_empty() => {
+                "No changes to save".to_owned()
+            }
+            Ok(outcome) if !outcome.unsupported.is_empty() => {
+                let names: Vec<&str> = outcome
+                    .unsupported
+                    .iter()
+                    .map(|edit| edit.node.as_str())
+                    .collect();
+                format!(
+                    "Saved {} file(s); not saved: {}",
+                    outcome.written.len(),
+                    names.join(", ")
+                )
+            }
+            Ok(outcome) => format!("Saved {} file(s)", outcome.written.len()),
+            Err(error) => format!("Save failed: {error}"),
+        };
+        let failed = status.starts_with("Save failed");
+        eprintln!("spool_save_command {status}");
+        self.save_status = Some((status.into(), failed));
+        cx.notify();
     }
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -612,6 +654,22 @@ impl AppShell {
             .overflow_hidden()
             .bg(rgb(theme::CANVAS))
             .child(self.canvas.clone());
+
+        if let Some((message, failed)) = &self.save_status {
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(px(16.0))
+                    .bottom(px(16.0))
+                    .rounded_md()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .bg(rgb(0x1b1e24))
+                    .text_color(rgb(if *failed { 0xff8a8a } else { 0xd8dbe2 }))
+                    .text_xs()
+                    .child(message.clone()),
+            );
+        }
 
         if self.ai_open {
             content = content.child(self.agent_panel(cx));
@@ -1342,7 +1400,10 @@ impl Render for AppShell {
                             this.canvas
                                 .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
                         }
-                        Some(ShortcutAction::Delete) | Some(ShortcutAction::Tool(_)) | None => {
+                        Some(ShortcutAction::Delete)
+                        | Some(ShortcutAction::Tool(_))
+                        | Some(ShortcutAction::Save)
+                        | None => {
                             if key == "escape" {
                                 this.canvas
                                     .update(cx, |canvas, cx| canvas.cancel_text_edit(cx));
@@ -1354,6 +1415,10 @@ impl Render for AppShell {
                 match shortcut_action(key, modifiers.platform, modifiers.control, modifiers.shift) {
                     Some(ShortcutAction::Undo) => {
                         this.canvas.update(cx, |canvas, cx| canvas.undo(cx));
+                        return;
+                    }
+                    Some(ShortcutAction::Save) => {
+                        this.save_project(cx);
                         return;
                     }
                     Some(ShortcutAction::Redo) => {
@@ -1726,6 +1791,8 @@ mod style_inspector_tests {
             size: gpui::size(20.0, 20.0),
             object_type: canvas::ObjectType::Rectangle,
             text_content: None,
+            text_color: None,
+            font_size: None,
             fill: fill.map(|color| canvas::Fill {
                 color: canvas::Color::from_rgb(color),
             }),
@@ -1946,5 +2013,23 @@ mod shortcut_tests {
             Some(ShortcutAction::Tool(canvas::Tool::Text))
         );
         assert_eq!(shortcut_action("r", true, false, false), None);
+    }
+
+    #[test]
+    fn save_is_reachable_from_the_keyboard_on_both_platform_conventions() {
+        // The save half of the loop needs a real command, not only a developer
+        // workflow. Both conventions map to it so the shortcut works wherever
+        // the editor runs.
+        assert_eq!(
+            shortcut_action("s", true, false, false),
+            Some(ShortcutAction::Save)
+        );
+        assert_eq!(
+            shortcut_action("s", false, true, false),
+            Some(ShortcutAction::Save)
+        );
+        // A bare "s" is still not a command: it must keep falling through to
+        // text entry rather than silently saving.
+        assert_eq!(shortcut_action("s", false, false, false), None);
     }
 }

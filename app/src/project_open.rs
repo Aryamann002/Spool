@@ -60,9 +60,27 @@ pub struct LoadedProject {
     /// Canonical, source-backed state. This is the only durable truth.
     pub document: PersistentDocument,
     /// Derived runtime mapping from `NodeId` to `ObjectId`. Disposable.
+    ///
+    /// Read by callers that want to go the other way, from a runtime object back
+    /// to the node it came from, and by the open-path tests.
+    #[allow(dead_code)]
     pub projection: RuntimeProjection,
     /// The disposable scene the editor draws and edits. Derived.
     pub runtime: Document,
+    /// Derived text, style, and layout for each node. Disposable.
+    ///
+    /// The interpretation of the authored source, kept beside the runtime it
+    /// produced so a caller can ask "what did the source say?" instead of
+    /// inferring it from the runtime.
+    #[allow(dead_code)]
+    pub visuals: crate::visual::VisualModel,
+    /// Nodes that bound and drew, but whose paint came from the editor's
+    /// defaults because no authored CSS gave them any.
+    ///
+    /// The visible edge of CSS coverage. Reported rather than hidden, so a
+    /// project that opens with editor-default chrome is visible as such
+    /// instead of looking like the authored design.
+    pub unstyled: Vec<String>,
     /// Nodes that bound successfully but have no canvas representation yet.
     ///
     /// A node is never dropped silently: if its kind is not one the runtime can
@@ -132,14 +150,25 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    source_binding::reconcile(&document.structure, &sources).map_err(ProjectOpenError::Binding)?;
+    let reconciled = source_binding::reconcile(&document.structure, &sources)
+        .map_err(ProjectOpenError::Binding)?;
 
-    // 3. Derive runtime state. Disposable, and keyed from the reserved range so
+    // 3. Interpret the authored source into text, style, and layout. This is
+    //    derived and disposable: nothing here is written back to the project.
+    let visuals = crate::visual::build(&reconciled, &document);
+
+    // 4. Derive runtime state. Disposable, and keyed from the reserved range so
     //    it cannot collide with keys the canvas allocates later.
-    let projection = RuntimeProjection::from_document(&document, None);
+    let projection = RuntimeProjection::from_document_with_visuals(&document, None, &visuals);
     let runtime = Document::from_design_objects(projection.canvas_objects());
 
-    // 4. A project that binds but draws nothing is reported, not shown blank.
+    let unstyled: Vec<String> = visuals
+        .unstyled()
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+
+    // 5. A project that binds but draws nothing is reported, not shown blank.
     //    "Unrendered" means the node survived into the projection and the
     //    persistent document, but its kind has no canvas representation yet, so
     //    it is absent from the runtime document. Derived by comparing the two,
@@ -164,6 +193,8 @@ pub fn open_project(root: impl AsRef<Path>) -> Result<LoadedProject, ProjectOpen
         document,
         projection,
         runtime,
+        visuals,
+        unstyled,
         unrendered,
     })
 }
@@ -421,13 +452,19 @@ mod tests {
         );
 
         // Hit testing sees the projected objects, so they are really in the
-        // scene rather than merely listed.
-        let first = view.document_objects().first().expect("a projected object");
+        // scene rather than merely listed. Children are painted over their
+        // parent, so a point inside the call-to-action resolves to the CTA and
+        // not to the frame behind it.
+        let cta = view
+            .document_objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+            .expect("the CTA is projected");
         let inside = gpui::point(
-            first.position.x + first.size.width / 2.0,
-            first.position.y + first.size.height / 2.0,
+            cta.position.x + cta.size.width / 2.0,
+            cta.position.y + cta.size.height / 2.0,
         );
-        assert_eq!(view.runtime_document().hit_test(inside), Some(first.id));
+        assert_eq!(view.runtime_document().hit_test(inside), Some(cta.id));
     }
 
     #[test]

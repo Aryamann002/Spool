@@ -32,9 +32,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::source_document::{
-    HtmlSource, LamineStructure, ModelError, NodeId, PersistentDocument,
-};
+use crate::source_document::{HtmlSource, LamineStructure, ModelError, NodeId, PersistentDocument};
 
 /// The one file Spool owns inside a project directory.
 pub const METADATA_FILE: &str = "lamine.yaml";
@@ -63,7 +61,10 @@ pub enum BundleError {
     },
     /// Reading or writing failed. Metadata replacement is failure-safe, so
     /// this never leaves a partially written `lamine.yaml` behind.
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for BundleError {
@@ -153,11 +154,12 @@ impl ProjectBundle {
         let root = root.as_ref().to_path_buf();
         let metadata_path = Self::locate_metadata(&root)?;
         let metadata = read(&metadata_path)?;
-        let structure = LamineStructure::from_yaml(&metadata)
-            .map_err(|source| BundleError::MalformedMetadata {
+        let structure = LamineStructure::from_yaml(&metadata).map_err(|source| {
+            BundleError::MalformedMetadata {
                 path: metadata_path.clone(),
                 source,
-            })?;
+            }
+        })?;
 
         // Read each bound file once, in deterministic order. A reference that
         // escapes the root is rejected before any file is opened.
@@ -166,25 +168,48 @@ impl ProjectBundle {
             if authored.contains_key(&node.source.file) {
                 continue;
             }
-            let path = resolve_within_root(&root, &node.source.file)
-                .ok_or_else(|| BundleError::InvalidSourceReference {
+            let path = resolve_within_root(&root, &node.source.file).ok_or_else(|| {
+                BundleError::InvalidSourceReference {
                     file: node.source.file.clone(),
                     referenced_by: node.id.clone(),
-                })?;
+                }
+            })?;
             // A missing file is the common case and deserves its own
             // actionable variant rather than a generic IO error.
-            let contents = std::fs::read_to_string(&path)
-                .map_err(|source| {
-                    if source.kind() == std::io::ErrorKind::NotFound {
-                        BundleError::MissingSource {
-                            file: node.source.file.clone(),
-                            referenced_by: node.id.clone(),
-                        }
-                    } else {
-                        BundleError::Io { path, source }
+            let contents = std::fs::read_to_string(&path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    BundleError::MissingSource {
+                        file: node.source.file.clone(),
+                        referenced_by: node.id.clone(),
                     }
-                })?;
+                } else {
+                    BundleError::Io { path, source }
+                }
+            })?;
             authored.insert(node.source.file.clone(), contents);
+        }
+
+        // Stylesheets the HTML links are part of the authored project and are
+        // loaded alongside it. Without them the runtime cannot know how the
+        // source is meant to look, and would fall back to invented defaults.
+        // The link is followed the way a browser would: out of the HTML, into
+        // the project root, never outside it.
+        let linked: Vec<String> = authored
+            .values()
+            .flat_map(|contents| linked_stylesheets(contents))
+            .collect();
+        for href in linked {
+            if authored.contains_key(&href) {
+                continue;
+            }
+            let Some(path) = resolve_within_root(&root, &href) else {
+                // A stylesheet outside the project is not followed. It is left
+                // unstyled rather than resolved against an unexpected path.
+                continue;
+            };
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                authored.insert(href, contents);
+            }
         }
 
         // Every node must bind to exactly one authored element. Zero is a
@@ -211,6 +236,23 @@ impl ProjectBundle {
                 structure,
                 sources: authored.into_iter().collect(),
             },
+        })
+    }
+
+    /// Wrap an already-loaded document as a bundle rooted at `root`.
+    ///
+    /// Exists so metadata is written through exactly one writer. A save that
+    /// has renamed a node in the editor must persist the editor's document, not
+    /// whatever was on disk when the project was opened, and it must still go
+    /// through [`ProjectBundle::save`] so validation and the atomic replace are
+    /// not re-implemented.
+    pub fn from_document(
+        root: impl AsRef<Path>,
+        document: PersistentDocument,
+    ) -> Result<Self, BundleError> {
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            document,
         })
     }
 
@@ -248,6 +290,65 @@ impl ProjectBundle {
     }
 }
 
+/// Stylesheet paths an HTML document links, relative to that document.
+///
+/// Deliberately simple: `<link ... rel~="stylesheet" href=...>`, in document
+/// order. Fragment-only and absolute URLs are ignored.
+fn linked_stylesheets(html: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = html;
+    while let Some(at) = rest.find("<link") {
+        rest = &rest[at..];
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..end];
+        if tag.contains("stylesheet") {
+            for href in quoted_attribute(tag, "href") {
+                let href = href.trim();
+                if !href.is_empty()
+                    && !href.starts_with('#')
+                    && !href.contains("://")
+                    && !found.contains(&href.to_owned())
+                {
+                    found.push(href.to_owned());
+                }
+            }
+        }
+        rest = &rest[end..];
+    }
+    found
+}
+
+fn quoted_attribute(tag: &str, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = tag;
+    while let Some(at) = rest.find(name) {
+        rest = &rest[at + name.len()..];
+        let Some(equals) = rest.find('=') else {
+            continue;
+        };
+        let after = rest[equals + 1..].trim_start();
+        let bytes = after.as_bytes();
+        if bytes.is_empty() {
+            break;
+        }
+        let quote = bytes[0] as char;
+        if quote == '"' || quote == '\'' {
+            if let Some(end) = after[1..].find(quote) {
+                values.push(after[1..1 + end].to_owned());
+                rest = &after[end + 2..];
+                continue;
+            }
+            break;
+        }
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(after.len());
+        values.push(after[..end].to_owned());
+        rest = &after[end..];
+    }
+    values
+}
+
 /// Resolve `reference` inside `root`, rejecting anything that escapes it.
 ///
 /// Absolute paths and `..` traversal are rejected: a binding names a file in
@@ -277,7 +378,7 @@ fn read(path: &Path) -> Result<String, BundleError> {
 }
 
 /// Replace `target` with `bytes` without ever exposing a partial write.
-fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), BundleError> {
+pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), BundleError> {
     use std::io::Write;
 
     let directory = target.parent().unwrap_or_else(|| Path::new("."));
@@ -329,7 +430,9 @@ mod tests {
     /// one would let concurrent tests delete each other's files.
     fn scratch(fixture: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(fixture);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(fixture);
         let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let scratch = std::env::temp_dir().join(format!(
             "spool-bundle-{}-{unique}-{}",
@@ -385,10 +488,18 @@ mod tests {
         assert_eq!(headline.kind, "text");
         assert_eq!(headline.parent.as_ref(), Some(&root.id));
 
-        // Authored content is loaded as bytes, not reconstructed.
-        assert_eq!(bundle.document.sources.keys().collect::<Vec<_>>(), ["index.html"]);
-        assert!(bundle.document.sources["index.html"]
-            .contains("Design in source, structure in Spool"));
+        // Authored content is loaded as bytes, not reconstructed: the HTML
+        // itself, plus the stylesheet it links so the runtime can interpret
+        // how the page is meant to look.
+        // `sources` is a map, so compare the set rather than an iteration
+        // order.
+        let mut loaded = bundle.document.sources.keys().collect::<Vec<_>>();
+        loaded.sort();
+        assert_eq!(loaded, ["index.html", "styles.css"]);
+        assert!(
+            bundle.document.sources["index.html"].contains("Design in source, structure in Spool")
+        );
+        assert!(bundle.document.sources["styles.css"].contains(".cta"));
     }
 
     #[test]
@@ -413,7 +524,10 @@ mod tests {
         std::fs::remove_file(dir.join(METADATA_FILE)).unwrap();
         match ProjectBundle::load(&dir) {
             Err(BundleError::MissingMetadata { root }) => assert_eq!(root, dir),
-            other => panic!("expected MissingMetadata, got {other:?}", other = describe(other)),
+            other => panic!(
+                "expected MissingMetadata, got {other:?}",
+                other = describe(other)
+            ),
         }
         // locate_metadata is the single source of truth for the filename.
         assert!(matches!(
@@ -430,7 +544,10 @@ mod tests {
             Err(BundleError::MalformedMetadata { path, .. }) => {
                 assert_eq!(path, dir.join(METADATA_FILE));
             }
-            other => panic!("expected MalformedMetadata, got {other:?}", other = describe(other)),
+            other => panic!(
+                "expected MalformedMetadata, got {other:?}",
+                other = describe(other)
+            ),
         }
     }
 
@@ -440,11 +557,8 @@ mod tests {
         let original = std::fs::read_to_string(dir.join(METADATA_FILE)).unwrap();
 
         // Duplicate id.
-        let duplicated_id = original.replacen(
-            "id: \"spool-text-headline\"",
-            "id: \"spool-frame-root\"",
-            1,
-        );
+        let duplicated_id =
+            original.replacen("id: \"spool-text-headline\"", "id: \"spool-frame-root\"", 1);
         std::fs::write(dir.join(METADATA_FILE), &duplicated_id).unwrap();
         assert!(matches!(
             ProjectBundle::load(&dir),
@@ -475,11 +589,17 @@ mod tests {
         let dir = scratch("landing");
         std::fs::remove_file(dir.join("index.html")).unwrap();
         match ProjectBundle::load(&dir) {
-            Err(BundleError::MissingSource { file, referenced_by }) => {
+            Err(BundleError::MissingSource {
+                file,
+                referenced_by,
+            }) => {
                 assert_eq!(file, "index.html");
                 assert_eq!(referenced_by.as_str(), "spool-frame-root");
             }
-            other => panic!("expected MissingSource, got {other:?}", other = describe(other)),
+            other => panic!(
+                "expected MissingSource, got {other:?}",
+                other = describe(other)
+            ),
         }
     }
 
@@ -490,13 +610,20 @@ mod tests {
         let original = std::fs::read_to_string(&html_path).unwrap();
 
         // Dangling: the authored identity marker is gone.
-        std::fs::write(&html_path, original.replace("spool-cta-primary", "renamed-away")).unwrap();
+        std::fs::write(
+            &html_path,
+            original.replace("spool-cta-primary", "renamed-away"),
+        )
+        .unwrap();
         match ProjectBundle::load(&dir) {
             Err(BundleError::UnresolvedBinding { id, matches, .. }) => {
                 assert_eq!(id.as_str(), "spool-cta-primary");
                 assert_eq!(matches, 0);
             }
-            other => panic!("expected UnresolvedBinding, got {other:?}", other = describe(other)),
+            other => panic!(
+                "expected UnresolvedBinding, got {other:?}",
+                other = describe(other)
+            ),
         }
 
         // Ambiguous: the same identity appears twice.
@@ -506,7 +633,10 @@ mod tests {
                 assert_eq!(id.as_str(), "spool-frame-root");
                 assert_eq!(matches, 2);
             }
-            other => panic!("expected UnresolvedBinding, got {other:?}", other = describe(other)),
+            other => panic!(
+                "expected UnresolvedBinding, got {other:?}",
+                other = describe(other)
+            ),
         }
     }
 
@@ -586,7 +716,10 @@ mod tests {
         let bundle = ProjectBundle::load(&dir).expect("scratch loads");
 
         // Same document in, same bytes out, every time.
-        assert_eq!(bundle.metadata_yaml().unwrap(), bundle.metadata_yaml().unwrap());
+        assert_eq!(
+            bundle.metadata_yaml().unwrap(),
+            bundle.metadata_yaml().unwrap()
+        );
 
         // And a reload of those bytes reproduces the same document.
         let first = bundle.metadata_yaml().unwrap();
@@ -612,7 +745,10 @@ mod tests {
             std::fs::read(dir.join(METADATA_FILE)).unwrap(),
             metadata_before
         );
-        assert!(!has_temp_files(&dir), "no temporary file should be left behind");
+        assert!(
+            !has_temp_files(&dir),
+            "no temporary file should be left behind"
+        );
     }
 
     #[test]
@@ -637,7 +773,10 @@ mod tests {
             before, after,
             "metadata should be replaced by rename, not rewritten in place"
         );
-        assert!(ProjectBundle::load(&dir).is_ok(), "the swapped-in file must be valid");
+        assert!(
+            ProjectBundle::load(&dir).is_ok(),
+            "the swapped-in file must be valid"
+        );
     }
 
     #[test]
@@ -708,7 +847,9 @@ mod tests {
         // exactly the metadata it had computed before the failure.
         std::fs::remove_dir(&target).unwrap();
         std::fs::write(&target, &metadata_before).unwrap();
-        bundle.save().expect("save succeeds once the target is a file");
+        bundle
+            .save()
+            .expect("save succeeds once the target is a file");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             edited_yaml,
@@ -754,11 +895,18 @@ mod tests {
     #[test]
     fn document_sources_never_duplicate_metadata_or_unreferenced_files() {
         let bundle = ProjectBundle::load(fixture_root("landing")).expect("fixture loads");
-        // Only files a node binds to are loaded, and metadata is not among
-        // them: sources are authored bytes, not a second copy of lamine.yaml.
-        assert_eq!(bundle.document.sources.keys().collect::<Vec<_>>(), ["index.html"]);
+        // Sources are authored bytes a node binds to, plus the stylesheets
+        // that HTML links. Metadata is never among them: `lamine.yaml` is not
+        // loaded into the source map, so it cannot become a second copy of
+        // itself.
+        // `sources` is a map, so compare the set rather than an iteration
+        // order.
+        let mut loaded = bundle.document.sources.keys().collect::<Vec<_>>();
+        loaded.sort();
+        assert_eq!(loaded, ["index.html", "styles.css"]);
         assert!(!bundle.document.sources.contains_key(METADATA_FILE));
-        assert!(!bundle.document.sources.contains_key("styles.css"));
+        // And nothing that no node references and no document links.
+        assert!(!bundle.document.sources.contains_key("unrelated.css"));
     }
 
     /// Name the outcome of a load without printing a whole document.

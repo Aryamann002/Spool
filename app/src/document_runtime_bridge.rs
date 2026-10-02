@@ -74,8 +74,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gpui::{point, size};
 
-use crate::canvas::{DesignObject, ObjectId, ObjectType};
+use crate::canvas::{Color, DesignObject, Fill, ObjectId, ObjectType, Stroke};
 use crate::source_document::{NodeId, PersistentDocument};
+use crate::visual::VisualModel;
 
 /// A position and size for a projected object.
 ///
@@ -170,8 +171,18 @@ pub struct ProjectedNode {
     /// Metadata hierarchy, projected for the runtime.
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
-    /// Temporary prototype state; see [`PrototypeGeometry`].
+    /// Derived layout geometry. See [`crate::visual`] for how this is
+    /// computed; [`PrototypeGeometry`] is only the fallback when no visual
+    /// model was supplied.
     pub geometry: PrototypeGeometry,
+    /// Authored text, when the node's element carries any.
+    pub text: Option<String>,
+    /// Text colour and size resolved from the authored stylesheet.
+    pub text_color: Option<Color>,
+    pub font_size: f32,
+    /// Resolved paint. `None` on both means the renderer default still applies.
+    pub fill: Option<Fill>,
+    pub stroke: Option<Stroke>,
 }
 
 /// A disposable runtime view of a [`PersistentDocument`].
@@ -200,6 +211,21 @@ impl RuntimeProjection {
         document: &PersistentDocument,
         previous: Option<&RuntimeProjection>,
     ) -> Self {
+        Self::from_document_with_visuals(document, previous, &VisualModel::default())
+    }
+
+    /// Project a document, using authored text, style, and layout where a
+    /// visual model supplies them.
+    ///
+    /// The visual model is derived from source and disposable. A node the model
+    /// does not cover falls back to the placeholder column, so a partially
+    /// interpreted project still produces a coherent runtime rather than
+    /// silently dropping nodes.
+    pub fn from_document_with_visuals(
+        document: &PersistentDocument,
+        previous: Option<&RuntimeProjection>,
+        visuals: &VisualModel,
+    ) -> Self {
         let mut projection = RuntimeProjection::default();
 
         for (index, node) in document.structure.nodes.iter().enumerate() {
@@ -223,7 +249,20 @@ impl RuntimeProjection {
                 object_type,
                 parent: node.parent.clone(),
                 children: node.children.clone(),
-                geometry: PrototypeGeometry::placeholder(index),
+                geometry: visuals
+                    .get(&node.id)
+                    .map(|visual| PrototypeGeometry {
+                        x: visual.geometry.x,
+                        y: visual.geometry.y,
+                        width: visual.geometry.width,
+                        height: visual.geometry.height,
+                    })
+                    .unwrap_or_else(|| PrototypeGeometry::placeholder(index)),
+                text: visuals.get(&node.id).and_then(|v| v.text.clone()),
+                text_color: visuals.get(&node.id).and_then(|v| v.text_color),
+                font_size: visuals.get(&node.id).map(|v| v.font_size).unwrap_or(16.0),
+                fill: visuals.get(&node.id).and_then(|v| v.style.fill),
+                stroke: visuals.get(&node.id).and_then(|v| v.style.stroke),
             });
         }
 
@@ -234,10 +273,7 @@ impl RuntimeProjection {
         self.identities.insert(node.object_id, node.node_id.clone());
         self.bindings.insert(
             node.node_id.clone(),
-            (
-                node.node_id.as_str().to_owned(),
-                node.name.clone(),
-            ),
+            (node.node_id.as_str().to_owned(), node.name.clone()),
         );
         self.nodes.push(node);
     }
@@ -246,10 +282,7 @@ impl RuntimeProjection {
     ///
     /// Nodes that still exist keep their runtime key, so a rebuild does not
     /// invalidate a selection or a hover that refers to them.
-    pub fn rebuild(
-        document: &PersistentDocument,
-        previous: &RuntimeProjection,
-    ) -> Self {
+    pub fn rebuild(document: &PersistentDocument, previous: &RuntimeProjection) -> Self {
         Self::from_document(document, Some(previous))
     }
 
@@ -278,8 +311,11 @@ impl RuntimeProjection {
     /// than invented, so a partially-resolved document cannot fabricate nodes.
     pub fn in_hierarchy_order(&self) -> Vec<&ProjectedNode> {
         let mut ordered = Vec::with_capacity(self.nodes.len());
-        let by_id: BTreeMap<&NodeId, &ProjectedNode> =
-            self.nodes.iter().map(|node| (&node.node_id, node)).collect();
+        let by_id: BTreeMap<&NodeId, &ProjectedNode> = self
+            .nodes
+            .iter()
+            .map(|node| (&node.node_id, node))
+            .collect();
 
         let mut visited: BTreeSet<&NodeId> = BTreeSet::new();
         let mut queue: Vec<&NodeId> = self
@@ -334,24 +370,27 @@ impl RuntimeProjection {
                     position: point(node.geometry.x, node.geometry.y),
                     size: size(node.geometry.width, node.geometry.height),
                     object_type,
-                    // Text content is authored in the HTML, not in metadata,
-                    // and this phase does not read it. Left empty rather than
-                    // invented.
-                    text_content: None,
-                    fill: None,
-                    stroke: None,
+                    // Authored text and resolved paint come from source, not
+                    // from metadata. A node the visual model did not cover
+                    // keeps `None`, which the renderer treats as "unstyled"
+                    // rather than inventing a value.
+                    text_content: node.text.clone(),
+                    text_color: node.text_color,
+                    font_size: (node.font_size > 0.0).then_some(node.font_size),
+                    fill: node.fill,
+                    stroke: node.stroke,
                 })
             })
             .collect()
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source_document::{EditorRuntimeState, LamineStructure, SourceBinding, StructuralNode};
+    use crate::source_document::{
+        EditorRuntimeState, LamineStructure, SourceBinding, StructuralNode,
+    };
 
     fn node(
         id: &str,
@@ -382,8 +421,20 @@ mod tests {
             structure: LamineStructure {
                 nodes: vec![
                     node("spool-root", "Root", "frame", None, &["spool-child"]),
-                    node("spool-child", "Child", "text", Some("spool-root"), &["spool-grandchild"]),
-                    node("spool-grandchild", "Grandchild", "frame", Some("spool-child"), &[]),
+                    node(
+                        "spool-child",
+                        "Child",
+                        "text",
+                        Some("spool-root"),
+                        &["spool-grandchild"],
+                    ),
+                    node(
+                        "spool-grandchild",
+                        "Grandchild",
+                        "frame",
+                        Some("spool-child"),
+                        &[],
+                    ),
                 ],
             },
             sources: Default::default(),
@@ -401,7 +452,11 @@ mod tests {
         let projection = RuntimeProjection::from_document(&document(), None);
 
         assert_eq!(projection.nodes.len(), 3);
-        let root = projection.nodes.iter().find(|n| n.node_id == id("spool-root")).expect("root");
+        let root = projection
+            .nodes
+            .iter()
+            .find(|n| n.node_id == id("spool-root"))
+            .expect("root");
         assert_eq!(root.name, "Root");
         assert_eq!(root.object_type, RuntimeObjectType::Frame);
         assert_eq!(root.parent, None);
@@ -439,7 +494,10 @@ mod tests {
         assert_eq!(objects[0].name, "Root");
 
         // The reverse lookup resolves a runtime key back to durable identity.
-        assert_eq!(projection.object_of(objects[1].id), Some(&id("spool-child")));
+        assert_eq!(
+            projection.object_of(objects[1].id),
+            Some(&id("spool-child"))
+        );
         assert_eq!(projection.object_of(ObjectId(999)), None);
     }
 
@@ -478,15 +536,28 @@ mod tests {
         // an allocator starting at an arbitrary number.
         let projection = RuntimeProjection::from_document(&document(), None);
         assert_eq!(projection.nodes[0].node_id, id("spool-root"));
-        assert_eq!(projection.nodes[0].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE));
-        assert_eq!(projection.nodes[1].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE + 1));
-        assert_eq!(projection.nodes[2].object_id, ObjectId(PROJECTED_OBJECT_ID_BASE + 2));
+        assert_eq!(
+            projection.nodes[0].object_id,
+            ObjectId(PROJECTED_OBJECT_ID_BASE)
+        );
+        assert_eq!(
+            projection.nodes[1].object_id,
+            ObjectId(PROJECTED_OBJECT_ID_BASE + 1)
+        );
+        assert_eq!(
+            projection.nodes[2].object_id,
+            ObjectId(PROJECTED_OBJECT_ID_BASE + 2)
+        );
 
         // Two independently built projections must agree on those keys.
         let other = RuntimeProjection::from_document(&document(), None);
         assert_eq!(
             other.nodes.iter().map(|n| n.object_id).collect::<Vec<_>>(),
-            projection.nodes.iter().map(|n| n.object_id).collect::<Vec<_>>()
+            projection
+                .nodes
+                .iter()
+                .map(|n| n.object_id)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -568,7 +639,10 @@ mod tests {
             Some(survivor_key),
             "surviving nodes keep their runtime key"
         );
-        assert!(!after.canvas_objects().iter().any(|o| o.spool_id == id("spool-grandchild")));
+        assert!(!after
+            .canvas_objects()
+            .iter()
+            .any(|o| o.spool_id == id("spool-grandchild")));
     }
 
     #[test]
@@ -585,7 +659,12 @@ mod tests {
 
         let after = RuntimeProjection::rebuild(&reparented, &before);
         assert_eq!(
-            after.nodes.iter().find(|n| n.node_id == id("spool-grandchild")).unwrap().parent,
+            after
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id("spool-grandchild"))
+                .unwrap()
+                .parent,
             Some(id("spool-root"))
         );
         // Identity is untouched by a structural change.
@@ -615,9 +694,18 @@ mod tests {
         // require any editor session state.
         let _ = &runtime;
         let serialized = format!("{projection:?}");
-        assert!(!serialized.contains("selection"), "selection leaked into projection");
-        assert!(!serialized.contains("camera"), "camera leaked into projection");
-        assert!(!serialized.contains("active_tool"), "tool leaked into projection");
+        assert!(
+            !serialized.contains("selection"),
+            "selection leaked into projection"
+        );
+        assert!(
+            !serialized.contains("camera"),
+            "camera leaked into projection"
+        );
+        assert!(
+            !serialized.contains("active_tool"),
+            "tool leaked into projection"
+        );
 
         // The projection carries no editor session state at all.
         assert!(projection.nodes.iter().all(|node| {
@@ -651,7 +739,10 @@ mod tests {
         runtime.selection.push(id("spool-grandchild"));
 
         let after = RuntimeProjection::from_document(&document(), None);
-        assert_eq!(before, after, "runtime session state must not affect projection");
+        assert_eq!(
+            before, after,
+            "runtime session state must not affect projection"
+        );
     }
 
     // -- Prototype geometry stays prototype.
@@ -671,9 +762,18 @@ mod tests {
         );
         // There is no geometry anywhere in persistent state.
         let serialized = format!("{:?}", document);
-        assert!(!serialized.contains("position"), "no position in persistent state");
-        assert!(!serialized.contains("width"), "no width in persistent state");
-        assert!(!serialized.contains("height"), "no height in persistent state");
+        assert!(
+            !serialized.contains("position"),
+            "no position in persistent state"
+        );
+        assert!(
+            !serialized.contains("width"),
+            "no width in persistent state"
+        );
+        assert!(
+            !serialized.contains("height"),
+            "no height in persistent state"
+        );
     }
 
     #[test]
@@ -734,17 +834,20 @@ mod tests {
             let mut document = self::document();
             for i in 0..8 {
                 let nid = id(&format!("spool-extra-{i}"));
-                document.structure.nodes.push(crate::source_document::StructuralNode {
-                    id: nid.clone(),
-                    name: format!("Extra {i}"),
-                    kind: "frame".into(),
-                    parent: None,
-                    children: vec![],
-                    source: crate::source_document::SourceBinding {
-                        file: "index.html".into(),
-                        selector: format!("[data-spool-id=\"{}\"]", nid.as_str()),
-                    },
-                });
+                document
+                    .structure
+                    .nodes
+                    .push(crate::source_document::StructuralNode {
+                        id: nid.clone(),
+                        name: format!("Extra {i}"),
+                        kind: "frame".into(),
+                        parent: None,
+                        children: vec![],
+                        source: crate::source_document::SourceBinding {
+                            file: "index.html".into(),
+                            selector: format!("[data-spool-id=\"{}\"]", nid.as_str()),
+                        },
+                    });
             }
             document
         };
