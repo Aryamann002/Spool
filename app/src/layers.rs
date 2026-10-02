@@ -25,6 +25,26 @@ struct LayerRow {
     element_id: SharedString,
 }
 
+/// What a click on a layer row does.
+///
+/// The convention, unchanged from the canvas: a click replaces the selection,
+/// `⇧`-click adds or removes one row, and a double click opens a rename rather
+/// than selecting — every product in the corpus treats the second click as "I
+/// want to edit this name", not as "select it twice".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowAction {
+    Select { additive: bool },
+    Rename,
+}
+
+fn row_action(click_count: usize, shift: bool) -> RowAction {
+    if click_count >= 2 {
+        RowAction::Rename
+    } else {
+        RowAction::Select { additive: shift }
+    }
+}
+
 /// A selection-presentation change for one row: `(row id, now selected)`.
 type PresentationChange = (ObjectId, bool);
 
@@ -143,6 +163,19 @@ fn tree_height(rows: usize) -> f32 {
 pub struct LayersView {
     canvas: WeakEntity<CanvasView>,
     projection: LayersProjection,
+    /// A row the user asked to rename, waiting to be picked up by the shell.
+    ///
+    /// The rename itself is a text buffer, a caret and a history boundary, all
+    /// of which the shell already owns for the Inspector. Rather than teach the
+    /// panel a second editing model, the panel states the request and the shell
+    /// opens its existing one — the same command, the same `SemanticOperation`,
+    /// the same Escape behaviour, from either surface.
+    rename_request: Option<ObjectId>,
+    /// The row whose name is currently being edited, if any.
+    ///
+    /// Presentation only: the buffer and the commit live in the shell, so this
+    /// is just the row that should show that it is open for renaming.
+    renaming: Option<ObjectId>,
 }
 
 impl LayersView {
@@ -150,7 +183,25 @@ impl LayersView {
         Self {
             canvas,
             projection: LayersProjection::default(),
+            rename_request: None,
+            renaming: None,
         }
+    }
+
+    /// Show which row is being renamed, or clear it.
+    pub fn set_renaming(&mut self, id: Option<ObjectId>) {
+        if self.renaming != id {
+            self.renaming = id;
+        }
+    }
+
+    /// Take the pending rename request, if a row asked for one.
+    pub fn take_rename_request(&mut self) -> Option<ObjectId> {
+        self.rename_request.take()
+    }
+
+    fn request_rename(&mut self, id: ObjectId) {
+        self.rename_request = Some(id);
     }
 
     /// Returns the synchronization outcome: `structure_changed` drives the
@@ -188,6 +239,7 @@ impl Render for LayersView {
             diagnostics::count("layers_row_construction", 1);
             let id = row.id;
             let selected = row.selected;
+            let renaming = (self.renaming == Some(id)).then(|| SharedString::from("…"));
             let icon = match row.object_type {
                 ObjectType::Frame => "▱",
                 ObjectType::Rectangle => "□",
@@ -216,13 +268,24 @@ impl Render for LayersView {
                     } else {
                         theme::TEXT_SECONDARY
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let _ = this.canvas.update(cx, |canvas, cx| {
-                            canvas.select_object(id, false, cx);
-                        });
+                    // The same selection model as the canvas, reached from a
+                    // different surface. Anything else here would be a second
+                    // selection store with its own idea of what is selected.
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        match row_action(event.click_count(), event.modifiers().shift) {
+                            RowAction::Rename => {
+                                this.request_rename(id);
+                                cx.notify();
+                            }
+                            RowAction::Select { additive } => {
+                                let _ = this.canvas.update(cx, |canvas, cx| {
+                                    canvas.select_object(id, additive, cx);
+                                });
+                            }
+                        }
                     }))
                     .child(icon)
-                    .child(row.name.clone()),
+                    .child(renaming.clone().unwrap_or_else(|| row.name.clone())),
             );
         }
         diagnostics::record("layers_tree_build", start);
@@ -279,6 +342,18 @@ pub(super) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_click_replaces_the_selection_shifted_click_toggles_and_a_double_click_renames() {
+        assert_eq!(row_action(1, false), RowAction::Select { additive: false });
+        assert_eq!(row_action(1, true), RowAction::Select { additive: true });
+        assert_eq!(row_action(2, false), RowAction::Rename);
+        assert_eq!(
+            row_action(3, true),
+            RowAction::Rename,
+            "a third click is still a rename, not a selection with a modifier"
+        );
+    }
 
     fn starter_rows() -> Vec<LayerRow> {
         [

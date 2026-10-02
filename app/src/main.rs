@@ -6,10 +6,11 @@ mod operations;
 pub mod project_bundle;
 mod project_open;
 mod project_save;
-pub mod source_binding;
 mod shell;
-mod style;
+mod snap;
+pub mod source_binding;
 pub mod source_document;
+mod style;
 mod theme;
 mod visual;
 

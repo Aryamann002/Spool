@@ -1,4 +1,6 @@
-use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, SharedString, Subscription, Window};
+use gpui::{
+    div, point, prelude::*, px, rgb, Context, Entity, Render, SharedString, Subscription, Window,
+};
 
 use crate::{canvas, layers::LayersView, project_open, theme};
 
@@ -80,13 +82,116 @@ fn shortcut_action(
     }
 }
 
+/// How many collapsible sections the Inspector has.
+///
+/// A fixed array rather than a map, so a section index can be baked into the
+/// click closure that toggles it.
+const INSPECTOR_SECTIONS: usize = 5;
+
+/// Slot for each collapsible section, in render order.
+///
+/// Named rather than written as a literal at each call site: the index is what
+/// `collapsed_sections[index]` reads and writes, and an out-of-range one is an
+/// index panic in a render, where nothing can catch it.
+const SECTION_POSITION: usize = 0;
+const SECTION_LAYOUT: usize = 1;
+const SECTION_APPEARANCE: usize = 2;
+const SECTION_TYPOGRAPHY: usize = 3;
+const SECTION_EFFECTS: usize = 4;
+
+/// A layer name being edited.
+///
+/// Not a second text model: the buffer is shell state exactly as it was before,
+/// and the name only becomes real when Enter hands it to the canvas as one
+/// semantic operation. `select_all` is the whole of the rename convention —
+/// every product in the corpus opens a name with the existing text selected, so
+/// the first keystroke replaces it rather than appending to it.
+struct RenameSession {
+    id: canvas::ObjectId,
+    buffer: String,
+    select_all: bool,
+}
+
+/// What a key did to an open rename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenameEffect {
+    /// The buffer changed; the rename is still open.
+    Continue,
+    /// The rename closed and this name should be committed, if it is not empty.
+    Commit(String),
+    /// The rename closed and nothing should reach the document.
+    Abandon,
+}
+
+impl RenameSession {
+    fn replacing(id: canvas::ObjectId, buffer: String) -> Self {
+        Self {
+            id,
+            buffer,
+            select_all: true,
+        }
+    }
+
+    /// Apply one keystroke to the open rename.
+    ///
+    /// The whole rename grammar in one pure function, because it is a *grammar*
+    /// and a grammar is the thing most worth pinning down: Enter commits, Escape
+    /// abandons without touching the document, the first printable key replaces
+    /// the selected text rather than appending to it, and a modifier combination
+    /// is a shortcut rather than a character.
+    fn apply_key(&mut self, key: &str) -> RenameEffect {
+        match key {
+            "enter" | "return" => {
+                let name = self.buffer.clone();
+                self.close();
+                RenameEffect::Commit(name)
+            }
+            "escape" => {
+                self.close();
+                RenameEffect::Abandon
+            }
+            "backspace" => {
+                // With the name selected, Backspace deletes the selection —
+                // the same rule typing follows. Treating it as "delete one
+                // character" here would leave the user staring at the rest of
+                // the old name after the key they expected to clear it.
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                } else {
+                    self.buffer.pop();
+                }
+                RenameEffect::Continue
+            }
+            other if other.chars().count() == 1 => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                }
+                self.buffer.push_str(other);
+                RenameEffect::Continue
+            }
+            // A modifier combination is an editor shortcut, not a character. It
+            // is swallowed so it cannot leak into the name.
+            _ => RenameEffect::Continue,
+        }
+    }
+
+    fn close(&mut self) {
+        self.buffer.clear();
+        self.select_all = false;
+    }
+}
+
 pub struct AppShell {
     canvas: Entity<canvas::CanvasView>,
     layers: Entity<LayersView>,
     selected_tool: canvas::Tool,
     selected_page: usize,
     inspector_tab: usize,
-    collapsed_sections: [bool; 4],
+    /// One flag per collapsible Inspector section, in section order:
+    /// position, layout, appearance, typography, effects.
+    collapsed_sections: [bool; INSPECTOR_SECTIONS],
     ai_open: bool,
     share_open: bool,
     export_open: bool,
@@ -117,7 +222,7 @@ pub struct AppShell {
     ///
     /// A buffer, not a second name store: the name only becomes real when the
     /// rename is handed to the canvas as one semantic operation.
-    rename: Option<(canvas::ObjectId, String)>,
+    rename: Option<RenameSession>,
 }
 
 /// One editable number in the Inspector's geometry fields.
@@ -231,7 +336,7 @@ impl AppShell {
             selected_tool: canvas::Tool::Select,
             selected_page: 0,
             inspector_tab: 0,
-            collapsed_sections: [false; 4],
+            collapsed_sections: [false; INSPECTOR_SECTIONS],
             ai_open: false,
             share_open: false,
             export_open: false,
@@ -266,31 +371,117 @@ impl AppShell {
     /// shortcuts stay out of the way: typing `f` into a name must not also
     /// switch to the frame tool.
     fn rename_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        let Some((id, buffer)) = self.rename.as_mut() else {
+        let Some(session) = self.rename.as_mut() else {
             return false;
         };
-        let id = *id;
-        let committed = match key {
-            "enter" | "return" => Some(buffer.clone()),
-            "escape" => Some(String::new()),
-            "backspace" => {
-                buffer.pop();
-                None
-            }
-            // Modifier combinations are shortcuts, not characters.
-            other if other.chars().count() == 1 => {
-                buffer.push_str(other);
-                None
-            }
-            _ => return true,
-        };
+        let id = session.id;
+        let effect = session.apply_key(key);
+        if effect == RenameEffect::Continue {
+            cx.notify();
+            return true;
+        }
         self.rename = None;
-        if let Some(name) = committed {
+        if let RenameEffect::Commit(name) = effect {
             let name = name.trim().to_owned();
             if !name.is_empty() {
                 self.edit_canvas(cx, |canvas, _| canvas.rename_object(id, name));
             }
         }
+        cx.notify();
+        true
+    }
+
+    /// Escape, as one ladder walked from the top.
+    ///
+    /// The research is unambiguous that Escape means "leave the most recent
+    /// thing you entered" — Figma calls it a chart traversal, tldraw the same.
+    /// Spool's handler used to do four unrelated jobs in one block, and what it
+    /// cancelled depended on which listener saw the key first. This is the one
+    /// place that decides, in the order every product in the corpus implies:
+    ///
+    /// 1. an open panel (a modal is above everything)
+    /// 2. an in-progress rename (a text buffer the user opened)
+    /// 3. an in-flight drag, whether it came from the canvas or the Inspector
+    /// 4. an open text session
+    /// 5. the selection
+    /// 6. a non-Select tool, which returns to Select
+    ///
+    /// Returns whether anything was cancelled, so the caller knows the key was
+    /// consumed.
+    fn escape_topmost(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ai_open || self.share_open || self.export_open || self.zoom_open {
+            self.ai_open = false;
+            self.share_open = false;
+            self.export_open = false;
+            self.zoom_open = false;
+            cx.notify();
+            return true;
+        }
+        if self.rename.is_some() {
+            // An abandoned rename leaves the document exactly as it was: the
+            // buffer never became an operation.
+            self.rename = None;
+            cx.notify();
+            return true;
+        }
+        if let Some(scrub) = self.geometry_scrub.take() {
+            self.edit_canvas(cx, |canvas, _| canvas.cancel_geometry_scrub(scrub.gesture));
+            cx.notify();
+            return true;
+        }
+        let cancelled_gesture = self
+            .canvas
+            .update(cx, |canvas, cx| canvas.cancel_manipulation(cx));
+        if cancelled_gesture {
+            return true;
+        }
+        if self.canvas.read(cx).is_text_editing() {
+            self.canvas
+                .update(cx, |canvas, cx| canvas.cancel_text_edit(cx));
+            return true;
+        }
+        let had_selection = !self.canvas.read(cx).selection().is_empty();
+        if had_selection {
+            self.canvas
+                .update(cx, |canvas, cx| canvas.clear_selection(cx));
+            return true;
+        }
+        if self.selected_tool != canvas::Tool::Select {
+            self.selected_tool = canvas::Tool::Select;
+            self.canvas
+                .update(cx, |canvas, _| canvas.set_tool(canvas::Tool::Select));
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    /// Arrow keys: nudge a selection, otherwise pan the canvas.
+    ///
+    /// Figma's rule, recorded in `navigation.md`: with nothing selected the
+    /// arrow keys pan, and with a selection they nudge it by 1px, or 10px with
+    /// `⇧`. Both are one semantic operation, so one arrow press is one undo
+    /// step — which is what makes holding an arrow key feel cheap to undo.
+    fn canvas_arrow_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        let (dx, dy) = match key {
+            "left" => (-1.0, 0.0),
+            "right" => (1.0, 0.0),
+            "up" => (0.0, -1.0),
+            "down" => (0.0, 1.0),
+            _ => return false,
+        };
+        let step = if shift { 10.0 } else { 1.0 };
+        let moved = self.edit_canvas(cx, |canvas, _| canvas.nudge_selection(dx * step, dy * step));
+        if moved {
+            return true;
+        }
+        // Nothing selected: the same keys move the view instead. A bigger jump,
+        // because panning is navigation rather than an edit and does not need
+        // the fine granularity a nudge does.
+        let pan_step = if shift { 400.0 } else { 40.0 };
+        self.canvas.update(cx, |canvas, _| {
+            canvas.pan_by(point(dx * pan_step, dy * pan_step))
+        });
         cx.notify();
         true
     }
@@ -1286,7 +1477,21 @@ impl AppShell {
         }
         fields
             .child(width_row)
-            .child(self.style_value_fields(selected, cx))
+            .child(Self::value_presets(
+                "Radius",
+                common_number(selected, |object| object.border_radius).map(format_width),
+                ["0", "4", "8", "16"],
+                cx,
+                |text| canvas::StyleEdit::BorderRadius(text.parse().unwrap_or(0.0)),
+            ))
+            .child(Self::value_presets(
+                "Opacity",
+                common_number(selected, |object| object.opacity)
+                    .map(|value| format!("{:.0}%", value * 100.0)),
+                ["25", "50", "75", "100"],
+                cx,
+                |text| canvas::StyleEdit::Opacity(text.parse::<f32>().unwrap_or(1.0) / 100.0),
+            ))
     }
 
     /// The object's name, or the rename buffer while one is open.
@@ -1303,8 +1508,8 @@ impl AppShell {
         let renaming = self
             .rename
             .as_ref()
-            .filter(|(id, _)| *id == object.id)
-            .map(|(_, buffer)| buffer.clone());
+            .filter(|session| session.id == object.id)
+            .map(|session| session.buffer.clone());
         let name = div()
             .text_sm()
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -1326,32 +1531,27 @@ impl AppShell {
                 if stateful {
                     return;
                 }
-                this.rename = Some((id, String::new()));
+                this.rename = Some(RenameSession::replacing(id, String::new()));
                 cx.notify();
             }))
             .child(name)
     }
 
-    /// The second half of the Appearance section: the properties this milestone
-    /// can express in CSS.
+    /// The Typography section.
     ///
-    /// Four controls, each mapped to one `StyleEdit` and one supported CSS
-    /// property. Nothing here invents a value the style model cannot write back,
-    /// because a control that cannot be saved is worse than a missing one.
-    fn style_value_fields(
+    /// Only shown for a selection that actually has text, and only for
+    /// properties the style model can write back. An object with no text has no
+    /// font size, so showing one would be an invitation to author a value that
+    /// nothing on the canvas will ever use.
+    fn typography_fields(
         &self,
         selected: &[canvas::DesignObject],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let text_color = common_text_color(selected);
         let font_size = common_font_size(selected);
-        let radius = common_number(selected, |object| object.border_radius);
-        let opacity = common_number(selected, |object| object.opacity);
-
         let mut fields = div().flex().flex_col().gap_3().px(px(14.0)).py(px(12.0));
 
-        // Text colour: the same palette as fill and stroke, because it is the
-        // same model — one colour, one semantic operation, one CSS property.
         let text_label = match text_color {
             Some(Some(color)) => color_hex(color),
             Some(None) => "None".to_owned(),
@@ -1370,7 +1570,7 @@ impl AppShell {
                         .flex_1()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_SECONDARY))
-                        .child("Text colour"),
+                        .child("Colour"),
                 )
                 .child(
                     div()
@@ -1384,6 +1584,7 @@ impl AppShell {
                         .bg(rgb(theme::WINDOW))
                         .border_1()
                         .border_color(rgb(theme::BORDER_SOFT))
+                        .hover(|style| style.bg(rgb(theme::SURFACE_RAISED)))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.color_picker =
                                 if this.color_picker == Some(StyleProperty::TextColor) {
@@ -1406,29 +1607,13 @@ impl AppShell {
             fields = fields.child(self.style_palette(StyleProperty::TextColor, cx));
         }
 
-        fields = fields
-            .child(Self::value_presets(
-                "Size",
-                font_size.map(format_width),
-                ["12", "16", "24", "32"],
-                cx,
-                |text| canvas::StyleEdit::FontSize(text.parse().unwrap_or(16.0)),
-            ))
-            .child(Self::value_presets(
-                "Radius",
-                radius.map(format_width),
-                ["0", "4", "8", "16"],
-                cx,
-                |text| canvas::StyleEdit::BorderRadius(text.parse().unwrap_or(0.0)),
-            ))
-            .child(Self::value_presets(
-                "Opacity",
-                opacity.map(|value| format!("{:.0}%", value * 100.0)),
-                ["25", "50", "75", "100"],
-                cx,
-                |text| canvas::StyleEdit::Opacity(text.parse::<f32>().unwrap_or(1.0) / 100.0),
-            ));
-        fields
+        fields.child(Self::value_presets(
+            "Size",
+            font_size.map(format_width),
+            ["12", "16", "24", "32"],
+            cx,
+            |text| canvas::StyleEdit::FontSize(text.parse().unwrap_or(16.0)),
+        ))
     }
 
     fn style_palette(&self, property: StyleProperty, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1515,42 +1700,52 @@ impl AppShell {
                         .child("Select an object on the canvas or in Layers."),
                 )
                 .into_any_element(),
-            [_, _, ..] => div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .p(px(16.0))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(theme::TEXT))
-                                .child(format!("{} objects selected", selected.len())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .child("Style changes apply to the entire selection."),
-                        ),
-                )
-                .child(self.inspector_section(
-                    "Position and size",
-                    0,
-                    Self::position_fields_mixed(&selected),
-                    cx,
-                ))
-                .child(self.inspector_section(
-                    "Appearance",
-                    2,
-                    self.appearance_fields(&selected, cx),
-                    cx,
-                ))
-                .into_any_element(),
+            [_, _, ..] => {
+                let mut inspector = div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p(px(16.0))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(format!("{} objects selected", selected.len())),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child("Style changes apply to the entire selection."),
+                            ),
+                    )
+                    .child(self.inspector_section(
+                        "Position and size",
+                        SECTION_POSITION,
+                        Self::position_fields_mixed(&selected),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Appearance",
+                        SECTION_APPEARANCE,
+                        self.appearance_fields(&selected, cx),
+                        cx,
+                    ));
+                if selected.iter().any(|object| object.text_content.is_some()) {
+                    inspector = inspector.child(self.inspector_section(
+                        "Typography",
+                        SECTION_TYPOGRAPHY,
+                        self.typography_fields(&selected, cx),
+                        cx,
+                    ));
+                }
+                inspector.into_any_element()
+            }
             [object] => {
                 let kind = object.object_type.label();
                 let mut inspector = div()
@@ -1587,23 +1782,42 @@ impl AppShell {
                     )
                     .child(self.inspector_section(
                         "Position and size",
-                        0,
+                        SECTION_POSITION,
                         self.position_fields(object, cx),
                         cx,
                     ))
-                    .child(self.inspector_section("Layout", 1, layout_fields(), cx))
+                    .child(self.inspector_section("Layout", SECTION_LAYOUT, layout_fields(), cx))
                     .child(self.inspector_section(
                         "Appearance",
-                        2,
+                        SECTION_APPEARANCE,
                         self.appearance_fields(&selected, cx),
                         cx,
                     ));
+                // Typography appears only when the object has text, and the
+                // content field travels with it. Figma groups them for the same
+                // reason: a font size with nothing to set is a control that
+                // cannot mean anything.
                 if let Some(text) = object.text_content.as_deref() {
-                    inspector = inspector.child(text_content_section(text));
+                    inspector = inspector.child(self.inspector_section(
+                        "Typography",
+                        SECTION_TYPOGRAPHY,
+                        typography_section(
+                            text_content_section(text),
+                            self.typography_fields(&selected, cx),
+                        ),
+                        cx,
+                    ));
+                } else {
+                    inspector =
+                        inspector.child(simple_section("Typography", "This layer has no text"));
                 }
                 inspector
-                    .child(simple_section("Effects", "Add effect"))
-                    .child(simple_section("Typography", "2 text styles"))
+                    .child(self.inspector_section(
+                        "Effects",
+                        SECTION_EFFECTS,
+                        effect_placeholder(),
+                        cx,
+                    ))
                     .child(simple_section("Export", "Add export setting"))
                     .into_any_element()
             }
@@ -1625,6 +1839,13 @@ impl AppShell {
         fields: impl IntoElement,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // A section index is a slot in a fixed array, so a caller's index is
+        // bounded before it is used rather than trusted: a render cannot
+        // afford an out-of-bounds panic. The title always comes from the
+        // caller, because the index decides *which* section collapses, not what
+        // it is called — deriving the name from the slot is how a section ends
+        // up labelled "Effects" while showing font sizes.
+        let index = index.min(INSPECTOR_SECTIONS - 1);
         let collapsed = self.collapsed_sections[index];
         let mut section = div()
             .flex()
@@ -1954,12 +2175,32 @@ impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::diagnostics::count("shell_render", 1);
         let render_start = crate::diagnostics::start();
+        // The Layers panel owns no editing state: it says which row the user
+        // double-clicked, and the shell opens the rename it already has. One
+        // rename model means one history boundary no matter which surface
+        // started it.
+        let requested = self
+            .layers
+            .update(cx, |layers, _| layers.take_rename_request());
+        if let Some(id) = requested {
+            let name = self
+                .canvas
+                .read(cx)
+                .document_objects()
+                .iter()
+                .find(|object| object.id == id)
+                .map(|object| object.name.clone())
+                .unwrap_or_default();
+            self.rename = Some(RenameSession::replacing(id, name));
+        }
+        let renaming_row = self.rename.as_ref().map(|session| session.id);
         self.layers.update(cx, |layers, cx| {
             // Structure changes and selection changes both notify the Layers
             // view so its subtree rebuilds. Selection changes are first
             // reduced to an O(changed rows) presentation diff (counted as
             // `row_presentation_updates`); applying the diff requires the
             // subtree rebuild described in the Phase 15 report.
+            layers.set_renaming(renaming_row);
             let outcome = layers.synchronize(self.canvas.read(cx));
             if outcome.structure_changed || !outcome.presentation.is_empty() {
                 cx.notify();
@@ -1999,20 +2240,14 @@ impl Render for AppShell {
                 {
                     return;
                 }
-                if this.geometry_key(key, modifiers.shift, cx) {
+                // Escape is one ladder, always walked from the top, so that what
+                // it cancels never depends on which listener happened to see the
+                // key first. See `escape_topmost`.
+                if key == "escape" && this.escape_topmost(cx) {
                     return;
                 }
-                // Escape abandons an in-progress Inspector drag, exactly as it
-                // abandons a canvas one: the object goes back where it started
-                // and nothing is recorded.
-                if key == "escape" {
-                    if let Some(scrub) = this.geometry_scrub.take() {
-                        this.edit_canvas(cx, |canvas, _| {
-                            canvas.cancel_geometry_scrub(scrub.gesture)
-                        });
-                        cx.notify();
-                        return;
-                    }
+                if this.geometry_key(key, modifiers.shift, cx) {
+                    return;
                 }
                 if this.canvas.read(cx).is_text_editing() {
                     match shortcut_action(
@@ -2074,31 +2309,32 @@ impl Render for AppShell {
                     }
                     None => {}
                 }
+                // Arrow keys: nudge a selection, or pan when there is none.
+                // Reached here rather than in `shortcut_action` because these
+                // are not shortcuts but two different jobs chosen by whether
+                // anything is selected — a rule a keymap cannot express.
+                if this.canvas_arrow_key(key, modifiers.shift, cx) {
+                    return;
+                }
                 let tool = match key {
-                    "escape" => {
-                        let had_overlay =
-                            this.ai_open || this.share_open || this.export_open || this.zoom_open;
-                        let had_selection = !this.canvas.read(cx).selection().is_empty();
-                        let cancelled_manipulation = this
-                            .canvas
-                            .update(cx, |canvas, cx| canvas.cancel_manipulation(cx));
-                        this.ai_open = false;
-                        this.share_open = false;
-                        this.export_open = false;
-                        this.zoom_open = false;
-                        if !cancelled_manipulation {
-                            this.canvas
-                                .update(cx, |canvas, cx| canvas.clear_selection(cx));
-                        }
-                        if had_overlay || had_selection || cancelled_manipulation {
-                            cx.notify();
-                        }
-                        None
-                    }
-                    "1" if event.keystroke.modifiers.shift => {
+                    // Figma: `⇧1` fits the document, `⇧2` frames the
+                    // selection, `⇧0` returns to actual size.
+                    "1" if modifiers.shift => {
                         this.canvas.update(cx, |canvas, _| canvas.fit_canvas());
                         cx.notify();
-                        None
+                        return;
+                    }
+                    "2" if modifiers.shift => {
+                        this.canvas
+                            .update(cx, |canvas, _| canvas.zoom_to_selection());
+                        cx.notify();
+                        return;
+                    }
+                    "0" if modifiers.shift => {
+                        this.canvas
+                            .update(cx, |canvas, _| canvas.zoom_to_actual_size());
+                        cx.notify();
+                        return;
                     }
                     "space" | " " => {
                         this.canvas
@@ -2411,6 +2647,101 @@ mod style_inspector_tests {
     }
 
     #[test]
+    fn every_inspector_section_has_its_own_slot_in_range() {
+        // The section index is read and written by a closure baked at render
+        // time, so an out-of-range one is an index panic inside a render where
+        // nothing can catch it. Asserting the slots here means adding a section
+        // is a compile-and-test question, not a launch-and-crash one.
+        let slots = [
+            SECTION_POSITION,
+            SECTION_LAYOUT,
+            SECTION_APPEARANCE,
+            SECTION_TYPOGRAPHY,
+            SECTION_EFFECTS,
+        ];
+        for (index, slot) in slots.iter().enumerate() {
+            assert!(
+                *slot < INSPECTOR_SECTIONS,
+                "section {index} is out of range"
+            );
+        }
+        for (index, slot) in slots.iter().enumerate() {
+            assert!(
+                !slots[..index].contains(slot),
+                "section {index} shares a slot, so collapsing one collapses another"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_opens_with_the_old_name_selected_so_the_first_key_replaces_it() {
+        // The convention, and the whole difference between "rename" and
+        // "append to the old name": the existing text arrives selected.
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        assert_eq!(session.apply_key("H"), RenameEffect::Continue);
+        assert_eq!(session.buffer, "H", "the old name is replaced, not kept");
+        for key in ["e", "a", "d"] {
+            assert_eq!(session.apply_key(key), RenameEffect::Continue);
+        }
+        assert_eq!(session.buffer, "Head");
+        assert_eq!(
+            session.apply_key("enter"),
+            RenameEffect::Commit("Head".into())
+        );
+    }
+
+    #[test]
+    fn typing_after_the_first_character_appends() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("H");
+        session.apply_key("i");
+        assert_eq!(session.buffer, "Hi", "only the first key replaced");
+    }
+
+    #[test]
+    fn escape_abandons_a_rename_without_committing_anything() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("X");
+        assert_eq!(session.buffer, "X");
+        assert_eq!(
+            session.apply_key("escape"),
+            RenameEffect::Abandon,
+            "nothing reaches the document, so the name is untouched"
+        );
+        assert!(session.buffer.is_empty(), "and the buffer is gone");
+    }
+
+    #[test]
+    fn enter_commits_even_an_empty_name_because_trimming_is_the_callers_job() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("backspace");
+        assert_eq!(
+            session.apply_key("enter"),
+            RenameEffect::Commit(String::new()),
+            "the caller decides an empty name is not a rename"
+        );
+    }
+
+    #[test]
+    fn a_modifier_combination_is_swallowed_rather_than_typed_into_the_name() {
+        // Typing `f` must not also switch to the frame tool, and `cmd-d` must not
+        // land in a layer name as the letters "cmd-d".
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, String::new());
+        for key in ["cmd-d", "cmd-shift-z", "left", "tab"] {
+            assert_eq!(session.apply_key(key), RenameEffect::Continue);
+        }
+        assert_eq!(session.buffer, "", "no shortcut leaked into the name");
+    }
+
+    #[test]
+    fn backspace_edits_the_buffer_and_leaves_the_rename_open() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("X");
+        assert_eq!(session.apply_key("backspace"), RenameEffect::Continue);
+        assert_eq!(session.buffer, "");
+    }
+
+    #[test]
     fn inspector_reports_mixed_fill_stroke_and_width_states() {
         let selected = [
             object(Some(theme::PAPER), Some((theme::INK, 1.0))),
@@ -2469,6 +2800,26 @@ fn text_content_section(content: &str) -> impl IntoElement {
                 .text_color(rgb(theme::TEXT))
                 .child(content.to_string()),
         )
+}
+
+/// Content above the controls, the way Figma's right panel stacks a property
+/// field above its own row.
+fn typography_section(content: impl IntoElement, fields: impl IntoElement) -> impl IntoElement {
+    div().flex().flex_col().child(content).child(fields)
+}
+
+/// The Effects section, which has no controls yet.
+///
+/// Rendered through the same section machinery as the rest so it collapses and
+/// expands like its neighbours instead of sitting there as a different kind of
+/// row.
+fn effect_placeholder() -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .px(px(14.0))
+        .py(px(12.0))
+        .child("No effects yet.")
 }
 
 fn simple_section(title: &'static str, value: &'static str) -> impl IntoElement {

@@ -143,14 +143,13 @@ source = source.replace(old2, new2, 1)' \
 # 8. An existing style attribute is duplicated instead of replaced.
 run_mutation "existing style attribute is duplicated" \
   src/project_save.rs \
-  'old = """                Some(range) => replacements.push((
-                    absolute + range.start..absolute + range.end,
-                    merged,
-                )),"""
-new = """                Some(_range) => replacements.push((
-                    absolute + open_end..absolute + open_end,
-                    format!(" style=\\"{declarations}\\""),
-                )),"""
+  'old = """                Some(range) => {
+                    replacements.push((absolute + range.start..absolute + range.end, merged))
+                }"""
+new = """                Some(_range) => {
+                    let insert_at = absolute + open_end;
+                    replacements.push((insert_at..insert_at, format!(" style=\\"{merged}\\"")));
+                }"""
 assert old in source, "style attribute replace pattern not found"
 source = source.replace(old, new, 1)' \
   "a_geometry_edit_survives_the_round_trip"
@@ -286,11 +285,15 @@ source = source.replace(old, new, 1)' \
   "a_second_move_adds_to_the_offset_the_author_wrote"
 
 # 19. An unreadable transform is overwritten instead of reported.
+# 19. A rotation is not an offset, so it must be reported rather than rewritten.
 run_mutation "a rotation is overwritten by a translate" \
-  src/project_save.rs \
-  'old = """                        Some(authored) => crate::style::parse_translate(&authored).ok_or_else("""
-new = """                        Some(authored) => {\n                            crate::style::parse_translate(&authored).unwrap_or((0.0, 0.0))\n                        }"""
-assert old in source, "transform refusal pattern not found"
+  src/style.rs \
+  'old = """pub fn parse_translate(value: &str) -> Option<(f32, f32)> {"""
+new = """pub fn parse_translate(value: &str) -> Option<(f32, f32)> {
+    if value.contains("rotate") {
+        return Some((0.0, 0.0));
+    }"""
+assert old in source, "parse_translate signature not found"
 source = source.replace(old, new, 1)' \
   "a_transform_the_editor_cannot_read_is_reported_rather_than_overwritten"
 

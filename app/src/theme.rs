@@ -10,6 +10,9 @@ pub const TEXT_SECONDARY: u32 = 0xa2a6aa;
 pub const TEXT_MUTED: u32 = 0x70767d;
 pub const ACCENT: u32 = 0x9da9ff;
 pub const ACCENT_WASH: u32 = 0x292d43;
+/// Alignment guides. Figma's magenta, and for the same reason: no document
+/// content is this colour, so a guide never reads as part of the artwork.
+pub const SNAP_GUIDE: u32 = 0xff4d8d;
 
 pub const PAPER: u32 = 0xe9e6de;
 pub const INK: u32 = 0x222522;

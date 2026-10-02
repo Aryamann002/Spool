@@ -28,6 +28,7 @@ gpui::actions!(
 use crate::{
     diagnostics,
     operations::{EditSession, OperationError, SemanticOperation},
+    snap,
     source_document::{NodeId, PersistentDocument},
     theme,
 };
@@ -47,6 +48,8 @@ const WORLD_CENTER: Point<f32> = point(382.0, 344.0);
 const LABEL_HEIGHT: f32 = 24.0;
 const MIN_OBJECT_SIZE: f32 = 20.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+/// Screen pixels left around content on each side when fitting the viewport.
+const FIT_MARGIN: f32 = 48.0;
 const RESIZE_HANDLE_SIZE: f32 = 8.0;
 const RESIZE_HANDLE_HIT_RADIUS: f32 = 7.0;
 
@@ -78,6 +81,14 @@ pub struct Camera {
     zoom: f32,
     viewport: Size<f32>,
     initialized: bool,
+    /// The bounds of the most recent fit request, waiting for a viewport.
+    ///
+    /// A project is loaded before the first frame, so "frame my content" is
+    /// asked while the camera still has a zero-sized viewport. Answering then
+    /// means dividing by zero and clamping to the minimum zoom — which is how
+    /// opening a project used to leave the user staring at a 10%-zoom speck.
+    /// The request is kept and applied the moment a real viewport arrives.
+    pending_fit: Option<WorldRect>,
 }
 
 impl Default for Camera {
@@ -87,6 +98,7 @@ impl Default for Camera {
             zoom: 1.0,
             viewport: size(0.0, 0.0),
             initialized: false,
+            pending_fit: None,
         }
     }
 }
@@ -121,6 +133,9 @@ impl Camera {
             self.initialized = true;
         }
         self.viewport = viewport;
+        if let Some(bounds) = self.pending_fit.take() {
+            self.apply_fit(bounds);
+        }
         true
     }
 
@@ -133,6 +148,11 @@ impl Camera {
         );
     }
 
+    /// Set an absolute zoom, keeping `screen` pinned to the same world point.
+    fn set_zoom_at(&mut self, zoom: f32, screen: Point<f32>) {
+        self.zoom_at(zoom / self.zoom, screen);
+    }
+
     fn set_zoom_at_center(&mut self, zoom: f32) {
         self.zoom_at(
             zoom / self.zoom,
@@ -140,18 +160,52 @@ impl Camera {
         );
     }
 
-    fn fit(&mut self) {
+    /// Fit a world-space box into the viewport.
+    ///
+    /// This is the camera's only fit rule, and it takes the box as an argument
+    /// rather than reading a constant. The previous version fitted a hard-coded
+    /// `WORLD_BOUNDS`, which was an accidental bound: every product in the
+    /// research corpus is either explicitly infinite (Figma, tldraw) or
+    /// explicitly bounded (Canva), and a fixed 764x688 is neither — it made
+    /// zoom-to-fit mean "show me the prototype's placeholder artboard" instead
+    /// of "show me what is in this document".
+    fn fit_bounds(&mut self, bounds: WorldRect) {
+        self.pending_fit = Some(bounds);
+        if self.initialized {
+            self.apply_fit(bounds);
+            self.pending_fit = None;
+        }
+    }
+
+    fn apply_fit(&mut self, bounds: WorldRect) {
         let available = size(
-            (self.viewport.width - 96.0).max(1.0),
-            (self.viewport.height - 96.0).max(1.0),
+            (self.viewport.width - FIT_MARGIN * 2.0).max(1.0),
+            (self.viewport.height - FIT_MARGIN * 2.0).max(1.0),
         );
-        self.zoom = (available.width / WORLD_BOUNDS.width)
-            .min(available.height / WORLD_BOUNDS.height)
+        self.zoom = (available.width / bounds.width().max(1.0))
+            .min(available.height / bounds.height().max(1.0))
+            // No cap at 100%: fitting a small frame does magnify it, in Figma
+            // and in tldraw, because "fit" means fit. `⇧0` is the key for
+            // actual size. The floor only stops content becoming a speck.
             .clamp(MIN_ZOOM, MAX_ZOOM);
         self.offset = point(
-            WORLD_CENTER.x - self.viewport.width / (2.0 * self.zoom),
-            WORLD_CENTER.y - self.viewport.height / (2.0 * self.zoom),
+            bounds.center().x - self.viewport.width / (2.0 * self.zoom),
+            bounds.center().y - self.viewport.height / (2.0 * self.zoom),
         );
+    }
+
+    /// Fit the placeholder starter scene, for a document with no real content.
+    fn fit(&mut self) {
+        self.fit_bounds(WorldRect {
+            min: point(
+                WORLD_CENTER.x - WORLD_BOUNDS.width / 2.0,
+                WORLD_CENTER.y - WORLD_BOUNDS.height / 2.0,
+            ),
+            max: point(
+                WORLD_CENTER.x + WORLD_BOUNDS.width / 2.0,
+                WORLD_CENTER.y + WORLD_BOUNDS.height / 2.0,
+            ),
+        });
     }
 
     fn pan_from(
@@ -1147,6 +1201,57 @@ struct WorldRect {
 }
 
 impl WorldRect {
+    fn from_object(object: &DesignObject) -> Self {
+        Self {
+            min: object.position,
+            max: point(
+                object.position.x + object.size.width,
+                object.position.y + object.size.height,
+            ),
+        }
+    }
+
+    /// The smallest box containing every object, if there is at least one.
+    ///
+    /// `None` for an empty document, because "fit nothing" has no honest
+    /// answer: the caller falls back to the placeholder scene rather than
+    /// inventing a box around the origin.
+    fn around(objects: &[DesignObject]) -> Option<Self> {
+        let mut bounds: Option<Self> = None;
+        for object in objects {
+            let object_bounds = Self::from_object(object);
+            bounds = Some(match bounds {
+                Some(current) => Self {
+                    min: point(
+                        current.min.x.min(object_bounds.min.x),
+                        current.min.y.min(object_bounds.min.y),
+                    ),
+                    max: point(
+                        current.max.x.max(object_bounds.max.x),
+                        current.max.y.max(object_bounds.max.y),
+                    ),
+                },
+                None => object_bounds,
+            });
+        }
+        bounds
+    }
+
+    fn width(self) -> f32 {
+        self.max.x - self.min.x
+    }
+
+    fn height(self) -> f32 {
+        self.max.y - self.min.y
+    }
+
+    fn center(self) -> Point<f32> {
+        point(
+            (self.min.x + self.max.x) / 2.0,
+            (self.min.y + self.max.y) / 2.0,
+        )
+    }
+
     fn from_points(start: Point<f32>, end: Point<f32>) -> Self {
         Self {
             min: point(start.x.min(end.x), start.y.min(end.y)),
@@ -1239,6 +1344,14 @@ struct MoveGesture {
     objects: Vec<ObjectSnapshot>,
     selected_ids: Vec<ObjectId>,
     click_selection: ClickSelection,
+    /// `⌘`/`Ctrl` held at press time: place this object freely, ignoring
+    /// alignment for the whole gesture.
+    ///
+    /// Read once, when the gesture starts, rather than sampled per pointer
+    /// movement. Figma's `⌘`-drag is one continuous "not this time", and a
+    /// magnet that switches off halfway through a drag is the single most
+    /// disorienting thing a snapping implementation can do.
+    suspend_snap: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1370,6 +1483,21 @@ fn creation_geometry(start: Point<f32>, current: Point<f32>) -> Geometry {
     }
 }
 
+/// Does this gesture ignore alignment for its whole duration?
+///
+/// `⌘` on macOS, `Ctrl` everywhere else — the same key that means "precise" to
+/// every product in the corpus. Read once when the gesture starts rather than
+/// sampled per movement: a magnet that switches off halfway through a drag is
+/// the most disorienting thing a snapping implementation can do, and the user
+/// who wants to place something freely says so before they press.
+///
+/// Split out from the gesture literal so the rule can be tested without a
+/// window. It is one boolean and one `||`, but it is a *convention*, and
+/// conventions are exactly the things that rot silently.
+fn suspends_snap(modifiers: gpui::Modifiers) -> bool {
+    modifiers.platform || modifiers.control
+}
+
 fn drag_threshold_crossed(start: Point<f32>, current: Point<f32>) -> bool {
     let dx = current.x - start.x;
     let dy = current.y - start.y;
@@ -1400,11 +1528,40 @@ fn resized_geometry(
     start: ObjectGeometry,
     handle: ResizeHandle,
     delta: Point<f32>,
+    proportional: bool,
 ) -> ObjectGeometry {
     let left = start.position.x;
     let top = start.position.y;
     let right = left + start.size.width;
     let bottom = top + start.size.height;
+
+    // `⇧` preserves the aspect ratio. The pointer's dominant axis decides the
+    // scale, which is the same rule the move uses for its dominant axis — one
+    // gesture grammar for both, rather than `⇧` meaning something different
+    // depending on which handle the pointer happened to grab.
+    let delta = if proportional {
+        // The pointer picks one axis; that axis's *resulting size* is what the
+        // user asked for, and the other axis follows by scale. Scaling the drag
+        // vector itself instead would compound the error, because the vector is
+        // what already moved the box.
+        let width = start.size.width.max(f32::EPSILON);
+        let height = start.size.height.max(f32::EPSILON);
+        let (driven, other) = if delta.x.abs() >= delta.y.abs() {
+            (width, height)
+        } else {
+            (height, width)
+        };
+        let requested = driven
+            + if delta.x.abs() >= delta.y.abs() {
+                delta.x
+            } else {
+                delta.y
+            };
+        let scale = (requested / driven).max(MIN_OBJECT_SIZE / other.max(f32::EPSILON));
+        point((width * scale) - width, (height * scale) - height)
+    } else {
+        delta
+    };
 
     let new_left = if handle.moves_left() {
         (left + delta.x).min(right - MIN_OBJECT_SIZE)
@@ -1438,9 +1595,10 @@ fn apply_resize(
     gesture: &ResizeGesture,
     camera: Camera,
     screen: Point<f32>,
+    proportional: bool,
 ) {
     let delta = movement_delta(camera, gesture.pointer_start_world, screen);
-    let geometry = resized_geometry(gesture.object.geometry, gesture.handle, delta);
+    let geometry = resized_geometry(gesture.object.geometry, gesture.handle, delta, proportional);
     document.set_geometry(gesture.object.id, geometry);
 }
 
@@ -1559,6 +1717,26 @@ pub struct CanvasView {
     /// disk for a session in which the user did nothing, which is exactly the
     /// behaviour source-preserving save exists to prevent.
     source_snapshot: BTreeMap<NodeId, SourceSnapshot>,
+    /// `⇧` is held, so this movement is constrained to one axis.
+    ///
+    /// Sampled per pointer movement rather than at press time, which is the
+    /// opposite of the snap suspension on purpose: a user presses `⇧` halfway
+    /// through a drag to straighten it, and expects it to take effect there and
+    /// then. It is reset the moment the gesture ends.
+    constrain_drag: bool,
+    /// The object under the pointer, when the pointer is over one.
+    ///
+    /// Runtime only, like everything else about hover: not in the document, not
+    /// in history, not restored by undo. Cleared whenever the pointer stops
+    /// being over an object, so a stale outline can never outlive the cursor.
+    hovered: Option<ObjectId>,
+    /// Alignment lines currently holding, one per axis at most.
+    ///
+    /// Pure runtime feedback: they are not in the document, not in history, and
+    /// they are cleared the moment nothing is moving. A snap the user cannot
+    /// see is the same as an object that jumped for no reason, so the guide is
+    /// part of the interaction, not a decoration added afterwards.
+    snap_guides: Vec<snap::Guide>,
     /// Debug-only: true pre-gesture positions for the runtime history probe.
     #[cfg(debug_assertions)]
     drag_start_positions: Vec<(f32, f32)>,
@@ -1663,6 +1841,9 @@ impl CanvasView {
             project_root: None,
             source_snapshot: BTreeMap::new(),
             #[cfg(debug_assertions)]
+            constrain_drag: false,
+            hovered: None,
+            snap_guides: Vec::new(),
             drag_start_positions: Vec::new(),
         }
     }
@@ -2230,6 +2411,7 @@ impl CanvasView {
         self.tool = tool;
         self.interaction = Interaction::None;
         self.marquee = None;
+        self.clear_gesture_feedback();
     }
 
     /// Undo the last committed semantic operation.
@@ -2533,8 +2715,268 @@ impl CanvasView {
         self.camera.set_zoom_at_center(zoom_percent as f32 / 100.0);
     }
 
-    pub fn fit_canvas(&mut self) {
-        self.camera.fit();
+    /// Nudge every selected object by a world-space delta, as one operation.
+    ///
+    /// Arrow keys, `⇧` for ten times the distance. One press is one history
+    /// entry, which is what makes holding an arrow key cheap to undo: the user
+    /// presses it four times and presses undo once, not the other way round.
+    ///
+    /// Deliberately *not* snapped. An arrow key states a position; it does not
+    /// ask where the object should be. More concretely, snapping is a magnet
+    /// within eight screen pixels, so a nudge of an object that happens to
+    /// share a neighbour's edge would be pulled straight back and the key
+    /// press would do nothing at all. Every product in the corpus treats the
+    /// arrow keys as a direct set for exactly that reason.
+    pub fn nudge_selection(&mut self, dx: f32, dy: f32) -> bool {
+        self.commit_text_edit();
+        let ids = self.selection.ids().to_vec();
+        let mut changes = Vec::new();
+        for id in &ids {
+            if let Some(before) = self.session.runtime.geometry(*id) {
+                changes.push((*id, before));
+            }
+        }
+        if changes.is_empty() {
+            return false;
+        }
+        let recorded: Vec<GeometryChange> = changes
+            .iter()
+            .filter_map(|(id, before)| {
+                let after = Geometry {
+                    position: point(before.position.x + dx, before.position.y + dy),
+                    size: before.size,
+                };
+                (after != *before).then_some(GeometryChange {
+                    id: *id,
+                    before: *before,
+                    after,
+                })
+            })
+            .collect();
+        if recorded.is_empty() {
+            return false;
+        }
+        for change in &recorded {
+            self.session.runtime.set_geometry(change.id, change.after);
+        }
+        self.commit(DocumentCommand::geometry(recorded));
+        true
+    }
+
+    /// Move a gesture's objects to where the pointer is, snapping unless the
+    /// gesture suspended it.
+    ///
+    /// The one place a drag's geometry is computed. Updating and releasing both
+    /// come through here, which is what makes the object land in the same place
+    /// whether the user lets go mid-drag or drops it on the final pixel — a
+    /// release that re-derives its own position is how objects used to jump by
+    /// a snap width on mouse-up.
+    fn drag_gesture_objects(&mut self, gesture: &MoveGesture, screen: Point<f32>) {
+        let raw = movement_delta(self.camera, gesture.pointer_start_world, screen);
+        let raw = if self.constrain_drag {
+            // `⇧` constrains a move to one axis, on whichever the pointer has
+            // travelled furthest. Figma, tldraw and Affinity all resolve the
+            // same way, and the rule is not "horizontal or vertical" but "the
+            // one you clearly meant" — so it is the dominant component that
+            // survives, not a fixed preference.
+            if raw.x.abs() >= raw.y.abs() {
+                point(raw.x, 0.0)
+            } else {
+                point(0.0, raw.y)
+            }
+        } else {
+            raw
+        };
+        let (dx, dy) = if gesture.suspend_snap {
+            self.snap_guides.clear();
+            (raw.x, raw.y)
+        } else {
+            // The bounds come from the gesture's own snapshots, never from the
+            // live geometry. Reading live geometry would make every pointer
+            // movement after the first add the whole drag again on top of the
+            // position the previous movement already produced — so the object
+            // would accelerate away from the pointer, and the snap would be
+            // measured from a place the user never dragged it to.
+            let bounds = snap::bounds_of(
+                &gesture
+                    .objects
+                    .iter()
+                    .map(|object| {
+                        snap::Rect::new(
+                            object.geometry.position.x,
+                            object.geometry.position.y,
+                            object.geometry.size.width,
+                            object.geometry.size.height,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            match bounds {
+                Some(bounds) => {
+                    let ids: Vec<ObjectId> = gesture.objects.iter().map(|o| o.id).collect();
+                    let (delta, _) = self.snap_delta(bounds, &ids, (raw.x, raw.y));
+                    (delta.0, delta.1)
+                }
+                None => (raw.x, raw.y),
+            }
+        };
+        apply_move(&mut self.session.runtime, &gesture.objects, point(dx, dy));
+    }
+
+    /// Snap a proposed world-space translation of `moving` against everything
+    /// else on the canvas, and remember the guides that explain the result.
+    ///
+    /// The whole selection is one rectangle: a multi-selection moves as a unit
+    /// and snaps as a unit, because snapping each object independently makes a
+    /// group fly apart. `suspended` is the `⌘`/`Ctrl` override, which every
+    /// product in the corpus documents as "place it freely this once".
+    fn snap_delta(
+        &mut self,
+        bounds: snap::Rect,
+        moving: &[ObjectId],
+        delta: (f32, f32),
+    ) -> ((f32, f32), Vec<snap::Guide>) {
+        if moving.is_empty() {
+            self.snap_guides.clear();
+            return (delta, Vec::new());
+        }
+        let targets = self.snap_targets(moving);
+        let snapped = snap::snap_translation(bounds, delta, &targets, self.camera.zoom);
+        self.snap_guides = snapped.guides.clone();
+        (snapped.delta, snapped.guides)
+    }
+
+    /// Every rectangle a moving selection may snap to.
+    ///
+    /// An object is never a target for itself, and neither is anything inside
+    /// it: a child's edges move with the parent, so aligning to them would
+    /// fight the move instead of explaining it.
+    fn snap_targets(&self, moving: &[ObjectId]) -> Vec<snap::Rect> {
+        let moving_nodes: Vec<&NodeId> = moving
+            .iter()
+            .filter_map(|id| self.session.runtime.object(*id))
+            .map(|object| &object.spool_id)
+            .collect();
+        self.snap_rects_all()
+            .into_iter()
+            .filter(|(_rect, node)| {
+                !moving_nodes
+                    .iter()
+                    .any(|candidate| self.is_within(node, candidate))
+            })
+            .map(|(rect, _)| rect)
+            .collect()
+    }
+
+    /// Every drawn object as a rectangle plus the document node it came from.
+    fn snap_rects_all(&self) -> Vec<(snap::Rect, &NodeId)> {
+        self.session
+            .runtime
+            .objects()
+            .iter()
+            .map(|object| {
+                (
+                    snap::Rect::new(
+                        object.position.x,
+                        object.position.y,
+                        object.size.width,
+                        object.size.height,
+                    ),
+                    &object.spool_id,
+                )
+            })
+            .collect()
+    }
+
+    /// Is `node` inside `ancestor`, at any depth?
+    fn is_within(&self, node: &NodeId, ancestor: &NodeId) -> bool {
+        let mut cursor = Some(node.clone());
+        while let Some(current) = cursor {
+            if &current == ancestor {
+                return true;
+            }
+            cursor = self
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == current)
+                .and_then(|candidate| candidate.parent.clone());
+        }
+        false
+    }
+
+    /// The alignment lines currently holding, for the renderer.
+    pub fn snap_guides(&self) -> &[snap::Guide] {
+        &self.snap_guides
+    }
+
+    /// Frame whatever is in the document, or the placeholder scene when the
+    /// document is empty.
+    ///
+    /// This is what `⇧1` means in every product in the corpus, and it is what a
+    /// user means by "zoom to fit": show me my document. It is also what
+    /// `load_project` calls, so opening a project frames the project.
+    pub fn fit_canvas(&mut self) -> bool {
+        match WorldRect::around(self.session.runtime.objects()) {
+            Some(bounds) => self.camera.fit_bounds(bounds),
+            None => self.camera.fit(),
+        }
+        true
+    }
+
+    /// Frame the current selection — `⇧2` in Figma.
+    ///
+    /// Falls back to fitting everything when nothing is selected, because
+    /// zooming to nothing has no meaning and silently doing nothing is worse.
+    pub fn zoom_to_selection(&mut self) -> bool {
+        let selected: Vec<DesignObject> = self
+            .selection
+            .ids()
+            .iter()
+            .filter_map(|id| self.session.runtime.object(*id).cloned())
+            .collect();
+        let Some(bounds) = WorldRect::around(&selected) else {
+            return self.fit_canvas();
+        };
+        self.camera.fit_bounds(bounds);
+        true
+    }
+
+    /// Zoom to 100% — `⇧0` in Figma, `⌘0` in Canva.
+    ///
+    /// Anchored on the selection when there is one, because that is the thing
+    /// the user is looking at; otherwise on the viewport centre.
+    pub fn zoom_to_actual_size(&mut self) -> bool {
+        let anchor = self.selection_bounds_screen();
+        match anchor {
+            Some(screen) => self.camera.set_zoom_at(1.0, screen),
+            None => self.camera.set_zoom_at_center(1.0),
+        }
+        true
+    }
+
+    /// Where on screen the selection's centre is, if anything is selected.
+    fn selection_bounds_screen(&self) -> Option<Point<f32>> {
+        let selected: Vec<DesignObject> = self
+            .selection
+            .ids()
+            .iter()
+            .filter_map(|id| self.session.runtime.object(*id).cloned())
+            .collect();
+        let center = WorldRect::around(&selected)?.center();
+        Some(self.camera.world_to_screen(center))
+    }
+
+    /// Pan by a screen-space delta, for wheel scrolling.
+    ///
+    /// Exposed so the wheel path and the space/middle-drag path share one
+    /// camera rule instead of two.
+    pub fn pan_by(&mut self, screen_delta: Point<f32>) -> bool {
+        self.camera.offset.x -= screen_delta.x / self.camera.zoom;
+        self.camera.offset.y -= screen_delta.y / self.camera.zoom;
+        true
     }
 
     pub fn set_space_held(&mut self, held: bool) {
@@ -2740,6 +3182,7 @@ impl CanvasView {
                 } else {
                     ClickSelection::SelectOnly(id)
                 },
+                suspend_snap: suspends_snap(event.modifiers),
             });
             self.capture_pointer(window);
             return;
@@ -2767,6 +3210,41 @@ impl CanvasView {
         }
     }
 
+    /// Track what the pointer is over, and say whether the picture changed.
+    ///
+    /// Returns false when the hover did not change so the caller can skip a
+    /// repaint: a pointer moving over empty canvas, or over the same object,
+    /// costs nothing.
+    ///
+    /// Nothing that is being dragged is hoverable, and neither is a text
+    /// editor — an outline flashing on and off as the caret moves would be
+    /// noise, not feedback.
+    fn update_hover(&mut self, screen: Point<f32>) -> bool {
+        let hovered = if self.tool == Tool::Select
+            && !self.interaction.is_active()
+            && self.pan.is_none()
+            && self.marquee.is_none()
+            && self.text_edit.is_none()
+            && self.hit_test_resize_handle(screen).is_none()
+        {
+            self.session
+                .runtime
+                .hit_test(self.camera.screen_to_world(screen))
+        } else {
+            None
+        };
+        if hovered == self.hovered {
+            return false;
+        }
+        self.hovered = hovered;
+        true
+    }
+
+    /// What the pointer is currently over, for the status bar.
+    pub fn hovered(&self) -> Option<ObjectId> {
+        self.hovered
+    }
+
     fn hit_test_resize_handle(&self, screen: Point<f32>) -> Option<ResizeHandle> {
         if self.selection.ids().len() != 1 {
             return None;
@@ -2780,6 +3258,16 @@ impl CanvasView {
     }
 
     fn update_interaction(&mut self, screen: Point<f32>) -> bool {
+        self.update_interaction_with(screen, false)
+    }
+
+    /// Advance a gesture, with `⇧` state supplied by the caller.
+    ///
+    /// `update_interaction` is the modifier-free form the tests drive; the
+    /// pointer path passes the real key state so `⇧`-constrain can be sampled
+    /// live.
+    fn update_interaction_with(&mut self, screen: Point<f32>, constrain: bool) -> bool {
+        self.constrain_drag = constrain;
         let interaction = std::mem::replace(&mut self.interaction, Interaction::None);
         match interaction {
             Interaction::None => false,
@@ -2789,20 +3277,12 @@ impl CanvasView {
                     return false;
                 }
                 self.selection.replace(gesture.selected_ids.clone());
-                apply_move(
-                    &mut self.session.runtime,
-                    &gesture.objects,
-                    movement_delta(self.camera, gesture.pointer_start_world, screen),
-                );
+                self.drag_gesture_objects(&gesture, screen);
                 self.interaction = Interaction::Moving(gesture);
                 true
             }
             Interaction::Moving(gesture) => {
-                apply_move(
-                    &mut self.session.runtime,
-                    &gesture.objects,
-                    movement_delta(self.camera, gesture.pointer_start_world, screen),
-                );
+                self.drag_gesture_objects(&gesture, screen);
                 self.interaction = Interaction::Moving(gesture);
                 true
             }
@@ -2811,12 +3291,24 @@ impl CanvasView {
                     self.interaction = Interaction::PotentialResize(gesture);
                     return false;
                 }
-                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
+                apply_resize(
+                    &mut self.session.runtime,
+                    &gesture,
+                    self.camera,
+                    screen,
+                    self.constrain_drag,
+                );
                 self.interaction = Interaction::Resizing(gesture);
                 true
             }
             Interaction::Resizing(gesture) => {
-                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
+                apply_resize(
+                    &mut self.session.runtime,
+                    &gesture,
+                    self.camera,
+                    screen,
+                    self.constrain_drag,
+                );
                 self.interaction = Interaction::Resizing(gesture);
                 true
             }
@@ -2837,6 +3329,19 @@ impl CanvasView {
         }
     }
 
+    /// Drop every piece of feedback that only exists during a gesture.
+    ///
+    /// Guides and hover are runtime state with no document meaning, so the one
+    /// thing they all need is a single place that ends them. Clearing them at
+    /// each call site instead is how a guide ends up outliving the drag that
+    /// drew it — a magenta line across the artwork that nothing will remove
+    /// until the next gesture happens to overwrite it.
+    fn clear_gesture_feedback(&mut self) {
+        self.snap_guides.clear();
+        self.hovered = None;
+        self.constrain_drag = false;
+    }
+
     fn finish_interaction(&mut self, screen: Point<f32>) {
         let interaction = std::mem::replace(&mut self.interaction, Interaction::None);
         match interaction {
@@ -2845,17 +3350,19 @@ impl CanvasView {
                 ClickSelection::Toggle(id) => self.selection.click(Some(id), true),
             },
             Interaction::Moving(gesture) => {
-                apply_move(
-                    &mut self.session.runtime,
-                    &gesture.objects,
-                    movement_delta(self.camera, gesture.pointer_start_world, screen),
-                );
+                self.drag_gesture_objects(&gesture, screen);
                 let command = geometry_command(&self.session.runtime, &gesture.objects);
                 self.commit(command);
             }
             Interaction::PotentialResize(_) => {}
             Interaction::Resizing(gesture) => {
-                apply_resize(&mut self.session.runtime, &gesture, self.camera, screen);
+                apply_resize(
+                    &mut self.session.runtime,
+                    &gesture,
+                    self.camera,
+                    screen,
+                    self.constrain_drag,
+                );
                 let command =
                     geometry_command(&self.session.runtime, std::slice::from_ref(&gesture.object));
                 self.commit(command);
@@ -2880,6 +3387,7 @@ impl CanvasView {
             }
             Interaction::None => {}
         }
+        self.clear_gesture_feedback();
     }
 
     fn commit_creation(
@@ -2973,6 +3481,7 @@ impl CanvasView {
         }
         self.interaction.restore(&mut self.session.runtime);
         self.interaction = Interaction::None;
+        self.clear_gesture_feedback();
         true
     }
 
@@ -3120,13 +3629,26 @@ impl Render for CanvasView {
                 if this.workload_controls_input() {
                     return;
                 }
-                if !event.modifiers.control && !event.modifiers.platform {
-                    return;
-                }
-                let delta = f32::from(event.delta.pixel_delta(gpui_px(24.0)).y);
-                let factor = (delta * 0.002).exp();
                 let cursor = this.cursor_in_viewport(event.position);
-                this.camera.zoom_at(factor, cursor);
+                // Figma: the wheel scrolls the canvas, `⇧`+wheel scrolls
+                // sideways, and `⌘`/`Ctrl`+wheel (or a trackpad pinch) zooms.
+                // Spool accepted the wheel only as a zoom gesture, which left a
+                // trackpad user with no way to pan at all.
+                if event.modifiers.control || event.modifiers.platform {
+                    let delta = f32::from(event.delta.pixel_delta(gpui_px(24.0)).y);
+                    this.camera.zoom_at((delta * 0.002).exp(), cursor);
+                } else {
+                    let line = gpui_px(24.0);
+                    let delta = event.delta.pixel_delta(line);
+                    let mut screen_delta = point(f32::from(delta.x), f32::from(delta.y));
+                    if event.modifiers.shift {
+                        // `⇧` turns a vertical scroll into a horizontal one,
+                        // which is what every editor does because a trackpad
+                        // only scrolls vertically by default.
+                        std::mem::swap(&mut screen_delta.x, &mut screen_delta.y);
+                    }
+                    this.pan_by(screen_delta);
+                }
                 diagnostics::count("canvas_notify", 1);
                 cx.notify();
             }))
@@ -3201,7 +3723,7 @@ impl Render for CanvasView {
                                     this.update_text_pointer_selection(screen, window, cx);
                                 } else if this.interaction.is_active() {
                                     let screen = this.cursor_in_viewport(event.position);
-                                    if this.update_interaction(screen) {
+                                    if this.update_interaction_with(screen, event.modifiers.shift) {
                                         diagnostics::count("canvas_notify", 1);
                                         cx.notify();
                                     }
@@ -3211,6 +3733,10 @@ impl Render for CanvasView {
                                     if let Some(marquee) = this.marquee.as_mut() {
                                         marquee.current = world;
                                     }
+                                    diagnostics::count("canvas_notify", 1);
+                                    cx.notify();
+                                } else if this.update_hover(this.cursor_in_viewport(event.position))
+                                {
                                     diagnostics::count("canvas_notify", 1);
                                     cx.notify();
                                 }
@@ -3282,6 +3808,10 @@ impl Render for CanvasView {
                 selection,
                 marquee,
                 preview,
+                GestureFeedback {
+                    snap_guides: self.snap_guides.clone(),
+                    hovered: self.hovered,
+                },
                 TextInputRenderContext {
                     edit: text_edit,
                     focus_handle: focus_handle.clone(),
@@ -3294,6 +3824,17 @@ impl Render for CanvasView {
         diagnostics::record("canvas_render_build", render_start);
         viewport
     }
+}
+
+/// The runtime-only things an in-flight gesture is drawing.
+///
+/// Grouped rather than passed as two more parameters because they share a
+/// lifetime exactly: both exist only while something is being dragged, and
+/// neither means anything once it is over.
+#[derive(Clone, Debug, Default)]
+struct GestureFeedback {
+    snap_guides: Vec<snap::Guide>,
+    hovered: Option<ObjectId>,
 }
 
 struct TextInputRenderContext {
@@ -3778,6 +4319,7 @@ fn artboards(
     selection: &Selection,
     marquee: Option<MarqueeGesture>,
     preview: Option<CreationPreview>,
+    feedback: GestureFeedback,
     text_input: TextInputRenderContext,
 ) -> impl IntoElement {
     // Keep the diagnostic-only visibility scan outside the construction timer.
@@ -3854,6 +4396,14 @@ fn artboards(
         world = world.child(render_preview(camera, preview, zoom));
     }
 
+    // Hover sits *under* selection so that hovering something already selected
+    // does not change its appearance at all — the selection outline is the
+    // stronger statement and should win.
+    if let Some(hovered) = feedback.hovered.filter(|id| !selection.contains(*id)) {
+        if let Some(object) = document.object(hovered) {
+            world = world.child(hover_outline(camera, object));
+        }
+    }
     for id in selection.ids() {
         if let Some(object) = document.object(*id) {
             world = world.child(selection_outline(camera, object));
@@ -3865,6 +4415,12 @@ fn artboards(
                 world = world.child(resize_handle_element(camera, object, handle));
             }
         }
+    }
+
+    // Guides last, so nothing in the scene can paint over the explanation of a
+    // move that is happening right now.
+    for guide in feedback.snap_guides {
+        world = world.child(render_snap_guide(camera, guide, zoom));
     }
 
     if let Some(marquee) = marquee {
@@ -4071,6 +4627,61 @@ fn selection_outline(camera: Camera, object: &DesignObject) -> impl IntoElement 
         .h(gpui_px(object.size.height * camera.zoom))
         .border_1()
         .border_color(rgb(theme::ACCENT))
+}
+
+/// The outline for an object under the pointer that is not selected.
+///
+/// Deliberately weaker than the selection outline: thinner and dimmer, so hover
+/// answers "is this clickable?" without claiming the user has chosen it. No
+/// fill, because a fill would hide the object's own colours at the exact moment
+/// the user is comparing them to something else.
+fn hover_outline(camera: Camera, object: &DesignObject) -> impl IntoElement {
+    let origin = camera.world_to_screen(object.position);
+    div()
+        .absolute()
+        .left(gpui_px(origin.x))
+        .top(gpui_px(origin.y))
+        .w(gpui_px(object.size.width * camera.zoom))
+        .h(gpui_px(object.size.height * camera.zoom))
+        .border_1()
+        .border_color(rgba((theme::ACCENT & 0x00ff_ffff) | (0x66 << 24)))
+}
+
+/// The line that explains a snap.
+///
+/// One screen pixel wide at any zoom — a guide that grows with the world is a
+/// wall, and one that shrinks is invisible exactly when the user is zoomed in
+/// trying to see it. Magenta is Figma's choice and this is that convention: a
+/// colour no object in the document is likely to be, so it reads as editor
+/// chrome rather than as content.
+fn render_snap_guide(camera: Camera, guide: snap::Guide, zoom: f32) -> impl IntoElement {
+    let thickness = 1.0;
+    match guide.axis {
+        snap::Axis::Vertical => {
+            let x = (guide.at - camera.offset.x) * zoom;
+            let top = (guide.start - camera.offset.y) * zoom;
+            let height = (guide.end - guide.start) * zoom;
+            div()
+                .absolute()
+                .left(gpui_px(x - thickness / 2.0))
+                .top(gpui_px(top))
+                .w(gpui_px(thickness))
+                .h(gpui_px(height.max(thickness)))
+                .bg(rgb(theme::SNAP_GUIDE))
+        }
+        snap::Axis::Horizontal => {
+            let y = (guide.at - camera.offset.y) * zoom;
+            let left = (guide.start - camera.offset.x) * zoom;
+            let width = (guide.end - guide.start) * zoom;
+            div()
+                .absolute()
+                .left(gpui_px(left))
+                .top(gpui_px(y - thickness / 2.0))
+                .w(gpui_px(width.max(thickness)))
+                .h(gpui_px(thickness))
+                .bg(rgb(theme::SNAP_GUIDE))
+        }
+    }
 }
 
 fn resize_handle_element(
@@ -5124,7 +5735,7 @@ mod tests {
 
         apply_move(&mut document, &[snapshot], point(25.0, 15.0));
         let moved = document.geometry(object.id).unwrap();
-        let resized = resized_geometry(moved, ResizeHandle::BottomRight, point(20.0, 10.0));
+        let resized = resized_geometry(moved, ResizeHandle::BottomRight, point(20.0, 10.0), false);
         document.set_geometry(object.id, resized);
 
         assert!(selection.contains(object.id));
@@ -5322,7 +5933,7 @@ mod tests {
             };
             let start_width = gesture.object.geometry.size.width;
 
-            apply_resize(&mut document, &gesture, camera, point(350.0, 220.0));
+            apply_resize(&mut document, &gesture, camera, point(350.0, 220.0), false);
 
             assert_eq!(
                 document.object(ObjectId::LANDING).unwrap().size.width,
@@ -5341,7 +5952,7 @@ mod tests {
     fn right_resize_changes_width_and_keeps_left_edge_fixed() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let resized = resized_geometry(start, ResizeHandle::Right, point(25.0, 0.0));
+        let resized = resized_geometry(start, ResizeHandle::Right, point(25.0, 0.0), false);
 
         assert_eq!(resized.position, start.position);
         assert_eq!(resized.size, size(125.0, 80.0));
@@ -5351,7 +5962,7 @@ mod tests {
     fn left_resize_changes_position_and_width() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let resized = resized_geometry(start, ResizeHandle::Left, point(20.0, 0.0));
+        let resized = resized_geometry(start, ResizeHandle::Left, point(20.0, 0.0), false);
 
         assert_eq!(resized.position, point(30.0, 20.0));
         assert_eq!(resized.size, size(80.0, 80.0));
@@ -5361,7 +5972,7 @@ mod tests {
     fn bottom_resize_changes_height_and_keeps_top_edge_fixed() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let resized = resized_geometry(start, ResizeHandle::Bottom, point(0.0, 18.0));
+        let resized = resized_geometry(start, ResizeHandle::Bottom, point(0.0, 18.0), false);
 
         assert_eq!(resized.position, start.position);
         assert_eq!(resized.size, size(100.0, 98.0));
@@ -5371,7 +5982,7 @@ mod tests {
     fn top_resize_changes_position_and_height() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let resized = resized_geometry(start, ResizeHandle::Top, point(0.0, 20.0));
+        let resized = resized_geometry(start, ResizeHandle::Top, point(0.0, 20.0), false);
 
         assert_eq!(resized.position, point(10.0, 40.0));
         assert_eq!(resized.size, size(100.0, 60.0));
@@ -5381,7 +5992,7 @@ mod tests {
     fn corner_resize_changes_both_dimensions() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let resized = resized_geometry(start, ResizeHandle::BottomRight, point(20.0, 15.0));
+        let resized = resized_geometry(start, ResizeHandle::BottomRight, point(20.0, 15.0), false);
 
         assert_eq!(resized.position, start.position);
         assert_eq!(resized.size, size(120.0, 95.0));
@@ -5391,9 +6002,9 @@ mod tests {
     fn resize_enforces_minimum_size_without_flipping() {
         let start = test_geometry(10.0, 20.0, 100.0, 80.0);
 
-        let right = resized_geometry(start, ResizeHandle::Right, point(-200.0, 0.0));
-        let left = resized_geometry(start, ResizeHandle::Left, point(200.0, 0.0));
-        let top = resized_geometry(start, ResizeHandle::Top, point(0.0, 200.0));
+        let right = resized_geometry(start, ResizeHandle::Right, point(-200.0, 0.0), false);
+        let left = resized_geometry(start, ResizeHandle::Left, point(200.0, 0.0), false);
+        let top = resized_geometry(start, ResizeHandle::Top, point(0.0, 200.0), false);
 
         assert_eq!(right.size.width, MIN_OBJECT_SIZE);
         assert_eq!(left.position.x, 90.0);
@@ -5417,6 +6028,7 @@ mod tests {
             objects: vec![snapshot],
             selected_ids: vec![ObjectId::LANDING],
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         };
         apply_move(&mut document, &gesture.objects, point(75.0, 30.0));
         let interaction = Interaction::Moving(gesture);
@@ -5448,6 +6060,15 @@ mod tests {
 
     /// Start a move gesture the way a pointer-down on a selected object does.
     fn begin_live_move(canvas: &mut CanvasView, ids: &[ObjectId]) {
+        begin_live_move_with_snap(canvas, ids, false);
+    }
+
+    /// The same gesture, but with the pointer already `suspend_snap`.
+    ///
+    /// Modifier state is a property of the press, not of the movement, so a
+    /// test that wants `⌘`-drag has to start the gesture with it held rather
+    /// than flip it mid-flight.
+    fn begin_live_move_with_snap(canvas: &mut CanvasView, ids: &[ObjectId], suspend_snap: bool) {
         let start = point(0.0, 0.0);
         canvas.interaction = Interaction::PotentialMove(MoveGesture {
             pointer_start_screen: start,
@@ -5455,6 +6076,7 @@ mod tests {
             objects: snapshots(&canvas.session.runtime, ids),
             selected_ids: ids.to_vec(),
             click_selection: ClickSelection::SelectOnly(ids[0]),
+            suspend_snap,
         });
     }
 
@@ -5502,6 +6124,268 @@ mod tests {
         assert_eq!(canvas.session.runtime.geometry(id).unwrap(), before);
         assert!(canvas.redo_history());
         assert_eq!(canvas.session.runtime.geometry(id).unwrap(), moved);
+    }
+
+    #[test]
+    fn a_drag_near_a_neighbour_snap_into_line_and_say_so() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let before = canvas.session.runtime.geometry(id).unwrap();
+
+        begin_live_move(&mut canvas, &[id]);
+        // Editor's left edge is at 454; this drag puts Landing's left edge at
+        // 456, two world pixels away at 100%.
+        canvas.update_interaction(point(456.0, 0.0));
+
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap().position.x,
+            454.0,
+            "held in line with Editor's left edge"
+        );
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap().position.y,
+            before.position.y,
+            "a purely horizontal drag must not also move vertically"
+        );
+        assert_eq!(canvas.snap_guides().len(), 1, "the snap explains itself");
+        assert_eq!(canvas.snap_guides()[0].at, 454.0);
+
+        canvas.finish_interaction(point(456.0, 0.0));
+    }
+
+    #[test]
+    fn the_command_modifier_places_an_object_freely_and_draws_no_guide() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        begin_live_move_with_snap(&mut canvas, &[id], true);
+        drag_to(&mut canvas, point(456.0, 0.0));
+
+        let moved = canvas.session.runtime.geometry(id).unwrap();
+        assert_eq!(
+            moved.position.x, 456.0,
+            "exactly where the pointer asked, not where the magnet wanted"
+        );
+        assert!(canvas.snap_guides().is_empty());
+    }
+
+    #[test]
+    fn shift_constrains_a_move_to_the_axis_the_pointer_chose() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let start = canvas.session.runtime.geometry(id).unwrap().position;
+
+        // Suspended snapping: these tests are about the axis constraint, and a
+        // neighbouring edge nearby would answer a different question.
+        begin_live_move_with_snap(&mut canvas, &[id], true);
+        // Mostly horizontal with `⇧` held: only the x survives.
+        canvas.update_interaction_with(point(60.0, 12.0), true);
+        let horizontal = canvas.session.runtime.geometry(id).unwrap().position;
+        assert_eq!(horizontal, point(start.x + 60.0, start.y));
+
+        // Mostly vertical with `⇧` held: only the y survives.
+        canvas.update_interaction_with(point(30.0, 60.0), true);
+        let vertical = canvas.session.runtime.geometry(id).unwrap().position;
+        assert_eq!(vertical, point(start.x, start.y + 60.0));
+    }
+
+    #[test]
+    fn releasing_shift_mid_drag_lets_the_object_move_on_both_axes_again() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let start = canvas.session.runtime.geometry(id).unwrap().position;
+
+        begin_live_move_with_snap(&mut canvas, &[id], true);
+        canvas.update_interaction_with(point(40.0, 5.0), true);
+        canvas.update_interaction_with(point(60.0, 12.0), false);
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap().position,
+            point(start.x + 60.0, start.y + 12.0),
+            "the constraint is sampled per movement, not latched at press time"
+        );
+    }
+
+    #[test]
+    fn shift_preserves_the_aspect_ratio_of_a_corner_resize() {
+        let start = ObjectGeometry {
+            position: point(0.0, 0.0),
+            size: size(200.0, 100.0),
+        };
+        // 40 across a 200-wide box is a 1.2 scale, so the height becomes 120
+        // rather than the 110 an unconstrained drag would have produced.
+        let resized = resized_geometry(start, ResizeHandle::BottomRight, point(40.0, 10.0), true);
+        assert!(
+            (resized.size.width - 240.0).abs() < 0.01,
+            "{:?}",
+            resized.size
+        );
+        assert!(
+            (resized.size.height - 120.0).abs() < 0.01,
+            "{:?}",
+            resized.size
+        );
+
+        let free = resized_geometry(start, ResizeHandle::BottomRight, point(40.0, 10.0), false);
+        assert_eq!(free.size, size(240.0, 110.0));
+    }
+
+    #[test]
+    fn shift_scales_a_resize_from_the_dominant_axis() {
+        let start = ObjectGeometry {
+            position: point(0.0, 0.0),
+            size: size(200.0, 100.0),
+        };
+        // A tall drag on a short box: the height drives the scale.
+        let resized = resized_geometry(start, ResizeHandle::BottomRight, point(10.0, 100.0), true);
+        assert_eq!(resized.size.height, 200.0, "doubled from 100 to 200");
+        assert_eq!(resized.size.width, 400.0, "and the width follows");
+    }
+
+    #[test]
+    fn snap_guides_disappear_when_the_gesture_ends() {
+        let mut canvas = CanvasView::new();
+        begin_live_move(&mut canvas, &[ObjectId::LANDING]);
+        canvas.update_interaction(point(456.0, 0.0));
+        assert_eq!(canvas.snap_guides().len(), 1, "held during the drag");
+        canvas.finish_interaction(point(456.0, 0.0));
+        assert!(
+            canvas.snap_guides().is_empty(),
+            "a guide that outlives its gesture is a line drawn on the document"
+        );
+    }
+
+    #[test]
+    fn a_nudge_is_never_pulled_back_by_an_alignment() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        // Park the object two pixels from Editor's left edge, which is well
+        // inside a snap width.
+        canvas.session.runtime.set_position(id, point(452.0, 24.0));
+        canvas.selection.click(Some(id), false);
+        let before = canvas.session.runtime.geometry(id).unwrap();
+
+        assert!(canvas.nudge_selection(1.0, 0.0));
+
+        assert_eq!(
+            canvas.session.runtime.geometry(id).unwrap().position.x,
+            before.position.x + 1.0,
+            "an arrow key states a position; it does not ask where it should be"
+        );
+    }
+
+    #[test]
+    fn hovering_tracks_the_pointer_and_stops_when_a_gesture_starts() {
+        let mut canvas = CanvasView::new();
+        // Landing occupies world (0, 24) to (430, 310) at 100%.
+        assert!(canvas.update_hover(point(10.0, 30.0)));
+        assert_eq!(canvas.hovered(), Some(ObjectId::LANDING));
+        assert!(
+            !canvas.update_hover(point(11.0, 31.0)),
+            "same object, no repaint"
+        );
+        assert!(canvas.update_hover(point(900.0, 700.0)));
+        assert_eq!(canvas.hovered(), None, "empty canvas is not hoverable");
+
+        assert!(canvas.update_hover(point(10.0, 30.0)));
+        assert_eq!(canvas.hovered(), Some(ObjectId::LANDING));
+
+        begin_live_move(&mut canvas, &[ObjectId::LANDING]);
+        assert!(
+            canvas.update_hover(point(10.0, 30.0)),
+            "dragging replaces hover rather than layering it"
+        );
+        assert_eq!(canvas.hovered(), None);
+    }
+
+    #[test]
+    fn only_the_command_modifier_suspends_snapping() {
+        // The corpus is unambiguous that it is the command key, and equally that
+        // no other modifier does this: `⇧` constrains and `⌥` duplicates. A
+        // blanket "any modifier" rule would quietly take snapping away from the
+        // gesture `⇧` is already changing.
+        let mods = |shift: bool, alt: bool, control: bool, platform: bool| gpui::Modifiers {
+            shift,
+            alt,
+            control,
+            platform,
+            ..Default::default()
+        };
+        assert!(!suspends_snap(mods(false, false, false, false)));
+        assert!(!suspends_snap(mods(true, false, false, false)));
+        assert!(!suspends_snap(mods(false, true, false, false)));
+        assert!(suspends_snap(mods(false, false, true, false)));
+        assert!(suspends_snap(mods(false, false, false, true)));
+        assert!(
+            suspends_snap(mods(true, false, true, false)),
+            "`⇧⌘` is still the command key, held harder"
+        );
+    }
+
+    #[test]
+    fn an_object_does_not_snap_to_its_own_child() {
+        let mut canvas = CanvasView::new();
+        // Make Editor a child of Landing in the persistent structure, and put the
+        // child 100 to the right of the parent so there is a real line to snap
+        // to.
+        let landing = node_id("spool-node-landing");
+        let editor = node_id("spool-node-editor");
+        let node = |id: NodeId, parent: Option<NodeId>, name: &str| {
+            crate::source_document::StructuralNode {
+                id,
+                name: name.to_owned(),
+                kind: "frame".to_owned(),
+                parent,
+                children: Vec::new(),
+                source: crate::source_document::SourceBinding {
+                    file: "index.html".to_owned(),
+                    selector: name.to_owned(),
+                },
+            }
+        };
+        canvas.session.document.structure.nodes = vec![
+            node(landing.clone(), None, "Landing"),
+            node(editor.clone(), Some(landing), "Editor"),
+        ];
+        let parent = canvas
+            .session
+            .runtime
+            .object(ObjectId::LANDING)
+            .unwrap()
+            .spool_id
+            .clone();
+        let child = canvas
+            .session
+            .runtime
+            .object(ObjectId::EDITOR)
+            .unwrap()
+            .spool_id
+            .clone();
+        canvas
+            .session
+            .runtime
+            .set_position(ObjectId::EDITOR, point(100.0, 24.0));
+        let child_x = canvas
+            .session
+            .runtime
+            .geometry(ObjectId::EDITOR)
+            .unwrap()
+            .position
+            .x;
+
+        // The parent's left edge lands two pixels from the child's — inside the
+        // threshold — but the child moves with the parent, so aligning to it
+        // would be aligning to the user.
+        let targets = canvas.snap_targets(&[ObjectId::LANDING]);
+        assert!(
+            !targets
+                .iter()
+                .any(|rect| rect.left() == child_x && rect.x == child_x),
+            "a descendant is not a snap target for its ancestor: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|rect| rect.left() == 106.0),
+            "an unrelated sibling still is: {targets:?}"
+        );
+        let _ = (parent, child);
     }
 
     #[test]
@@ -5767,6 +6651,7 @@ mod tests {
             objects: snapshots(&canvas.session.runtime, &[ObjectId::LANDING]),
             selected_ids: vec![ObjectId::LANDING],
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         });
         assert!(canvas.update_interaction(pointer_end));
         canvas.finish_interaction(pointer_end);
@@ -6046,6 +6931,7 @@ mod tests {
             objects: before.clone(),
             selected_ids: ids.to_vec(),
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         };
         canvas.interaction = Interaction::Moving(gesture);
         canvas.finish_interaction(point(50.0, 25.0));
@@ -6087,6 +6973,7 @@ mod tests {
             objects: before,
             selected_ids: ids.to_vec(),
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         });
         canvas.finish_interaction(point(50.0, 25.0));
         let after: Vec<_> = ids
@@ -6174,6 +7061,7 @@ mod tests {
             objects: vec![snapshot],
             selected_ids: vec![ObjectId::LANDING],
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         };
         apply_move(&mut document, &gesture.objects, point(80.0, 30.0));
         let interaction = Interaction::Moving(gesture);
@@ -6199,6 +7087,7 @@ mod tests {
             objects: vec![snapshot],
             selected_ids: vec![ObjectId::LANDING],
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         });
         canvas.finish_interaction(point(10.0, 10.0));
         assert!(!canvas.session.history.can_undo());
@@ -6209,6 +7098,7 @@ mod tests {
             objects: vec![snapshot],
             selected_ids: vec![ObjectId::LANDING],
             click_selection: ClickSelection::SelectOnly(ObjectId::LANDING),
+            suspend_snap: false,
         });
         canvas.finish_interaction(point(0.0, 0.0));
         assert!(!canvas.session.history.can_undo());
@@ -7224,6 +8114,7 @@ mod tests {
                 zoom,
                 viewport: size(800.0, 600.0),
                 initialized: true,
+                pending_fit: None,
             };
             let world = point(
                 object_position.x + local_world.x,
@@ -7360,6 +8251,7 @@ mod tests {
             zoom,
             viewport: size(400.0, 400.0),
             initialized: true,
+            pending_fit: None,
         }
     }
 

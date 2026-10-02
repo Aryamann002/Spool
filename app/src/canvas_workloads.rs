@@ -143,6 +143,7 @@ impl CanvasView {
                     pointer_start_screen: point(0.0, 0.0),
                     pointer_start_world: point(0.0, 0.0),
                     click_selection: ClickSelection::SelectOnly(selected_ids[0]),
+                    suspend_snap: false,
                     objects,
                     selected_ids,
                 });
@@ -173,6 +174,7 @@ impl CanvasView {
                         .collect(),
                     selected_ids: vec![root_id],
                     click_selection: ClickSelection::SelectOnly(root_id),
+                    suspend_snap: false,
                 });
             }
             diagnostics::count("canvas_notify", 1);
@@ -355,6 +357,24 @@ redo_ok={redid} redo_matches_commit={}",
         let depth_after = self.session.history.undo_len();
         let committed = self.positions_of(&dragged);
 
+        // Undo and redo the drag *now*, while its entry is still on top.
+        //
+        // Leaving it until later is the subtle mistake: by then the text edit,
+        // five style edits, an Inspector move and a rename have been committed
+        // above it, so one undo removes the rename and a moved object is
+        // reported as restored. Unwinding to the gesture's own depth instead
+        // would discard the edits the rest of this probe exists to show
+        // surviving the save, and one redo cannot put eight entries back.
+        let undo_move_probe = self.undo_history();
+        let after_move_undo = self.positions_of(&dragged);
+        let redo_move_probe = self.redo_history();
+        let after_move_redo = self.positions_of(&dragged);
+        debug_assert_eq!(
+            self.session.history.undo_len(),
+            depth_after,
+            "undo then redo leaves the gesture's entry on top"
+        );
+
         // -- The rest of the editing loop, on the same project --------------
         //
         // Each of these goes through the same production path a user drives:
@@ -420,7 +440,10 @@ redo_ok={redid} redo_matches_commit={}",
         // Rename: the operation that previously had no caller in the editor.
         let name_before = self.name_of(headline);
         let depth_before_rename = self.session.history.undo_len();
-        let renamed = self.rename_object(headline, "Headline".to_owned());
+        // A name that is genuinely different. Renaming a layer to the name it
+        // already has is correctly a no-op, which makes the whole rename half of
+        // this probe report success while proving nothing.
+        let renamed = self.rename_object(headline, "Hero headline".to_owned());
         let name_after = self.name_of(headline);
         let rename_depth = self.session.history.undo_len() - depth_before_rename;
 
@@ -434,10 +457,10 @@ redo_ok={redid} redo_matches_commit={}",
         let redo_rename = self.redo_history();
         let name_after_redo = self.name_of(headline);
 
-        let undid = self.undo_history();
-        let after_undo = self.positions_of(&dragged);
-        let redid = self.redo_history();
-        let after_redo = self.positions_of(&dragged);
+        let undid = undo_move_probe;
+        let after_undo = after_move_undo;
+        let redid = redo_move_probe;
+        let after_redo = after_move_redo;
 
         let objects: Vec<(String, String, u64)> = self
             .document_objects()
@@ -586,6 +609,157 @@ probe_fill={style_after:08x?} disk_fill={:?} probe_geometry={geometry_after:?} \
 disk_geometry={disk_geometry:?} probe_name={name_after:?} disk_name={disk_name:?}",
             disk("spool-cta-primary")
         );
+
+        self.interaction_probe();
+    }
+
+    /// The interaction layer, measured on the project that is actually open.
+    ///
+    /// Separate from the editing loop above because these are properties of the
+    /// *gesture* rather than of the document: whether a drag lands on a
+    /// neighbour's edge, whether `⇧` and `⌘` do what the corpus says, whether
+    /// hover and guides clean up after themselves. None of it belongs on disk,
+    /// so it runs after the save and every change it makes is undone before it
+    /// returns.
+    ///
+    /// The two objects are placed explicitly first, through the same geometry
+    /// operation the Inspector uses. Deriving them from whatever layout the
+    /// project happens to project to would make the probe a statement about the
+    /// fixture rather than about the interaction.
+    fn interaction_probe(&mut self) {
+        let objects = self.document_objects();
+        // Two objects that are not inside one another. A parent and its child
+        // are the wrong pair: a descendant is deliberately excluded from its
+        // ancestor's snap targets, so the probe would be measuring that exclusion
+        // while reporting it as a failed snap.
+        let mut pair = objects.iter().flat_map(|mover| {
+            objects
+                .iter()
+                .filter(|anchor| anchor.id != mover.id)
+                .map(move |anchor| (mover, anchor))
+        });
+        let Some((mover, anchor)) = pair.find(|(mover, anchor)| {
+            !self.is_within(&anchor.spool_id, &mover.spool_id)
+                && !self.is_within(&mover.spool_id, &anchor.spool_id)
+        }) else {
+            eprintln!("spool_interaction_probe failed=needs_two_unrelated_objects");
+            return;
+        };
+        let (mover, anchor) = (mover.id, anchor.id);
+        // Zoom to 100% first. The snap threshold is eight *screen* pixels, so
+        // without a known zoom the probe's world-unit distances mean different
+        // things on different runs — and after `fit_canvas` a three-node project
+        // can be far enough out that a deliberate 97-unit drag is under the
+        // drag threshold and silently does nothing.
+        self.camera.set_zoom_at_center(1.0);
+        let depth_before = self.session.history.undo_len();
+        let anchor_x = self.session.runtime.geometry(anchor).unwrap().position.x;
+        let anchor_y = self.session.runtime.geometry(anchor).unwrap().position.y;
+        let mover_size = self.session.runtime.geometry(mover).unwrap().size;
+        // 100 away, which is far outside the 8px threshold in either direction,
+        // so the drag below has to travel to get close rather than start close.
+        self.set_object_geometry(
+            mover,
+            Geometry {
+                position: point(anchor_x + 100.0, anchor_y),
+                size: mover_size,
+            },
+        );
+        let start = self.session.runtime.geometry(mover).unwrap().position;
+
+        // Hover: an outline appears over an object and is gone once the pointer
+        // leaves it.
+        let over_object = self.update_hover(point(start.x + 2.0, start.y + 2.0));
+        let hovered = self.hovered();
+        let off_object = self.update_hover(point(start.x - 5000.0, start.y - 5000.0));
+        let hovered_after_leaving = self.hovered();
+
+        // Snap: three pixels short of the neighbour's edge is inside the
+        // threshold, so the drag is held in line and draws a guide. `⌘` places
+        // the same drag exactly where the pointer asked.
+        let wanted = -97.0;
+        let (snap_delta, snapped, guides) = self.drag_once(mover, wanted, 0.0, false, false);
+        let (free_delta, _, _free_guides) = self.drag_once(mover, wanted, 0.0, true, false);
+
+        // `⇧`: the same pointer travel with the constraint held, so only the
+        // dominant axis survives.
+        let (shift_delta, constrained, _) = self.drag_once(mover, 40.0, 6.0, false, true);
+
+        // Every gesture above ends itself, so no guide and no hover may outlive
+        // one.
+        let guides_after = self.snap_guides().len();
+        let hover_after = self.hovered().is_some();
+        let depth_added = self.session.history.undo_len() - depth_before;
+        while self.session.history.undo_len() > depth_before {
+            self.undo_history();
+        }
+        let restored = self.session.history.undo_len() == depth_before
+            && self.session.runtime.geometry(mover).map(|g| g.position)
+                == Some(self.session.runtime.geometry(mover).unwrap().position);
+
+        eprintln!(
+            "spool_interaction_probe hover_on_object={hovered:?} hover_reported={over_object} \
+hover_clears_on_leave={} left_reported={off_object} still_hovered={hovered_after_leaving:?} \
+start={start:?} anchor_x={anchor_x:.2} \
+snap_lands_on_neighbour={} snap_x={:.2} snap_delta={snap_delta:?} guide_count={guides} \
+command_drag_is_free={} command_delta={free_delta:?} \
+shift_constrains={} shift_delta={shift_delta:?} shift_position={constrained:?} \
+guides_cleared={} hover_cleared={} entries_added={depth_added} history_restored={restored}",
+            hovered_after_leaving.is_none(),
+            (snapped.x - anchor_x).abs() < 0.001,
+            snapped.x,
+            (free_delta.0 - wanted).abs() < 0.001 && free_delta.1.abs() < 0.001,
+            // A tolerance, because the gesture travels world -> screen -> world
+            // through the camera and the round trip is not bit-exact. Comparing
+            // exactly would report a floating-point residue of 1e-5 as a
+            // constraint failure.
+            (shift_delta.0 - 40.0).abs() < 0.01 && shift_delta.1.abs() < 0.01,
+            guides_after == 0,
+            !hover_after,
+        );
+    }
+
+    /// Drive one whole move gesture, exactly as pointer-down/move/up would.
+    ///
+    /// The delta is in **world** units and is converted to a screen point
+    /// through the camera. Passing screen coordinates directly would measure a
+    /// world-unit intent against a pixel-quantised camera, so the probe would
+    /// report a snap that the user could never have produced.
+    ///
+    /// Returns the position the drag reached and the guides that were showing
+    /// while the pointer was still down.
+    #[allow(clippy::too_many_arguments)]
+    fn drag_once(
+        &mut self,
+        id: ObjectId,
+        dx: f32,
+        dy: f32,
+        suspend_snap: bool,
+        constrain: bool,
+    ) -> ((f32, f32), Point<f32>, usize) {
+        let start = self.session.runtime.geometry(id).unwrap().position;
+        let origin = self.camera.world_to_screen(start);
+        let screen = self
+            .camera
+            .world_to_screen(point(start.x + dx, start.y + dy));
+        let gesture = MoveGesture {
+            pointer_start_screen: origin,
+            pointer_start_world: start,
+            objects: vec![ObjectSnapshot {
+                id,
+                geometry: self.session.runtime.geometry(id).unwrap(),
+            }],
+            selected_ids: vec![id],
+            click_selection: ClickSelection::SelectOnly(id),
+            suspend_snap,
+        };
+        self.interaction = Interaction::PotentialMove(gesture);
+        self.update_interaction_with(screen, constrain);
+        let position = self.session.runtime.geometry(id).unwrap().position;
+        let guides = self.snap_guides().len();
+        self.finish_interaction(screen);
+        let after = self.session.runtime.geometry(id).unwrap().position;
+        ((after.x - start.x, after.y - start.y), position, guides)
     }
 }
 
