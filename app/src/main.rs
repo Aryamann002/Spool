@@ -1,7 +1,7 @@
 mod canvas;
 mod diagnostics;
 mod layers;
-pub mod project;
+pub mod project_bundle;
 mod shell;
 pub mod source_document;
 mod theme;

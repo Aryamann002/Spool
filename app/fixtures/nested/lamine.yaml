@@ -1,0 +1,23 @@
+version: 1
+nodes:
+  - id: "spool-page-home"
+    name: "Home Page"
+    kind: "frame"
+    parent: null
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-page-home\"]"
+    children: ["spool-text-title", "spool-image-logo"]
+  - id: "spool-text-title"
+    name: "Page Title"
+    kind: "text"
+    parent: "spool-page-home"
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-text-title\"]"
+    children: []
+  - id: "spool-image-logo"
+    name: "Logo"
+    kind: "image"
+    parent: "spool-page-home"
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-image-logo\"]"
+    children: []

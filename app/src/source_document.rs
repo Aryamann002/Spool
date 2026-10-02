@@ -55,6 +55,21 @@ pub enum ModelError {
     InvalidOperation(String),
 }
 
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId(value) => write!(f, "{value:?} is not a valid node ID"),
+            Self::DuplicateId(value) => write!(f, "duplicate node ID {value:?}"),
+            Self::DuplicateName(value) => write!(f, "duplicate node name {value:?}"),
+            Self::MissingNode(value) => write!(f, "reference to unknown node {value:?}"),
+            Self::InvalidYaml(detail) => write!(f, "{detail}"),
+            Self::InvalidOperation(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
 impl LamineStructure {
     pub fn validate(&self) -> Result<(), ModelError> {
         let mut ids = HashSet::new();
