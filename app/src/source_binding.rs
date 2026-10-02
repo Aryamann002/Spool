@@ -72,6 +72,17 @@ pub struct ElementBinding {
     pub parent: Option<usize>,
     /// Indices of directly nested bound elements, in document order.
     pub children: Vec<usize>,
+    /// The element's own text: the exact source range holding it, when it has
+    /// one.
+    ///
+    /// `None` when the content is not a single run of text — an element with
+    /// no children, with a nested element, or with markup between its words.
+    /// That is not a failure: it is the honest answer to "which bytes does this
+    /// node's text own?", and a writer that gets `None` reports the edit as
+    /// unsupported instead of guessing at a range. Recorded from the same parse
+    /// as `element_range`, so text ownership and element ownership cannot drift
+    /// apart.
+    pub text_range: Option<ByteRange>,
 }
 
 /// Every identity-bearing element in one file, in document order.
@@ -205,9 +216,22 @@ impl<'a> IndexBuilder<'a> {
         // duplicate as ambiguous, but only the first one establishes nesting:
         // a second attribute on the same element does not own children.
         let (first, rest) = identities.split_first().expect("identities was non-empty");
-        let opened = self.push_binding(first.clone(), &tag, node.byte_range(), parent);
+        let text_range = self.own_text_range(node);
+        let opened = self.push_binding(
+            first.clone(),
+            &tag,
+            node.byte_range(),
+            parent,
+            text_range.clone(),
+        );
         for extra in rest {
-            self.push_binding(extra.clone(), &tag, node.byte_range(), parent);
+            self.push_binding(
+                extra.clone(),
+                &tag,
+                node.byte_range(),
+                parent,
+                text_range.clone(),
+            );
         }
         if let Some(parent_index) = parent {
             self.bindings[parent_index].children.push(opened);
@@ -235,6 +259,7 @@ impl<'a> IndexBuilder<'a> {
         tag: &str,
         element_range: ByteRange,
         parent: Option<usize>,
+        text_range: Option<ByteRange>,
     ) -> usize {
         let index = self.bindings.len();
         self.bindings.push(ElementBinding {
@@ -245,8 +270,37 @@ impl<'a> IndexBuilder<'a> {
             quoted: identity.2,
             parent,
             children: Vec::new(),
+            text_range,
         });
         index
+    }
+
+    /// The source range this element's own text occupies.
+    ///
+    /// Text ownership is all-or-nothing on purpose. `<h1>Hello</h1>` owns
+    /// `Hello`, and `<h1>Hello <em>world</em></h1>` owns nothing: rewriting one
+    /// range there would either drop the `<em>` or write text across it. An
+    /// element whose children are exactly text nodes owns the span from the
+    /// first to the last of them, which covers the whitespace between them
+    /// without ever crossing a tag.
+    fn own_text_range(&self, element: Node) -> Option<ByteRange> {
+        let mut text_nodes: Vec<Node> = Vec::new();
+        let mut cursor = element.walk();
+        for child in element.children(&mut cursor) {
+            // The start tag and end tag are structural, not content.
+            if matches!(child.kind(), "start_tag" | "end_tag") {
+                continue;
+            }
+            if child.kind() != "text" {
+                return None;
+            }
+            text_nodes.push(child);
+        }
+        let first = text_nodes.first()?;
+        let last = text_nodes.last()?;
+        let start = first.start_byte();
+        let end = last.end_byte();
+        (start < end).then_some(start..end)
     }
 
     /// Collect every `data-spool-id` attribute on this element, in order.
@@ -325,7 +379,9 @@ fn first_tag_name(element: Node) -> Option<Node> {
         return None;
     }
     let mut cursor = tag.walk();
-    let tag_name = tag.children(&mut cursor).find(|node| node.kind() == "tag_name");
+    let tag_name = tag
+        .children(&mut cursor)
+        .find(|node| node.kind() == "tag_name");
     tag_name
 }
 
@@ -333,7 +389,11 @@ fn first_tag_name(element: Node) -> Option<Node> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindingError {
     /// The same `data-spool-id` appears on more than one element or attribute.
-    DuplicateIdentity { id: String, first: ByteRange, second: ByteRange },
+    DuplicateIdentity {
+        id: String,
+        first: ByteRange,
+        second: ByteRange,
+    },
     /// An authored `data-spool-id` value is not a legal NodeId.
     MalformedIdentity { raw: String, range: ByteRange },
     /// An element carries `data-spool-id` with no usable value.
@@ -353,7 +413,11 @@ pub enum BindingError {
     },
     /// The metadata's source binding is not the `[data-spool-id="…"]` form
     /// this phase supports.
-    UnsupportedSelector { id: NodeId, file: String, selector: String },
+    UnsupportedSelector {
+        id: NodeId,
+        file: String,
+        selector: String,
+    },
     /// Metadata itself failed its own validation.
     Metadata(ModelError),
 }
@@ -643,7 +707,9 @@ fn collect_identity_problems(node: Node, source: &[u8], out: &mut Vec<(ByteRange
             //   - an empty value: `data-spool-id=""`
             //   - a value that is not a legal NodeId: `data-spool-id="a b"`
             let problem = match raw {
-                Some((text, range)) if text.is_empty() => Some(BindingError::EmptyIdentity { range }),
+                Some((text, range)) if text.is_empty() => {
+                    Some(BindingError::EmptyIdentity { range })
+                }
                 Some((text, range)) if NodeId::new(text.as_str()).is_err() => {
                     Some(BindingError::MalformedIdentity { raw: text, range })
                 }
@@ -746,13 +812,65 @@ pub fn retarget_identity(
     })
 }
 
+#[test]
+fn a_bound_element_owns_exactly_the_text_the_author_wrote() {
+    // Text ownership is what makes a text edit source-preserving. The range
+    // must be the authored run itself: writing anywhere else would edit the
+    // markup around it.
+    let html = "<!doctype html>\n<body>\n  <h1 data-spool-id=\"h\">Design in source</h1>\n  <a data-spool-id=\"a\" class=\"cta\">Start</a>\n  <div data-spool-id=\"d\"><span>nested</span></div>\n  <p data-spool-id=\"e\"></p>\n</body>\n";
+    let index = SourceIndex::parse(html);
+    let id = |value: &str| NodeId::new(value).expect("valid");
+
+    let heading = index.find(&id("h")).expect("h1 binds");
+    let range = heading
+        .text_range
+        .clone()
+        .expect("the heading owns its text");
+    assert_eq!(&html[range], "Design in source");
+
+    let link = index.find(&id("a")).expect("a binds");
+    assert_eq!(
+        &html[link.text_range.clone().expect("link owns its text")],
+        "Start"
+    );
+
+    // Mixed content owns nothing, and says so.
+    assert_eq!(
+        index.find(&id("d")).expect("div binds").text_range,
+        None,
+        "an element wrapping a child must not claim a text range that spans it"
+    );
+    // An empty element has nothing to own.
+    assert_eq!(index.find(&id("e")).expect("p binds").text_range, None);
+}
+
+#[test]
+fn text_ownership_survives_attributes_and_whitespace_inside_the_element() {
+    // The span runs from the first to the last text node, so the
+    // whitespace between them is included and the surrounding markup is
+    // never inside it.
+    let html = "<!doctype html>\n<body>\n  <a data-spool-id=\"a\"\n     class=\"cta\"\n     href=\"#x\">Start designing</a>\n</body>\n";
+    let index = SourceIndex::parse(html);
+    let binding = index
+        .find(&NodeId::new("a").expect("valid"))
+        .expect("a binds");
+    let range = binding.text_range.clone().expect("owns its text");
+    assert_eq!(&html[range.clone()], "Start designing");
+    assert!(
+        range.start > binding.element_range.start && range.end < binding.element_range.end,
+        "the text range sits strictly inside the element"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source_document::{SourceBinding, StructuralNode};
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/awkward").join(name)
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/awkward")
+            .join(name)
     }
 
     fn awkward_source() -> String {
@@ -789,7 +907,10 @@ mod tests {
         // beginning with '<', which proves ranges point at elements.
         for binding in index.bindings() {
             let slice = &source[binding.element_range.clone()];
-            assert!(slice.starts_with('<'), "range should start an element: {slice:?}");
+            assert!(
+                slice.starts_with('<'),
+                "range should start an element: {slice:?}"
+            );
             assert!(!index.has_syntax_errors(), "fixture should parse cleanly");
         }
     }
@@ -834,11 +955,19 @@ mod tests {
 
         // The comment markers and the plain-text mention must not appear.
         assert!(!ids.contains(&"spool-not-real"), "comment markup was bound");
-        assert!(!ids.contains(&"spool-inside-comment"), "comment text was bound");
+        assert!(
+            !ids.contains(&"spool-inside-comment"),
+            "comment text was bound"
+        );
         assert_eq!(ids.len(), 6);
         // The headline's title attribute contains the id as text; that is an
         // attribute value, not an identity attribute, so it is not double-bound.
-        assert_eq!(ids.iter().filter(|value| **value == "spool-text-headline").count(), 1);
+        assert_eq!(
+            ids.iter()
+                .filter(|value| **value == "spool-text-headline")
+                .count(),
+            1
+        );
     }
 
     // -- Invariant 2: an identity edit changes only the intended byte range.
@@ -847,7 +976,10 @@ mod tests {
     fn retargeting_changes_only_the_intended_byte_range() {
         let source = awkward_source();
         let index = SourceIndex::parse(&source);
-        let binding = index.find(&id("spool-text-emphasis")).expect("emphasis bound").clone();
+        let binding = index
+            .find(&id("spool-text-emphasis"))
+            .expect("emphasis bound")
+            .clone();
 
         let before = source.clone();
         let patch = retarget_identity(&source, &binding, &id("spool-text-body-emphasis"))
@@ -889,7 +1021,8 @@ mod tests {
     fn retargeting_preserves_surrounding_authored_style() {
         // Uses awkward HTML on purpose: single quotes, spaces around '=',
         // extra whitespace, attribute reordering, and comments.
-        let source = "<p   class='body body'    data-spool-id = 'spool-x'  >\n  <!-- keep me -->\n</p>";
+        let source =
+            "<p   class='body body'    data-spool-id = 'spool-x'  >\n  <!-- keep me -->\n</p>";
         let index = SourceIndex::parse(source);
         let binding = index.find(&id("spool-x")).expect("bound").clone();
 
@@ -935,8 +1068,18 @@ mod tests {
         assert!(retarget_identity(source, &binding, &id("spool-b")).is_err());
 
         // An identity that no longer exists in the source is also refused.
-        assert!(retarget_identity(source, &index.find(&id("spool-a")).unwrap().clone(), &id("spool-c")).is_ok());
-        assert!(retarget_identity("<p></p>", &index.find(&id("spool-a")).unwrap().clone(), &id("spool-b")).is_err());
+        assert!(retarget_identity(
+            source,
+            &index.find(&id("spool-a")).unwrap().clone(),
+            &id("spool-c")
+        )
+        .is_ok());
+        assert!(retarget_identity(
+            "<p></p>",
+            &index.find(&id("spool-a")).unwrap().clone(),
+            &id("spool-b")
+        )
+        .is_err());
     }
 
     #[test]
@@ -948,7 +1091,8 @@ mod tests {
         // Rename one node's identity in the HTML, then move the metadata
         // selector with it, exactly as an identity edit would.
         let binding = index.find(&id("spool-image-mark")).expect("bound").clone();
-        let patch = retarget_identity(&source, &binding, &id("spool-image-logo")).expect("retarget");
+        let patch =
+            retarget_identity(&source, &binding, &id("spool-image-logo")).expect("retarget");
 
         // Renaming a node's identity in source must be mirrored in metadata:
         // its own id and selector, plus any parent's reference to it.
@@ -1071,7 +1215,8 @@ mod tests {
 
     #[test]
     fn html_identity_without_metadata_is_reported() {
-        let source = r#"<div data-spool-id="spool-known"></div><div data-spool-id="spool-stray"></div>"#;
+        let source =
+            r#"<div data-spool-id="spool-known"></div><div data-spool-id="spool-stray"></div>"#;
         let metadata = LamineStructure {
             nodes: vec![structural("spool-known", None, Vec::new())],
         };
@@ -1147,14 +1292,19 @@ mod tests {
         let mut second = structural("spool-b", None, Vec::new());
         second.name = "Same".to_owned();
         let errors = reconcile(
-            &LamineStructure { nodes: vec![first, second] },
+            &LamineStructure {
+                nodes: vec![first, second],
+            },
             &BTreeMap::from([(
                 "f.html".to_owned(),
                 r#"<div data-spool-id="spool-a"></div>"#.to_owned(),
             )]),
         )
         .expect_err("duplicate names must fail");
-        assert!(matches!(errors[0], BindingError::Metadata(ModelError::DuplicateName(_))));
+        assert!(matches!(
+            errors[0],
+            BindingError::Metadata(ModelError::DuplicateName(_))
+        ));
     }
 
     // -- Structural relationships.
@@ -1191,7 +1341,11 @@ mod tests {
             "<div data-spool-id=\"spool-b\"></div></section>"
         );
         let index = SourceIndex::parse(source);
-        assert_eq!(index.bindings().len(), 2, "text and unmarked elements are ignored");
+        assert_eq!(
+            index.bindings().len(),
+            2,
+            "text and unmarked elements are ignored"
+        );
         assert!(index.find(&id("spool-a")).is_some());
         assert!(index.find(&id("spool-b")).is_some());
     }
@@ -1213,14 +1367,17 @@ mod tests {
         // well-formedness check. A future phase may want an explicit
         // well-formedness pass; this phase does not pretend to have one.
         let recovered = SourceIndex::parse("<div data-spool-id=\"spool-a\"><span></div>");
-        assert_eq!(recovered.bindings().len(), 1, "the bound identity still resolves");
+        assert_eq!(
+            recovered.bindings().len(),
+            1,
+            "the bound identity still resolves"
+        );
         assert_eq!(
             &recovered.source[recovered.bindings()[0].value_range.clone()],
             "spool-a",
             "ranges remain exact even when the grammar recovered"
         );
     }
-
 
     /// Build a metadata node carrying the identity selector this phase supports.
     fn structural(id_value: &str, parent: Option<&str>, children: Vec<&str>) -> StructuralNode {

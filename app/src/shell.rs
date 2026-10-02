@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, SharedString, Window};
+use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, SharedString, Subscription, Window};
 
 use crate::{canvas, layers::LayersView, project_open, theme};
 
@@ -18,6 +18,7 @@ const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
 enum StyleProperty {
     Fill,
     Stroke,
+    TextColor,
 }
 
 const STYLE_COLORS: [(&str, u32); 9] = [
@@ -97,6 +98,86 @@ pub struct AppShell {
     /// be visible: a save that silently dropped an edit would look identical to
     /// one that persisted everything.
     save_status: Option<(SharedString, bool)>,
+    /// Repaint subscriptions that must outlive this function.
+    ///
+    /// A dropped `Subscription` detaches its observer, so the shell keeps them
+    /// for its whole life: it reads the canvas on every render, and a canvas
+    /// edit has to cause a shell render or the Inspector goes stale. Nothing
+    /// reads this field; holding it is the point.
+    #[allow(dead_code)]
+    observations: Vec<Subscription>,
+    ///
+    /// The shell owns the widget; the canvas owns the document and the history
+    /// boundary, so a drag here is one operation when it ends rather than one
+    /// per pointer movement. `None` the rest of the time.
+    geometry_scrub: Option<GeometryScrub>,
+    /// The geometry field the arrow keys adjust, once one has been touched.
+    geometry_target: Option<(canvas::ObjectId, GeometryField)>,
+    /// The object being renamed and the text typed so far.
+    ///
+    /// A buffer, not a second name store: the name only becomes real when the
+    /// rename is handed to the canvas as one semantic operation.
+    rename: Option<(canvas::ObjectId, String)>,
+}
+
+/// One editable number in the Inspector's geometry fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeometryField {
+    X,
+    Y,
+    Width,
+    Height,
+}
+
+impl GeometryField {
+    fn label(self) -> &'static str {
+        match self {
+            GeometryField::X => "X",
+            GeometryField::Y => "Y",
+            GeometryField::Width => "W",
+            GeometryField::Height => "H",
+        }
+    }
+
+    fn value_of(self, geometry: canvas::Geometry) -> f32 {
+        match self {
+            GeometryField::X => geometry.position.x,
+            GeometryField::Y => geometry.position.y,
+            GeometryField::Width => geometry.size.width,
+            GeometryField::Height => geometry.size.height,
+        }
+    }
+
+    /// The same geometry with this field replaced.
+    ///
+    /// A size cannot go below one pixel: a zero-sized box cannot be clicked
+    /// again, so shrinking one to nothing would make it unrecoverable rather
+    /// than small.
+    fn with_value(self, geometry: canvas::Geometry, value: f32) -> canvas::Geometry {
+        let value = match self {
+            GeometryField::X | GeometryField::Y => value,
+            GeometryField::Width | GeometryField::Height => value.max(1.0),
+        };
+        let mut next = geometry;
+        match self {
+            GeometryField::X => next.position.x = value,
+            GeometryField::Y => next.position.y = value,
+            GeometryField::Width => next.size.width = value,
+            GeometryField::Height => next.size.height = value,
+        }
+        next
+    }
+}
+
+/// A live geometry drag from an Inspector field.
+struct GeometryScrub {
+    field: GeometryField,
+    /// The gesture the canvas opened for this object.
+    gesture: canvas::GeometryScrub,
+    /// Screen position the drag started at.
+    start_x: f32,
+    /// The field's value when the drag started.
+    start_value: f32,
 }
 
 /// Open the project named by `SPOOL_PROJECT`, if one was requested.
@@ -138,9 +219,15 @@ impl AppShell {
         let canvas = cx.new(canvas::CanvasView::new_with_context);
         canvas.update(cx, |view, _| open_requested_project(view));
         let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
+        // Held, not dropped: a GPUI subscription detaches its observer when it
+        // goes away, and without it the Inspector would only repaint when the
+        // shell itself changed — showing the geometry an object had before the
+        // user dragged it.
+        let observations = vec![cx.observe(&canvas, |_, _, cx| cx.notify())];
         Self {
             canvas,
             layers,
+            observations,
             selected_tool: canvas::Tool::Select,
             selected_page: 0,
             inspector_tab: 0,
@@ -151,7 +238,105 @@ impl AppShell {
             zoom_open: false,
             color_picker: None,
             save_status: None,
+            geometry_scrub: None,
+            geometry_target: None,
+            rename: None,
         }
+    }
+
+    /// Run a canvas mutation and repaint both sides of the editor.
+    ///
+    /// The canvas and the Inspector are two views of one document, so a change
+    /// made through either has to redraw both. Notifying the canvas alone leaves
+    /// the fields showing a value the canvas has already moved past; notifying
+    /// the shell alone leaves the object where it was on screen.
+    fn edit_canvas<T>(
+        &mut self,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut canvas::CanvasView, &mut Context<canvas::CanvasView>) -> T,
+    ) -> T {
+        let result = self.canvas.update(cx, |canvas, cx| edit(canvas, cx));
+        self.canvas.update(cx, |_, cx| cx.notify());
+        result
+    }
+
+    /// Keys pressed while an Inspector rename is in progress.
+    ///
+    /// Returns `true` when the key belonged to the rename, so the editor's own
+    /// shortcuts stay out of the way: typing `f` into a name must not also
+    /// switch to the frame tool.
+    fn rename_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some((id, buffer)) = self.rename.as_mut() else {
+            return false;
+        };
+        let id = *id;
+        let committed = match key {
+            "enter" | "return" => Some(buffer.clone()),
+            "escape" => Some(String::new()),
+            "backspace" => {
+                buffer.pop();
+                None
+            }
+            // Modifier combinations are shortcuts, not characters.
+            other if other.chars().count() == 1 => {
+                buffer.push_str(other);
+                None
+            }
+            _ => return true,
+        };
+        self.rename = None;
+        if let Some(name) = committed {
+            let name = name.trim().to_owned();
+            if !name.is_empty() {
+                self.edit_canvas(cx, |canvas, _| canvas.rename_object(id, name));
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Arrow keys adjusting the geometry field the user last touched.
+    ///
+    /// One key press is one semantic operation, the same as one field drag.
+    fn geometry_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        let Some((id, field)) = self.geometry_target else {
+            return false;
+        };
+        let step = if shift { 10.0 } else { 1.0 };
+        let (dx, dy) = match key {
+            "left" => (-step, 0.0),
+            "right" => (step, 0.0),
+            "up" => (0.0, -step),
+            "down" => (0.0, step),
+            _ => return false,
+        };
+        let delta = match field {
+            GeometryField::X | GeometryField::Width => gpui::point(dx, 0.0),
+            GeometryField::Y | GeometryField::Height => gpui::point(0.0, dy),
+        };
+        self.edit_canvas(cx, |canvas, _| {
+            let Some(current) = canvas.object_geometry(id) else {
+                return false;
+            };
+            let next = match field {
+                GeometryField::X | GeometryField::Y => canvas::Geometry {
+                    position: gpui::point(
+                        current.position.x + delta.x,
+                        current.position.y + delta.y,
+                    ),
+                    size: current.size,
+                },
+                GeometryField::Width | GeometryField::Height => canvas::Geometry {
+                    position: current.position,
+                    size: gpui::size(
+                        (current.size.width + delta.x).max(1.0),
+                        (current.size.height + delta.y).max(1.0),
+                    ),
+                },
+            };
+            canvas.set_object_geometry(id, next)
+        });
+        true
     }
 
     /// Save the open project and report what actually happened.
@@ -1099,7 +1284,151 @@ impl AppShell {
                     .child(format_width(width)),
             );
         }
-        fields.child(width_row)
+        fields
+            .child(width_row)
+            .child(self.style_value_fields(selected, cx))
+    }
+
+    /// The object's name, or the rename buffer while one is open.
+    ///
+    /// Clicking the name opens a rename; the typed text is a buffer in the shell
+    /// and becomes a real name only when Enter hands it to the canvas as one
+    /// semantic operation. Escape and an empty name abandon it, leaving the
+    /// document untouched.
+    fn object_name(
+        &self,
+        object: &canvas::DesignObject,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let renaming = self
+            .rename
+            .as_ref()
+            .filter(|(id, _)| *id == object.id)
+            .map(|(_, buffer)| buffer.clone());
+        let name = div()
+            .text_sm()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(if renaming.is_some() {
+                theme::ACCENT
+            } else {
+                theme::TEXT
+            }))
+            .child(match &renaming {
+                Some(buffer) => format!("{buffer}|"),
+                None => object.name.clone(),
+            });
+        let id = object.id;
+        let stateful = renaming.is_some();
+        div()
+            .id(SharedString::from(format!("rename-{}", object.id.0)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if stateful {
+                    return;
+                }
+                this.rename = Some((id, String::new()));
+                cx.notify();
+            }))
+            .child(name)
+    }
+
+    /// The second half of the Appearance section: the properties this milestone
+    /// can express in CSS.
+    ///
+    /// Four controls, each mapped to one `StyleEdit` and one supported CSS
+    /// property. Nothing here invents a value the style model cannot write back,
+    /// because a control that cannot be saved is worse than a missing one.
+    fn style_value_fields(
+        &self,
+        selected: &[canvas::DesignObject],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let text_color = common_text_color(selected);
+        let font_size = common_font_size(selected);
+        let radius = common_number(selected, |object| object.border_radius);
+        let opacity = common_number(selected, |object| object.opacity);
+
+        let mut fields = div().flex().flex_col().gap_3().px(px(14.0)).py(px(12.0));
+
+        // Text colour: the same palette as fill and stroke, because it is the
+        // same model — one colour, one semantic operation, one CSS property.
+        let text_label = match text_color {
+            Some(Some(color)) => color_hex(color),
+            Some(None) => "None".to_owned(),
+            None => "Mixed".to_owned(),
+        };
+        let swatch = text_color
+            .flatten()
+            .map_or(theme::TEXT, canvas::Color::to_rgb);
+        fields = fields.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_SECONDARY))
+                        .child("Text colour"),
+                )
+                .child(
+                    div()
+                        .id("text-color-trigger")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px(px(6.0))
+                        .py(px(5.0))
+                        .rounded_sm()
+                        .bg(rgb(theme::WINDOW))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER_SOFT))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.color_picker =
+                                if this.color_picker == Some(StyleProperty::TextColor) {
+                                    None
+                                } else {
+                                    Some(StyleProperty::TextColor)
+                                };
+                            cx.notify();
+                        }))
+                        .child(div().size(px(12.0)).rounded_sm().bg(rgb(swatch)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SECONDARY))
+                                .child(text_label),
+                        ),
+                ),
+        );
+        if self.color_picker == Some(StyleProperty::TextColor) {
+            fields = fields.child(self.style_palette(StyleProperty::TextColor, cx));
+        }
+
+        fields = fields
+            .child(Self::value_presets(
+                "Size",
+                font_size.map(format_width),
+                ["12", "16", "24", "32"],
+                cx,
+                |text| canvas::StyleEdit::FontSize(text.parse().unwrap_or(16.0)),
+            ))
+            .child(Self::value_presets(
+                "Radius",
+                radius.map(format_width),
+                ["0", "4", "8", "16"],
+                cx,
+                |text| canvas::StyleEdit::BorderRadius(text.parse().unwrap_or(0.0)),
+            ))
+            .child(Self::value_presets(
+                "Opacity",
+                opacity.map(|value| format!("{:.0}%", value * 100.0)),
+                ["25", "50", "75", "100"],
+                cx,
+                |text| canvas::StyleEdit::Opacity(text.parse::<f32>().unwrap_or(1.0) / 100.0),
+            ));
+        fields
     }
 
     fn style_palette(&self, property: StyleProperty, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1123,6 +1452,9 @@ impl AppShell {
                     }
                     StyleProperty::Stroke => {
                         canvas::StyleEdit::Stroke(Some(canvas::Color::from_rgb(value)))
+                    }
+                    StyleProperty::TextColor => {
+                        canvas::StyleEdit::TextColor(Some(canvas::Color::from_rgb(value)))
                     }
                 };
                 row = row.child(
@@ -1207,6 +1539,12 @@ impl AppShell {
                         ),
                 )
                 .child(self.inspector_section(
+                    "Position and size",
+                    0,
+                    Self::position_fields_mixed(&selected),
+                    cx,
+                ))
+                .child(self.inspector_section(
                     "Appearance",
                     2,
                     self.appearance_fields(&selected, cx),
@@ -1238,13 +1576,7 @@ impl AppShell {
                                             .text_color(rgb(theme::TEXT_MUTED))
                                             .child("▱"),
                                     )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(rgb(theme::TEXT))
-                                            .child(object.name.clone()),
-                                    ),
+                                    .child(self.object_name(object, cx)),
                             )
                             .child(
                                 div()
@@ -1256,7 +1588,7 @@ impl AppShell {
                     .child(self.inspector_section(
                         "Position and size",
                         0,
-                        position_fields(object),
+                        self.position_fields(object, cx),
                         cx,
                     ))
                     .child(self.inspector_section("Layout", 1, layout_fields(), cx))
@@ -1332,6 +1664,281 @@ impl AppShell {
         section
     }
 
+    /// The four geometry fields, for a single selected object.
+    ///
+    /// Each one is draggable: dragging changes the runtime geometry live, and the
+    /// whole drag becomes one semantic operation when it ends. The values are read
+    /// from the canvas on every render, so a canvas drag and a field drag are the
+    /// same fact shown in two places rather than two stores.
+    fn position_fields(
+        &self,
+        object: &canvas::DesignObject,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(px(14.0))
+            .pb(px(13.0))
+            .child(self.geometry_field_pair(object, GeometryField::X, GeometryField::Y, cx))
+            .child(self.geometry_field_pair(
+                object,
+                GeometryField::Width,
+                GeometryField::Height,
+                cx,
+            ))
+    }
+
+    /// The same four fields for a multi-selection.
+    ///
+    /// Read-only on purpose: a mixed selection has no single value to drag, and
+    /// inventing one would mean keeping a second copy of the geometry to average.
+    /// Showing `Mixed` is the honest answer until a multi-object move is wired to
+    /// these fields.
+    fn position_fields_mixed(selected: &[canvas::DesignObject]) -> impl IntoElement {
+        let common = |field: GeometryField| {
+            let first = selected.first().map(|object| canvas::Geometry {
+                position: object.position,
+                size: object.size,
+            });
+            let first = first?;
+            selected
+                .iter()
+                .all(|object| {
+                    field.value_of(canvas::Geometry {
+                        position: object.position,
+                        size: object.size,
+                    }) == field.value_of(first)
+                })
+                .then(|| format_geometry(field.value_of(first)))
+        };
+        let label = |field: GeometryField| common(field).unwrap_or_else(|| "Mixed".to_owned());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(px(14.0))
+            .pb(px(13.0))
+            .child(Self::geometry_field_pair_static(
+                "X",
+                label(GeometryField::X),
+                "Y",
+                label(GeometryField::Y),
+            ))
+            .child(Self::geometry_field_pair_static(
+                "W",
+                label(GeometryField::Width),
+                "H",
+                label(GeometryField::Height),
+            ))
+    }
+
+    fn geometry_field_pair_static(
+        left_name: &'static str,
+        left_value: String,
+        right_name: &'static str,
+        right_value: String,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .gap_2()
+            .child(Self::geometry_field_static(left_name, left_value))
+            .child(Self::geometry_field_static(right_name, right_value))
+    }
+
+    fn geometry_field_static(name: &'static str, value: String) -> impl IntoElement {
+        Self::geometry_field_body(name, value, false)
+    }
+
+    /// One draggable geometry field.
+    ///
+    /// The baseline for the drag is read from the runtime at the moment the button
+    /// goes down, so a field can never disagree with what the canvas is showing.
+    fn geometry_field(
+        &self,
+        object: &canvas::DesignObject,
+        field: GeometryField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let geometry = canvas::Geometry {
+            position: object.position,
+            size: object.size,
+        };
+        let value = format_geometry(field.value_of(geometry));
+        let id = object.id;
+        let active = self.geometry_target == Some((id, field));
+        Self::geometry_field_body(field.label(), value, active)
+            .id(SharedString::from(format!(
+                "geometry-{}-{}",
+                object.id.0,
+                field.label()
+            )))
+            .cursor_default()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.begin_geometry_scrub(id, field, event.position.x.into(), cx)
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    this.move_geometry_scrub(event.position.x.into(), field, cx)
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_geometry_scrub(cx)),
+            )
+    }
+
+    fn geometry_field_pair(
+        &self,
+        object: &canvas::DesignObject,
+        left: GeometryField,
+        right: GeometryField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .gap_2()
+            .child(self.geometry_field(object, left, cx))
+            .child(self.geometry_field(object, right, cx))
+    }
+
+    /// Start dragging a geometry field.
+    ///
+    /// The value has already moved by the time this runs if the pointer moved into
+    /// the field, so the baseline is the runtime geometry rather than a value read
+    /// from the widget.
+    fn begin_geometry_scrub(
+        &mut self,
+        id: canvas::ObjectId,
+        field: GeometryField,
+        screen_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.end_geometry_scrub(cx);
+        let gesture = self
+            .canvas
+            .update(cx, |canvas, _| canvas.begin_geometry_scrub(id));
+        let Some(gesture) = gesture else {
+            return;
+        };
+        self.geometry_target = Some((id, field));
+        self.geometry_scrub = Some(GeometryScrub {
+            field,
+            gesture,
+            start_x: screen_x,
+            start_value: field.value_of(gesture.before),
+        });
+        cx.notify();
+    }
+
+    /// Move the object the scrub is dragging, without recording anything yet.
+    fn move_geometry_scrub(&mut self, screen_x: f32, field: GeometryField, cx: &mut Context<Self>) {
+        let Some(scrub) = self.geometry_scrub.as_ref() else {
+            return;
+        };
+        if scrub.field != field {
+            return;
+        }
+        let value = (scrub.start_value + (screen_x - scrub.start_x)).round();
+        let next = field.with_value(scrub.gesture.before, value);
+        let gesture = scrub.gesture;
+        self.edit_canvas(cx, |canvas, _| canvas.scrub_geometry(&gesture, next));
+        cx.notify();
+    }
+
+    /// Finish a scrub: one semantic operation, or none at all if it landed where it
+    /// started.
+    fn end_geometry_scrub(&mut self, cx: &mut Context<Self>) {
+        let Some(scrub) = self.geometry_scrub.take() else {
+            return;
+        };
+        self.edit_canvas(cx, |canvas, _| canvas.commit_geometry_scrub(scrub.gesture));
+        cx.notify();
+    }
+
+    /// The shared look of a geometry field.
+    fn geometry_field_body(name: &'static str, value: String, active: bool) -> gpui::Div {
+        let border = if active {
+            theme::ACCENT
+        } else {
+            theme::BORDER_SOFT
+        };
+        div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px(px(8.0))
+            .py(px(8.0))
+            .rounded_md()
+            .bg(rgb(theme::WINDOW))
+            .border_1()
+            .border_color(rgb(border))
+            .cursor_default()
+            .text_xs()
+            .child(div().text_color(rgb(theme::TEXT_MUTED)).child(name))
+            .child(div().text_color(rgb(theme::TEXT_SECONDARY)).child(value))
+    }
+
+    /// A row of preset buttons that each set one style property.
+    ///
+    /// Presets rather than free text: each one is a value the style model can
+    /// definitely express, so every button is a control whose edit saves. One click
+    /// is one semantic operation, the same as a canvas gesture.
+    fn value_presets(
+        label: &'static str,
+        current: Option<String>,
+        presets: [&'static str; 4],
+        cx: &mut Context<Self>,
+        parse: fn(&'static str) -> canvas::StyleEdit,
+    ) -> impl IntoElement {
+        let current = current.unwrap_or_else(|| "Mixed".to_owned());
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(current),
+            );
+        for preset in presets {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("{label}-{preset}")))
+                    .px(px(7.0))
+                    .py(px(5.0))
+                    .rounded_sm()
+                    .bg(rgb(theme::WINDOW))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_SOFT))
+                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let edit = parse(preset);
+                        this.canvas
+                            .update(cx, |canvas, cx| canvas.set_selected_style(edit, cx));
+                    }))
+                    .child(preset),
+            );
+        }
+        row
+    }
+
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -1383,6 +1990,30 @@ impl Render for AppShell {
                 }
                 let key = event.keystroke.key.as_str();
                 let modifiers = event.keystroke.modifiers;
+                // A rename owns the keyboard while it is open: letters go into
+                // the name, not into tool shortcuts.
+                if this.rename.is_some()
+                    && !modifiers.control
+                    && !modifiers.platform
+                    && this.rename_key(key, cx)
+                {
+                    return;
+                }
+                if this.geometry_key(key, modifiers.shift, cx) {
+                    return;
+                }
+                // Escape abandons an in-progress Inspector drag, exactly as it
+                // abandons a canvas one: the object goes back where it started
+                // and nothing is recorded.
+                if key == "escape" {
+                    if let Some(scrub) = this.geometry_scrub.take() {
+                        this.edit_canvas(cx, |canvas, _| {
+                            canvas.cancel_geometry_scrub(scrub.gesture)
+                        });
+                        cx.notify();
+                        return;
+                    }
+                }
                 if this.canvas.read(cx).is_text_editing() {
                     match shortcut_action(
                         key,
@@ -1614,62 +2245,6 @@ fn field(label: &'static str) -> impl IntoElement {
         .child(div().text_color(rgb(theme::TEXT_SECONDARY)).child(value))
 }
 
-fn position_fields(object: &canvas::DesignObject) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .px(px(14.0))
-        .pb(px(13.0))
-        .child(geometry_field_pair(
-            "X",
-            object.position.x,
-            "Y",
-            object.position.y,
-        ))
-        .child(geometry_field_pair(
-            "W",
-            object.size.width,
-            "H",
-            object.size.height,
-        ))
-}
-
-fn geometry_field_pair(
-    left_name: &'static str,
-    left_value: f32,
-    right_name: &'static str,
-    right_value: f32,
-) -> impl IntoElement {
-    div()
-        .flex()
-        .gap_2()
-        .child(geometry_field(left_name, left_value))
-        .child(geometry_field(right_name, right_value))
-}
-
-fn geometry_field(name: &'static str, value: f32) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .px(px(8.0))
-        .py(px(8.0))
-        .rounded_md()
-        .bg(rgb(theme::WINDOW))
-        .border_1()
-        .border_color(rgb(theme::BORDER_SOFT))
-        .text_xs()
-        .child(div().text_color(rgb(theme::TEXT_MUTED)).child(name))
-        .child(
-            div()
-                .text_color(rgb(theme::TEXT_SECONDARY))
-                .child(format_geometry(value)),
-        )
-}
-
 fn format_geometry(value: f32) -> String {
     if value.fract() == 0.0 {
         format!("{value:.0}")
@@ -1770,6 +2345,36 @@ fn color_hex(color: canvas::Color) -> String {
     format!("#{:06X}", color.to_rgb())
 }
 
+/// A mixed selection shows `Mixed` rather than the first object's value, which
+/// would be a number the user did not choose and could not act on.
+/// The one value every selected object has for `read`, or `None` when they
+/// differ.
+///
+/// A mixed selection shows `Mixed` rather than the first object's value, which
+/// would be a number the user did not choose and could not act on.
+fn common_number(
+    selected: &[canvas::DesignObject],
+    read: impl Fn(&canvas::DesignObject) -> f32,
+) -> Option<f32> {
+    let first = read(selected.first()?);
+    selected
+        .iter()
+        .all(|object| read(object) == first)
+        .then_some(first)
+}
+
+fn common_text_color(selected: &[canvas::DesignObject]) -> Option<Option<canvas::Color>> {
+    let first = selected.first()?.text_color;
+    selected
+        .iter()
+        .all(|object| object.text_color == first)
+        .then_some(first)
+}
+
+fn common_font_size(selected: &[canvas::DesignObject]) -> Option<f32> {
+    common_number(selected, |object| object.font_size.unwrap_or_default())
+}
+
 fn format_width(width: f32) -> String {
     if width.fract() == 0.0 {
         format!("{}", width as u32)
@@ -1793,6 +2398,8 @@ mod style_inspector_tests {
             text_content: None,
             text_color: None,
             font_size: None,
+            border_radius: 0.0,
+            opacity: 1.0,
             fill: fill.map(|color| canvas::Fill {
                 color: canvas::Color::from_rgb(color),
             }),

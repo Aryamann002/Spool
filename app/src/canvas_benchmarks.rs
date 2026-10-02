@@ -33,6 +33,8 @@ fn core_workload_baseline() {
                 text_content: Some("Representative text content".repeat(4)),
                 text_color: None,
                 font_size: None,
+                border_radius: 0.0,
+                opacity: 1.0,
                 fill: default_style(ObjectType::Text).fill,
                 stroke: None,
             })

@@ -55,6 +55,8 @@ fn fixture(count: usize) -> Document {
             font_size: None,
             fill: default_style(ObjectType::Rectangle).fill,
             stroke: None,
+            border_radius: default_style(ObjectType::Rectangle).border_radius,
+            opacity: 1.0,
         })
         .collect();
     Document {
@@ -196,7 +198,8 @@ impl CanvasView {
         }
         if step == STEPS && kind == Workload::Project {
             // The whole product loop, against the project that was actually
-            // opened from disk: move, undo, redo, save, reopen.
+            // opened from disk: edit text, restyle, move, rename, undo, redo,
+            // save, reopen.
             self.project_loop_probe();
             self.workload_running = false;
             eprintln!("spool_workload_complete {kind:?}:{count}");
@@ -313,6 +316,32 @@ redo_ok={redid} redo_matches_commit={}",
     /// [`crate::project_open::open_project`] — so the probe proves the shipped
     /// lifecycle rather than a parallel imitation of it. Every value printed is read
     /// back out of the live canvas or off the filesystem after the write.
+    /// The runtime object projected from a persistent node.
+    fn node_object(&self, node: &str) -> Option<ObjectId> {
+        self.document_objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == node)
+            .map(|object| object.id)
+    }
+
+    fn text_of(&self, id: ObjectId) -> Option<String> {
+        self.session.runtime.text_content(id).map(str::to_owned)
+    }
+
+    fn fill_of(&self, id: ObjectId) -> Option<u32> {
+        self.session
+            .runtime
+            .object(id)
+            .and_then(|object| object.fill.map(|fill| fill.color.to_rgb()))
+    }
+
+    fn name_of(&self, id: ObjectId) -> Option<String> {
+        self.session
+            .runtime
+            .object(id)
+            .map(|object| object.name.clone())
+    }
+
     fn project_loop_probe(&mut self) {
         let Some(root) = self.project_root.clone() else {
             eprintln!("spool_project_probe failed=no_project_open");
@@ -325,6 +354,85 @@ redo_ok={redid} redo_matches_commit={}",
         self.finish_interaction(point(STEPS as f32 * 5.0, STEPS as f32 * 3.0));
         let depth_after = self.session.history.undo_len();
         let committed = self.positions_of(&dragged);
+
+        // -- The rest of the editing loop, on the same project --------------
+        //
+        // Each of these goes through the same production path a user drives:
+        // text through the caret and commit, appearance through the Inspector's
+        // `StyleEdit`, geometry through the Inspector's field operation, and
+        // the name through the rename operation. Nothing here builds a document
+        // by hand to make the probe easier to write.
+        let headline = self.node_object("spool-text-headline");
+        let cta = self.node_object("spool-cta-primary");
+        let (Some(headline), Some(cta)) = (headline, cta) else {
+            eprintln!("spool_project_probe failed=expected_nodes_missing");
+            return;
+        };
+
+        let text_before = self.text_of(headline);
+        let history_before_edits = self.session.history.undo_len();
+
+        // Text: the same command a committed caret edit produces. Typing into a
+        // caret session would record one entry per commit; three entries here
+        // would mean the same thing went wrong.
+        let headline_text = self.text_of(headline).unwrap_or_default();
+        let text_committed =
+            self.set_object_text(headline, format!("{headline_text} — edited in Spool"));
+        let text_depth = self.session.history.undo_len() - history_before_edits;
+        let text_after = self.text_of(headline);
+
+        // Appearance: what the Inspector's fill swatch does. The selection
+        // follows the object being styled, exactly as clicking a swatch does.
+        self.selection.replace(vec![cta]);
+        let style_before = self.fill_of(cta);
+        let depth_before_style = self.session.history.undo_len();
+        self.apply_selected_style(StyleEdit::Fill(Some(Color::from_rgb(0xc4_5d_5d))));
+        let style_after = self.fill_of(cta);
+        let style_depth = self.session.history.undo_len() - depth_before_style;
+
+        // Text colour, font size, radius and opacity: one semantic operation
+        // each, all through the same edit the Inspector sends.
+        let depth_before_more_style = self.session.history.undo_len();
+        for edit in [
+            StyleEdit::TextColor(Some(Color::from_rgb(0x16_16_1d))),
+            StyleEdit::FontSize(24.0),
+            StyleEdit::BorderRadius(16.0),
+            StyleEdit::Opacity(0.5),
+        ] {
+            self.apply_selected_style(edit);
+        }
+        let more_style_depth = self.session.history.undo_len() - depth_before_more_style;
+
+        // Geometry: the Inspector field operation, not a drag.
+        let geometry_before = self.object_geometry(cta);
+        let moved = match geometry_before {
+            Some(geometry) => self.set_object_geometry(
+                cta,
+                Geometry {
+                    position: point(geometry.position.x + 40.0, geometry.position.y + 24.0),
+                    size: geometry.size,
+                },
+            ),
+            None => false,
+        };
+        let geometry_after = self.object_geometry(cta);
+
+        // Rename: the operation that previously had no caller in the editor.
+        let name_before = self.name_of(headline);
+        let depth_before_rename = self.session.history.undo_len();
+        let renamed = self.rename_object(headline, "Headline".to_owned());
+        let name_after = self.name_of(headline);
+        let rename_depth = self.session.history.undo_len() - depth_before_rename;
+
+        let history_count = self.session.history.undo_len();
+
+        // Undo the rename only: the last thing the user did. Restores the
+        // authored name without touching the text or the style.
+        let undo_rename = self.undo_history();
+        let name_after_undo = self.name_of(headline);
+        let text_after_undo = self.text_of(headline);
+        let redo_rename = self.redo_history();
+        let name_after_redo = self.name_of(headline);
 
         let undid = self.undo_history();
         let after_undo = self.positions_of(&dragged);
@@ -405,6 +513,17 @@ redo_ok={redid} redo_matches_commit={}",
             .iter()
             .map(|o| (o.spool_id.as_str().to_owned(), o.text_content.clone()))
             .collect();
+        let reopened_appearance: Vec<(String, Option<u32>)> = reopened
+            .runtime
+            .objects()
+            .iter()
+            .map(|o| {
+                (
+                    o.spool_id.as_str().to_owned(),
+                    o.fill.map(|fill| fill.color.to_rgb()),
+                )
+            })
+            .collect();
 
         eprintln!(
         "spool_project_probe persistent_nodes={persistent:?} runtime_objects={objects:?}\n\
@@ -415,8 +534,57 @@ exactly_one_history_entry={} undo_restored_start={} redo_matches_commit={} undo_
         after_undo == resting,
         after_redo == committed,
     );
+
+        // What the editor can now do, as values rather than claims.
+        eprintln!(
+            "spool_edit_probe text_before={text_before:?} text_after={text_after:?} \
+text_committed={text_committed} one_history_entry_per_text_edit={}\n\
+style_before={style_before:08x?} style_after={style_after:08x?} \
+one_history_entry_per_style_edit={} four_style_edits_four_entries={}\n\
+geometry_before={geometry_before:?} geometry_after={geometry_after:?} inspector_move={moved}\n\
+name_before={name_before:?} name_after={name_after:?} renamed={renamed} rename_depth={rename_depth} \
+undo_ok={undo_rename} redo_ok={redo_rename} undo_restored_name={} redo_restored_name={} \
+undo_kept_text={} history_count={history_count}",
+            text_depth == 1,
+            style_depth == 1,
+            more_style_depth == 4,
+            name_after_undo == name_before,
+            name_after_redo == name_after,
+            text_after_undo == text_after,
+        );
+
         eprintln!(
             "spool_reopen_probe geometry={reopened_geometry:?} text={reopened_text:?} saved={save}"
+        );
+        // What came back off disk beside what the editor was showing: the only
+        // comparison that says whether an edit survived the whole loop.
+        let disk = |node: &str| {
+            reopened_appearance
+                .iter()
+                .find(|(id, _)| id == node)
+                .map(|(_, value)| *value)
+        };
+        let disk_geometry = reopened
+            .runtime
+            .objects()
+            .iter()
+            .find(|o| o.spool_id.as_str() == "spool-cta-primary")
+            .map(|o| (o.position.x, o.position.y, o.size.width, o.size.height));
+        let disk_name = reopened
+            .runtime
+            .objects()
+            .iter()
+            .find(|o| o.spool_id.as_str() == "spool-text-headline")
+            .map(|o| o.name.clone());
+        let disk_text = reopened_text
+            .iter()
+            .find(|(id, _)| id == "spool-text-headline")
+            .map(|(_, text)| text.clone());
+        eprintln!(
+            "spool_reopen_values probe_text={text_after:?} disk_text={disk_text:?} \
+probe_fill={style_after:08x?} disk_fill={:?} probe_geometry={geometry_after:?} \
+disk_geometry={disk_geometry:?} probe_name={name_after:?} disk_name={disk_name:?}",
+            disk("spool-cta-primary")
         );
     }
 }

@@ -41,10 +41,15 @@ pub enum SourceEdit {
     /// Replace the text content of a node's element.
     Text { node: NodeId, text: String },
     /// Write explicit geometry onto a node's element.
+    ///
+    /// A move and a resize are separate because they are separate kinds of
+    /// source change: a resize is an explicit box, and a move is a position
+    /// expressed in whichever of the two ways the element's own positioning
+    /// allows. See [`Placement`].
     Geometry {
         node: NodeId,
-        x: Option<f32>,
-        y: Option<f32>,
+        /// `None` when only the box changed.
+        placement: Option<Placement>,
         width: Option<f32>,
         height: Option<f32>,
     },
@@ -57,6 +62,43 @@ pub enum SourceEdit {
         property: String,
         value: String,
     },
+}
+
+/// How a moved element's new position is expressed in source.
+///
+/// The two cases exist because the two cases have different honest answers.
+/// Turning every dragged element into `position: absolute` — which is what this
+/// milestone inherited — is correct for a box the author already took out of
+/// the flow, and wrong for one that did not: lifting a `main` out of `body`
+/// deletes the only thing that let it reflow with its siblings, so reopening
+/// the project shows a page the author never wrote.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Placement {
+    /// Out of the flow, at this offset from the containing block.
+    ///
+    /// Written as `left`/`top`, which is what an absolutely positioned box
+    /// already means.
+    ContainingBlock { x: f32, y: f32 },
+    /// Still in the flow, offset by this much from where the flow puts it.
+    ///
+    /// Written as `transform: translate(...)`, which moves a box without
+    /// removing it from the flow. The offset is added to whatever the author
+    /// already authored, so a second move composes with the first instead of
+    /// replacing it.
+    Flow { dx: f32, dy: f32 },
+}
+
+/// Where the declarations for one geometry edit go.
+///
+/// Split because a box and a position do not have the same answer: a size is
+/// always a local declaration on the element, while a flow offset may belong to
+/// a stylesheet rule the author wrote.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GeometryWrites {
+    /// Declarations for the element's own inline `style`.
+    inline: Vec<(String, String)>,
+    /// `(file, value range, replacement)` for authored declarations.
+    css: Vec<(String, (usize, usize), String)>,
 }
 
 /// A change that could not be written, with the reason.
@@ -86,7 +128,11 @@ pub fn save_project(
 ) -> Result<SaveOutcome, BundleError> {
     let mut outcome = SaveOutcome::default();
     let mut html_edits: BTreeMap<String, Vec<(NodeId, String)>> = BTreeMap::new();
-    let mut attributes: BTreeMap<String, Vec<(NodeId, String)>> = BTreeMap::new();
+    // File -> element -> the declarations to set on that element's own inline
+    // style. Grouped per element rather than per edit so a geometry write and a
+    // style write to the same element produce one attribute, not two that
+    // fight over it.
+    let mut inline: BTreeMap<String, BTreeMap<NodeId, Vec<(String, String)>>> = BTreeMap::new();
     let mut css_edits: Vec<(String, (usize, usize), String)> = Vec::new();
 
     for edit in edits {
@@ -105,52 +151,78 @@ pub fn save_project(
         };
         let file = node.source.file.clone();
         match edit {
-            SourceEdit::Text { text, .. } => html_edits
-                .entry(file)
-                .or_default()
-                .push((node_id.clone(), text.clone())),
+            SourceEdit::Text { text, .. } => {
+                // Text is written only into the range the element owns. An
+                // element whose content is not a single run of text — a wrapper
+                // around a child, or empty — owns nothing, and rewriting "the
+                // inside" anyway would destroy markup the author wrote.
+                match text_owner(document, node) {
+                    Some(_) => html_edits
+                        .entry(file)
+                        .or_default()
+                        .push((node_id.clone(), text.clone())),
+                    None => outcome.unsupported.push(UnsupportedEdit {
+                        node: node_id.clone(),
+                        kind: "text",
+                        reason: "this element's content is not a single run of text, \
+                                 so there is no text range to replace"
+                            .into(),
+                    }),
+                }
+            }
             SourceEdit::Geometry {
-                x,
-                y,
+                placement,
                 width,
                 height,
                 ..
-            } => {
-                let declarations = geometry_declarations(*x, *y, *width, *height);
-                if declarations.is_empty() {
-                    outcome.unsupported.push(UnsupportedEdit {
-                        node: node_id.clone(),
-                        kind: "geometry",
-                        reason: "no geometry value to write".into(),
-                    });
-                } else {
-                    attributes
+            } => match geometry_writes(document, node, placement.as_ref(), *width, *height) {
+                Ok(writes) => {
+                    inline
                         .entry(file)
                         .or_default()
-                        .push((node_id.clone(), declarations));
+                        .entry(node_id.clone())
+                        .or_default()
+                        .extend(writes.inline);
+                    css_edits.extend(writes.css);
                 }
-            }
+                Err(reason) => outcome.unsupported.push(UnsupportedEdit {
+                    node: node_id.clone(),
+                    kind: "geometry",
+                    reason,
+                }),
+            },
             SourceEdit::Style {
                 property, value, ..
             } => {
-                // Ownership: a style edit needs an authored declaration for
-                // that property. Without one there is no span to rewrite, and
-                // inventing a rule would be source generation, not an edit.
-                match find_style_owner(document, node, property) {
-                    Some((css_file, range)) => {
-                        css_edits.push((css_file, range, value.clone()));
+                // Ownership decides where the edit lands. See
+                // `StyleTarget` for the policy; the short version is that an
+                // authored declaration is rewritten in place, and a property
+                // this element does not itself declare — including one it only
+                // inherits — is written as a local declaration on the element
+                // rather than mutating an ancestor.
+                match style_target(document, node, property) {
+                    Some(StyleTarget::Declaration { file, range, .. }) => {
+                        css_edits.push((file, range, value.clone()));
+                    }
+                    Some(StyleTarget::Element { .. }) => {
+                        inline
+                            .entry(file)
+                            .or_default()
+                            .entry(node_id.clone())
+                            .or_default()
+                            .push((property.clone(), value.clone()));
                     }
                     None => outcome.unsupported.push(UnsupportedEdit {
                         node: node_id.clone(),
                         kind: "style",
-                        reason: format!("no authored declaration of `{property}` owns this node"),
+                        reason: format!("`{property}` cannot be written on this element"),
                     }),
                 }
             }
         }
     }
 
-    // Write HTML files that have text or attribute edits.
+    // Write HTML files that have text or inline-style edits.
     for (file, edits_for_file) in &html_edits {
         let path = resolve(root, file)?;
         let original = read_source(&path)?;
@@ -161,12 +233,12 @@ pub fn save_project(
             &original,
             &index,
             edits_for_file,
-            attributes.get(file),
+            inline.get(file),
         )?;
         write_if_changed(&path, &original, &rewritten, &mut outcome)?;
     }
-    // Files with only attribute edits.
-    for (file, edits_for_file) in &attributes {
+    // Files with only inline-style edits.
+    for (file, edits_for_file) in &inline {
         if html_edits.contains_key(file) {
             continue;
         }
@@ -232,27 +304,158 @@ fn resolve(root: &std::path::Path, file: &str) -> Result<PathBuf, BundleError> {
     Ok(candidate)
 }
 
-fn geometry_declarations(
-    x: Option<f32>,
-    y: Option<f32>,
+/// Decide what a geometry edit writes, and where each part goes.
+///
+/// # The policy
+///
+/// A size is always the element's own business: `width`/`height` become local
+/// declarations, because pinning a box to the number the editor measured is
+/// the only way to write an authored width down at all.
+///
+/// A position follows the element's own positioning:
+///
+/// - Already out of the flow: `left`/`top`, measured from the containing block.
+///   `position` is not restated, because the author already said so — inline
+///   or in a rule — and repeating it locally would be a second declaration
+///   saying the same thing.
+/// - In the flow: `transform: translate(...)`, added to whatever offset the
+///   author already wrote. An element that has no authored transform gains one;
+///   an element whose author wrote something this editor cannot offset (a
+///   rotation, say) is reported rather than having that transform replaced.
+///
+/// # The failure this is honest about
+///
+/// A `transform` the editor does not understand is a real conflict, not a
+/// missing feature. Overwriting `rotate(4deg)` with a translate would delete an
+/// authored decision, so the save reports the node and leaves the file alone.
+fn geometry_writes(
+    document: &crate::source_document::PersistentDocument,
+    node: &crate::source_document::StructuralNode,
+    placement: Option<&Placement>,
     width: Option<f32>,
     height: Option<f32>,
-) -> String {
-    let mut parts = Vec::new();
-    if let (Some(left), Some(top)) = (x, y) {
-        parts.push(format!(
-            "position: absolute; left: {}px; top: {}px",
-            css_length(left),
-            css_length(top)
-        ));
+) -> Result<GeometryWrites, String> {
+    let mut writes = GeometryWrites::default();
+    if placement.is_none() && width.is_none() && height.is_none() {
+        return Err("no geometry value to write".to_owned());
     }
     if let Some(width) = width {
-        parts.push(format!("width: {}px", css_length(width)));
+        writes
+            .inline
+            .push(("width".to_owned(), format!("{}px", css_length(width))));
     }
     if let Some(height) = height {
-        parts.push(format!("height: {}px", css_length(height)));
+        writes
+            .inline
+            .push(("height".to_owned(), format!("{}px", css_length(height))));
     }
-    parts.join("; ")
+    let Some(placement) = placement else {
+        return Ok(writes);
+    };
+    match *placement {
+        Placement::ContainingBlock { x, y } => {
+            if !is_out_of_flow(document, node)? {
+                writes
+                    .inline
+                    .push(("position".to_owned(), "absolute".to_owned()));
+            }
+            writes
+                .inline
+                .push(("left".to_owned(), format!("{}px", css_length(x))));
+            writes
+                .inline
+                .push(("top".to_owned(), format!("{}px", css_length(y))));
+        }
+        Placement::Flow { dx, dy } => {
+            let Some(target) = style_target(document, node, "transform") else {
+                return Err("`transform` cannot be written on this element".to_owned());
+            };
+            let (base, css_target) = match target {
+                StyleTarget::Declaration {
+                    file,
+                    range,
+                    authored,
+                } => {
+                    let base = crate::style::parse_translate(&authored).ok_or_else(|| {
+                        format!(
+                            "this element's authored `transform: {authored}` is not an offset \
+                             this editor can add to"
+                        )
+                    })?;
+                    (base, Some((file, range)))
+                }
+                StyleTarget::Element { authored } => {
+                    // No authored transform means no base to compose with. An
+                    // authored one this subset cannot read is a conflict, not an
+                    // absent base.
+                    let base = match authored {
+                        None => (0.0, 0.0),
+                        Some(authored) => {
+                            crate::style::parse_translate(&authored).ok_or_else(|| {
+                                format!(
+                                    "this element's authored `transform: {authored}` is not an \
+                                     offset this editor can add to"
+                                )
+                            })?
+                        }
+                    };
+                    (base, None)
+                }
+            };
+            let moved = (base.0 + dx, base.1 + dy);
+            if (dx, dy) == (0.0, 0.0) {
+                // Back where the flow puts it. `transform: none` says exactly
+                // that and reads as no offset; leaving an authored offset in
+                // place would reopen the element somewhere the editor is not
+                // showing it.
+                if base != (0.0, 0.0) {
+                    match css_target {
+                        Some((file, range)) => writes.css.push((file, range, "none".to_owned())),
+                        None => writes
+                            .inline
+                            .push(("transform".to_owned(), "none".to_owned())),
+                    }
+                }
+                return Ok(writes);
+            }
+            let value = format!(
+                "translate({}px, {}px)",
+                css_length(moved.0),
+                css_length(moved.1)
+            );
+            match css_target {
+                // The author owns this offset, so the edit belongs to their
+                // declaration rather than a new local one that would fight it.
+                Some((file, range)) => writes.css.push((file, range, value)),
+                None => writes.inline.push(("transform".to_owned(), value)),
+            }
+        }
+    }
+    Ok(writes)
+}
+
+/// Whether a node's element is already positioned out of the normal flow.
+///
+/// Asked before every move, because it is the whole difference between a
+/// `left`/`top` write and a `transform` write. Resolved the same way a style
+/// edit resolves ownership — the element's own inline declaration first, then
+/// the last matching rule — so the answer agrees with what the renderer and the
+/// style ownership rules already believe.
+pub fn is_out_of_flow(
+    document: &crate::source_document::PersistentDocument,
+    node: &crate::source_document::StructuralNode,
+) -> Result<bool, String> {
+    let Some(target) = style_target(document, node, "position") else {
+        return Ok(false);
+    };
+    let authored = match target {
+        StyleTarget::Declaration { authored, .. } => Some(authored),
+        StyleTarget::Element { authored } => authored,
+    };
+    Ok(matches!(
+        authored.as_deref().map(str::trim),
+        Some("absolute" | "fixed")
+    ))
 }
 
 /// Format a length the way an author would write it.
@@ -261,7 +464,7 @@ fn geometry_declarations(
 /// `22.399994`. Writing that into the document is accurate and unreadable, and
 /// it makes every save produce a noisy diff. Two decimals is finer than any
 /// screen can show and keeps the source something a person would have written.
-fn css_length(value: f32) -> String {
+pub fn css_length(value: f32) -> String {
     let rounded = (value * 100.0).round() / 100.0;
     if rounded == rounded.trunc() {
         return format!("{}", rounded as i64);
@@ -269,27 +472,81 @@ fn css_length(value: f32) -> String {
     format!("{rounded}")
 }
 
-/// Find the authored declaration that owns `property` for this node.
+/// The source range holding a node's own text, if it owns one.
 ///
-/// Ownership is checked, not assumed: the node's own element must be matched by
-/// a rule that declares the property, and the answer is the byte range of that
-/// declaration's value. A property nobody authored for this element has no span
-/// to edit, so it is reported rather than turned into a new rule — inventing a
-/// rule would be source generation, not an edit.
+/// Re-parses the bound file through the same [`SourceIndex`] the project was
+/// opened with, so ownership is decided by the authored parse rather than by
+/// string surgery at save time. Returns `None` when the node does not exist,
+/// binds to nothing, or has content that is not a single run of text.
+fn text_owner(
+    document: &crate::source_document::PersistentDocument,
+    node: &crate::source_document::StructuralNode,
+) -> Option<std::ops::Range<usize>> {
+    let html = document.sources.get(&node.source.file)?;
+    SourceIndex::parse(html).find(&node.id)?.text_range.clone()
+}
+
+/// Where a style edit lands, and what the property is currently authored as.
+#[derive(Clone, Debug, PartialEq)]
+enum StyleTarget {
+    /// An authored declaration already owns this property for this element.
+    Declaration {
+        /// The stylesheet holding it.
+        file: String,
+        /// Byte range of that declaration's value.
+        range: (usize, usize),
+        /// The authored value text, taken from the same range.
+        authored: String,
+    },
+    /// Nothing this element declares owns the property; write it locally.
+    Element {
+        /// The inline value, when the element happens to declare it there
+        /// without owning it. Needed to compose a new value onto what the
+        /// author wrote rather than overwriting it.
+        authored: Option<String>,
+    },
+}
+
+/// Decide where an edit to `property` on `node` belongs.
 ///
-/// Returns the owning file together with the value range.
-fn find_style_owner(
+/// # The policy, in order
+///
+/// 1. The element's own inline `style` declaration wins: an inline style is
+///    the author saying "this element, not the class".
+/// 2. Otherwise the last stylesheet rule matching this element that declares
+///    the property is rewritten in place — same file, same declaration, same
+///    position. That includes a value written as `var(--accent)`: the edit
+///    replaces it with the resolved colour on this element and leaves the
+///    variable alone for every other element using it.
+/// 3. Otherwise the element gets a local declaration. That covers both a
+///    property nobody authored and one the element only *inherits*: editing an
+///    inherited `color` writes `color` on this element, and deliberately does
+///    not rewrite the ancestor that happened to be its source. Changing an
+///    ancestor would silently restyle every sibling inheriting from it, which
+///    is never what editing one selected object means.
+fn style_target(
     document: &crate::source_document::PersistentDocument,
     node: &crate::source_document::StructuralNode,
     property: &str,
-) -> Option<(String, (usize, usize))> {
+) -> Option<StyleTarget> {
     let html = document.sources.get(&node.source.file)?;
     let index = SourceIndex::parse(html);
     let binding = index.find(&node.id)?;
     let fragment = html.get(binding.element_range.clone())?;
     let (tag, classes) = crate::visual::element_identity(fragment);
 
-    // Sorted so the answer does not depend on hash iteration order.
+    // 1. The element's own inline style, if it declares the property.
+    let open_tag_end = fragment.find('>').unwrap_or(fragment.len());
+    let open_tag = &fragment[..open_tag_end];
+    let inline = parse_inline_declarations(open_tag);
+    if let Some((_, value)) = inline.iter().find(|(declared, _)| declared == property) {
+        return Some(StyleTarget::Element {
+            authored: Some(value.clone()),
+        });
+    }
+
+    // 2. The stylesheet declaration that owns it. Sorted so the answer does not
+    // depend on hash iteration order.
     let mut sheets: Vec<&String> = document
         .sources
         .keys()
@@ -303,14 +560,21 @@ fn find_style_owner(
         let sheet = Stylesheet::parse(contents);
         for spelling in ownership_spellings(property) {
             if let Some(range) = sheet.declaration_value_range(&tag, &classes, None, spelling) {
-                return Some((name.clone(), range));
+                let authored = contents.get(range.0..range.1).unwrap_or("").to_owned();
+                return Some(StyleTarget::Declaration {
+                    file: name.clone(),
+                    range,
+                    authored,
+                });
             }
         }
     }
-    None
+
+    // 3. Nothing authored here, so the element itself becomes the owner.
+    Some(StyleTarget::Element { authored: None })
 }
 
-/// The authored spellings a visual property can be written as, in preference
+/// The property spellings a visual property may be authored as, in preference
 /// order.
 ///
 /// A fill may be authored as `background-color` or as the `background` shorthand;
@@ -334,7 +598,7 @@ fn rewrite_html(
     original: &str,
     index: &SourceIndex,
     text_edits: &[(NodeId, String)],
-    attribute_edits: Option<&Vec<(NodeId, String)>>,
+    attribute_edits: Option<&BTreeMap<NodeId, Vec<(String, String)>>>,
 ) -> Result<String, BundleError> {
     let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
@@ -342,19 +606,16 @@ fn rewrite_html(
         let Some(binding) = index.find(node) else {
             continue;
         };
-        let element = original.get(binding.element_range.clone()).unwrap_or("");
-        let Some(open_end) = element.find('>') else {
+        // The range recorded when the project was parsed, not one recomputed
+        // from the element's tags: that is what makes this a text edit rather
+        // than a rewrite of the element's content.
+        let Some(range) = binding.text_range.clone() else {
             continue;
         };
-        let inner_start = binding.element_range.start + open_end + 1;
-        // This element's own closing tag. Measured from the end of the
-        // fragment rather than assumed to be a fixed width, because tag names
-        // vary and a void element has none at all.
-        let inner_end = binding.element_range.start + element.rfind("</").unwrap_or(element.len());
-        if inner_end < inner_start {
+        if !original.is_char_boundary(range.start) || !original.is_char_boundary(range.end) {
             continue;
         }
-        replacements.push((inner_start..inner_end, escape_text(text)));
+        replacements.push((range, escape_text(text)));
     }
 
     if let Some(edits) = attribute_edits {
@@ -368,18 +629,20 @@ fn rewrite_html(
             };
             let open_tag = &element[..open_end];
             let absolute = binding.element_range.start;
+            // Merge into whatever the author already wrote on this element, so
+            // a geometry write and a style write share one attribute, and a
+            // hand-written declaration neither of them knows about survives.
+            let merged = merge_inline_declarations(open_tag, declarations);
             match style_attribute_value(open_tag) {
                 // Replace the authored value in place, so the attribute keeps
-                // its position, quoting style, and any declaration this edit did
-                // not touch.
-                Some(range) => replacements.push((
-                    absolute + range.start..absolute + range.end,
-                    declarations.clone(),
-                )),
+                // its position and its quoting style.
+                Some(range) => {
+                    replacements.push((absolute + range.start..absolute + range.end, merged))
+                }
                 // No `style` attribute yet: add one just before the closing `>`.
                 None => {
                     let insert_at = absolute + open_end;
-                    replacements.push((insert_at..insert_at, format!(" style=\"{declarations}\"")));
+                    replacements.push((insert_at..insert_at, format!(" style=\"{merged}\"")));
                 }
             }
         }
@@ -394,6 +657,53 @@ fn rewrite_html(
         }
     }
     Ok(out)
+}
+
+/// Parse an open tag's inline `style` into ordered `(property, value)` pairs.
+///
+/// Order and unknown declarations are preserved, because this is somebody's
+/// source: reordering or dropping a declaration the editor does not understand
+/// would be an edit the user never asked for. A property is lowercased because
+/// CSS property names are case-insensitive and matching must be too.
+fn parse_inline_declarations(open_tag: &str) -> Vec<(String, String)> {
+    let Some(range) = style_attribute_value(open_tag) else {
+        return Vec::new();
+    };
+    open_tag
+        .get(range)
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|part| {
+            let (property, value) = part.split_once(':')?;
+            let property = property.trim().to_ascii_lowercase();
+            let value = value.trim();
+            (!property.is_empty() && !value.is_empty()).then(|| (property, value.to_owned()))
+        })
+        .collect()
+}
+
+/// Apply edits to an element's inline style and render the attribute value.
+///
+/// A property already present is replaced where it stands, so a second save
+/// cannot duplicate it and an unrelated declaration keeps its position. A new
+/// property is appended. The result is always the authored value plus the
+/// edits, never just the edits.
+fn merge_inline_declarations(open_tag: &str, edits: &[(String, String)]) -> String {
+    let mut declarations = parse_inline_declarations(open_tag);
+    for (property, value) in edits {
+        match declarations
+            .iter_mut()
+            .find(|(declared, _)| declared == property)
+        {
+            Some(existing) => existing.1 = value.clone(),
+            None => declarations.push((property.clone(), value.clone())),
+        }
+    }
+    declarations
+        .iter()
+        .map(|(property, value)| format!("{property}: {value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The byte range of an open tag's existing `style` attribute value.
@@ -521,6 +831,47 @@ mod tests {
         Ok(())
     }
 
+    /// Write a throwaway project for the cases the shared fixtures do not cover.
+    ///
+    /// Three files and no more: a fixture is a real authored page, and these
+    /// cases are about one declaration each. `scratch` remains the default
+    /// because most saves are about the projects people actually author.
+    fn project_named(name: &str, html: &str, css: Option<&str>, yaml: &str) -> PathBuf {
+        let to = std::env::temp_dir().join(format!(
+            "spool-save-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&to);
+        std::fs::create_dir_all(&to).expect("create project");
+        std::fs::write(to.join("lamine.yaml"), yaml).expect("write metadata");
+        std::fs::write(to.join("index.html"), html).expect("write html");
+        if let Some(css) = css {
+            std::fs::write(to.join("styles.css"), css).expect("write css");
+        }
+        to
+    }
+
+    /// One node's entry in a `lamine.yaml`, in the shape the bundle reads.
+    fn node_yaml(id: &str, parent: Option<&str>, children: &str) -> String {
+        format!(
+            "  - id: \"{id}\"\n    name: \"{id}\"\n    kind: \"frame\"\n    parent: {parent}\n    file: \"index.html\"\n    selector: \"[data-spool-id=\\\"{id}\\\"]\"\n    children: [{children}]\n",
+            parent = parent
+                .map(|parent| format!("\"{parent}\""))
+                .unwrap_or_else(|| "null".to_owned()),
+        )
+    }
+
+    /// Where a node sits in world coordinates after opening a project.
+    fn position_of(runtime: &crate::canvas::Document, id: &NodeId) -> gpui::Point<f32> {
+        runtime
+            .objects()
+            .iter()
+            .find(|object| &object.spool_id == id)
+            .expect("node is in the runtime")
+            .position
+    }
+
     fn node(id: &str) -> NodeId {
         NodeId::new(id).expect("valid id")
     }
@@ -587,20 +938,36 @@ mod tests {
     fn a_geometry_edit_survives_the_round_trip() {
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
+        // The CTA is in the normal flow, so there is no authored position to
+        // overwrite. The baseline is where the flow puts it, and the editor's
+        // move is an offset from there.
+        let authored = position_of(&loaded.runtime, &node("spool-cta-primary"));
 
         let outcome = save_project(
             &root,
             &loaded.document,
             &[SourceEdit::Geometry {
                 node: node("spool-cta-primary"),
-                x: Some(40.0),
-                y: Some(120.0),
+                placement: Some(Placement::Flow {
+                    dx: 40.0,
+                    dy: 120.0,
+                }),
                 width: Some(220.0),
                 height: Some(48.0),
             }],
         )
         .expect("save");
-        assert!(outcome.unsupported.is_empty());
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(
+            html.contains("transform: translate(40px, 120px)"),
+            "the move stayed in the flow: {html}"
+        );
+        assert!(
+            !html.contains("position: absolute"),
+            "a flow element must not be lifted out of it: {html}"
+        );
 
         let reopened = open_project(&root).expect("reopens");
         let cta = reopened
@@ -618,15 +985,20 @@ mod tests {
             cta.size.width
         );
         assert!((cta.size.height - 48.0).abs() < 0.01);
-        // `position: absolute` with `left`/`top` came back too.
-        assert_eq!(cta.position.x, 40.0);
-        assert_eq!(cta.position.y, 120.0);
+        assert!(
+            (cta.position.x - (authored.x + 40.0)).abs() < 0.01
+                && (cta.position.y - (authored.y + 120.0)).abs() < 0.01,
+            "the element came back where the editor left it: {} vs {}",
+            cta.position,
+            gpui::point(authored.x + 40.0, authored.y + 120.0)
+        );
 
         // Re-saving what came back must not drift: a project opened, edited and
         // saved repeatedly has to converge rather than grow by its padding each
         // round trip. The bytes are compared too, because a duplicated style
         // attribute still parses to the same geometry — only the file on disk
-        // shows the damage.
+        // shows the damage. The reopened project has not been moved again, so
+        // the editor has no move to write — only the size it measured.
         let after_first_save = std::fs::read_to_string(root.join("index.html")).expect("read html");
         let measured = cta.size;
         save_project(
@@ -634,8 +1006,7 @@ mod tests {
             &reopened.document,
             &[SourceEdit::Geometry {
                 node: node("spool-cta-primary"),
-                x: Some(cta.position.x),
-                y: Some(cta.position.y),
+                placement: None,
                 width: Some(measured.width),
                 height: Some(measured.height),
             }],
@@ -654,6 +1025,12 @@ mod tests {
             "a second round trip is a fixed point, got {}x{}",
             cta.size.width,
             cta.size.height
+        );
+        assert!(
+            (cta.position.x - (authored.x + 40.0)).abs() < 0.01
+                && (cta.position.y - (authored.y + 120.0)).abs() < 0.01,
+            "and the offset did not accumulate: {}",
+            cta.position
         );
         assert_eq!(
             std::fs::read_to_string(root.join("index.html")).expect("read html"),
@@ -708,41 +1085,173 @@ mod tests {
     }
 
     #[test]
-    fn a_child_position_is_written_relative_to_the_parent_that_contains_it() {
-        // Absolute positioning is resolved against the containing block, which
-        // is the parent element. Writing a child's world coordinate as its
-        // `left` would put it twice as far right once the parent itself moved.
+    fn a_moved_flow_element_does_not_mention_its_parent() {
+        // A flow element has no position of its own, so a move says nothing
+        // about where its parent is: the two stay independent, and moving the
+        // parent later never requires rewriting the child.
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
-        // The fixture's CTA sits at y = 22.4 inside a frame at y = 0, so 22.4 is
-        // both its world position and its offset from the frame.
+        let before = position_of(&loaded.runtime, &node("spool-cta-primary"));
+
         save_project(
             &root,
             &loaded.document,
             &[SourceEdit::Geometry {
                 node: node("spool-cta-primary"),
-                // Already parent-relative, which is what a second save would
-                // compute from world (22.4) minus parent (0).
-                x: Some(0.0),
-                y: Some(22.4),
+                placement: Some(Placement::Flow { dx: 0.0, dy: 10.0 }),
                 width: None,
                 height: None,
             }],
         )
         .expect("save succeeds");
 
+        let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(html.contains("transform: translate(0px, 10px)"), "{html}");
+        assert!(!html.contains("left:"), "no absolute position: {html}");
+
         let reopened = open_project(&root).expect("reopens");
-        let cta = reopened
-            .runtime
-            .objects()
-            .iter()
-            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
-            .expect("cta survives");
-        assert_eq!(cta.position, gpui::point(0.0, 22.4));
+        let cta = position_of(&reopened.runtime, &node("spool-cta-primary"));
         assert!(
-            (cta.size.height - 46.4).abs() < 0.01,
-            "an unchanged size was not pinned: {}",
-            cta.size.height
+            (cta.y - (before.y + 10.0)).abs() < 0.01,
+            "{cta} vs {before}"
+        );
+        let frame = position_of(&reopened.runtime, &node("spool-frame-root"));
+        assert_eq!(frame, gpui::point(0.0, 0.0), "the parent did not move");
+    }
+
+    #[test]
+    fn an_element_the_author_took_out_of_the_flow_keeps_its_own_coordinates() {
+        // The other half of the policy: a box that is already out of the flow is
+        // written with `left`/`top` from its containing block, and `position` is
+        // not restated — the author already said so, and repeating it locally
+        // would be a second declaration making the same promise.
+        let html = "<!doctype html>\n<body>\n  <div data-spool-id=\"spool-frame-root\" style=\"position: absolute; left: 100px; top: 60px; width: 200px\">\n    <span data-spool-id=\"spool-text-headline\" style=\"position: absolute; left: 4px; top: 6px\">Hello</span>\n  </div>\n</body>\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}",
+            node_yaml("spool-frame-root", None, "\"spool-text-headline\""),
+            node_yaml("spool-text-headline", Some("spool-frame-root"), "")
+        );
+        let root = project_named("absolute", html, None, &yaml);
+        let loaded = open_project(&root).expect("opens");
+        assert!(is_out_of_flow(&loaded.document, &loaded.document.structure.nodes[1]).unwrap());
+
+        // The child is absolute, so its position is written relative to the
+        // parent's containing block. Writing the child's world coordinate would
+        // put it twice as far down once the parent itself moved.
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Geometry {
+                node: node("spool-text-headline"),
+                placement: Some(Placement::ContainingBlock { x: 12.0, y: 20.0 }),
+                width: None,
+                height: None,
+            }],
+        )
+        .expect("save succeeds");
+
+        let after = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(
+            after.contains("left: 12px") && after.contains("top: 20px"),
+            "{after}"
+        );
+        assert!(
+            after.contains(r#"<span data-spool-id="spool-text-headline" style="position: absolute; left: 12px; top: 20px">"#),
+            "an already-absolute element keeps its single `position`, with only the \
+             coordinates rewritten: {after}"
+        );
+
+        let reopened = open_project(&root).expect("reopens");
+        // Parent at 100/60 plus a child at 12/20 from it.
+        assert_eq!(
+            position_of(&reopened.runtime, &node("spool-text-headline")),
+            gpui::point(112.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn a_second_move_adds_to_the_offset_the_author_wrote() {
+        // Moves compose. A drag is a change from where the element already was,
+        // so saving twice must not double the offset — and an author's own
+        // `transform` is part of that baseline, not something to overwrite.
+        let html = "<!doctype html>\n<body>\n  <div data-spool-id=\"spool-frame-root\">\n    <span data-spool-id=\"spool-text-headline\" style=\"transform: translate(10px, 0px)\">Hello</span>\n  </div>\n</body>\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}",
+            node_yaml("spool-frame-root", None, "\"spool-text-headline\""),
+            node_yaml("spool-text-headline", Some("spool-frame-root"), "")
+        );
+        let root = project_named("compose", html, None, &yaml);
+        let loaded = open_project(&root).expect("opens");
+        let before = position_of(&loaded.runtime, &node("spool-text-headline"));
+
+        // Each session the user drags the element 10px to the right of where it
+        // was when that session opened, which is the only information a save
+        // gets. Two sessions, two drags, one authored offset.
+        for _ in 0..2 {
+            let loaded = open_project(&root).expect("opens");
+            save_project(
+                &root,
+                &loaded.document,
+                &[SourceEdit::Geometry {
+                    node: node("spool-text-headline"),
+                    placement: Some(Placement::Flow { dx: 10.0, dy: 0.0 }),
+                    width: None,
+                    height: None,
+                }],
+            )
+            .expect("save succeeds");
+        }
+
+        let after = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        assert!(
+            after.contains("transform: translate(30px, 0px)"),
+            "two moves of the same distance add to the authored offset instead of \
+             replacing it: {after}"
+        );
+        assert_eq!(
+            position_of(
+                &open_project(&root).expect("reopens").runtime,
+                &node("spool-text-headline")
+            ),
+            gpui::point(before.x + 20.0, before.y),
+            "and the element sits where the editor left it"
+        );
+    }
+
+    #[test]
+    fn a_transform_the_editor_cannot_read_is_reported_rather_than_overwritten() {
+        // A rotation is an authored decision. Rewriting it as a translate would
+        // delete it, so the save says so and leaves the file alone.
+        let html = "<!doctype html>\n<body>\n  <div data-spool-id=\"spool-frame-root\">\n    <span data-spool-id=\"spool-text-headline\" style=\"transform: rotate(4deg)\">Hello</span>\n  </div>\n</body>\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}",
+            node_yaml("spool-frame-root", None, "\"spool-text-headline\""),
+            node_yaml("spool-text-headline", Some("spool-frame-root"), "")
+        );
+        let root = project_named("rotated", html, None, &yaml);
+        let loaded = open_project(&root).expect("opens");
+
+        let outcome = save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Geometry {
+                node: node("spool-text-headline"),
+                placement: Some(Placement::Flow { dx: 8.0, dy: 8.0 }),
+                width: None,
+                height: None,
+            }],
+        )
+        .expect("save succeeds");
+        assert_eq!(outcome.unsupported.len(), 1, "{:?}", outcome.unsupported);
+        assert!(
+            outcome.unsupported[0].reason.contains("rotate(4deg)"),
+            "the reason names the conflict: {:?}",
+            outcome.unsupported[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).expect("read html"),
+            html,
+            "and the file is byte-for-byte untouched"
         );
     }
 
@@ -756,8 +1265,27 @@ mod tests {
         assert_eq!(css_length(0.0), "0");
         assert_eq!(css_length(-3.5), "-3.5");
         assert_eq!(
-            geometry_declarations(Some(40.0), Some(22.4), Some(300.0), Some(46.4)),
-            "position: absolute; left: 40px; top: 22.4px; width: 300px; height: 46.4px"
+            merge_inline_declarations(
+                "",
+                &[
+                    ("left".to_owned(), "40px".to_owned()),
+                    ("top".to_owned(), "22.4px".to_owned()),
+                    ("width".to_owned(), "300px".to_owned()),
+                    ("height".to_owned(), "46.4px".to_owned()),
+                ]
+            ),
+            "left: 40px; top: 22.4px; width: 300px; height: 46.4px"
+        );
+        // A position alone must not pin a size the user never changed.
+        assert_eq!(
+            merge_inline_declarations(
+                "",
+                &[
+                    ("left".to_owned(), "10px".to_owned()),
+                    ("top".to_owned(), "20px".to_owned())
+                ]
+            ),
+            "left: 10px; top: 20px"
         );
     }
 
@@ -845,6 +1373,7 @@ mod tests {
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
         let target = node("spool-cta-primary");
+        let flowed = position_of(&loaded.runtime, &target);
         save_project(
             &root,
             &loaded.document,
@@ -855,8 +1384,7 @@ mod tests {
                 },
                 SourceEdit::Geometry {
                     node: target.clone(),
-                    x: Some(10.0),
-                    y: Some(20.0),
+                    placement: Some(Placement::Flow { dx: 10.0, dy: 20.0 }),
                     width: Some(200.0),
                     height: Some(40.0),
                 },
@@ -872,7 +1400,12 @@ mod tests {
             .find(|object| object.spool_id == target)
             .expect("cta survives");
         assert_eq!(cta.text_content.as_deref(), Some("Start now"));
-        assert_eq!(cta.position, gpui::point(10.0, 20.0));
+        assert!(
+            (cta.position.x - (flowed.x + 10.0)).abs() < 0.01
+                && (cta.position.y - (flowed.y + 20.0)).abs() < 0.01,
+            "the move is an offset on top of where the flow put it: {} vs {flowed}",
+            cta.position
+        );
         assert_eq!(cta.size.width, 200.0);
         let html = std::fs::read_to_string(root.join("index.html")).expect("read html");
         assert_eq!(
@@ -887,12 +1420,14 @@ mod tests {
     }
 
     #[test]
-    fn a_style_edit_with_no_authored_owner_is_reported_not_invented() {
+    fn a_style_edit_with_no_authored_owner_becomes_a_local_declaration() {
         let root = scratch("landing");
         let loaded = open_project(&root).expect("opens");
         let before = std::fs::read_to_string(root.join("styles.css")).unwrap();
 
-        // No declaration of `letter-spacing` exists anywhere in this project.
+        // Nothing in this project declares `letter-spacing` for the headline.
+        // The policy is to give the element its own declaration rather than to
+        // invent a rule in the stylesheet or to refuse the edit.
         let outcome = save_project(
             &root,
             &loaded.document,
@@ -902,13 +1437,171 @@ mod tests {
                 value: "2px".into(),
             }],
         )
-        .expect("save does not fail, it reports");
+        .expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
 
-        assert_eq!(outcome.unsupported.len(), 1, "the edit was reported");
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(
+            html.contains(
+                r#"<h1 data-spool-id="spool-text-headline" style="letter-spacing: 2px">"#
+            ),
+            "the declaration landed on the element itself: {html}"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("styles.css")).unwrap(),
             before,
-            "no rule was invented to hold the edit"
+            "and no rule was invented in the stylesheet"
+        );
+    }
+
+    #[test]
+    fn editing_an_inherited_property_writes_it_on_the_element_not_on_the_ancestor() {
+        // The headline's colour comes from `body`. Editing the headline must not
+        // restyle every element that inherits from body — that would change
+        // objects the user never selected.
+        let root = scratch("landing");
+        let loaded = open_project(&root).expect("opens");
+        let css_before = std::fs::read_to_string(root.join("styles.css")).unwrap();
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-text-headline"),
+                property: "color".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(
+            html.contains(r#"<h1 data-spool-id="spool-text-headline" style="color: #ff0000">"#),
+            "the headline now owns its colour: {html}"
+        );
+        assert!(
+            !html.contains(r#"<main data-spool-id="spool-frame-root" style="color"#),
+            "and the frame that inherited it was not touched: {html}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("styles.css")).unwrap(),
+            css_before,
+            "body's rule is untouched"
+        );
+    }
+
+    #[test]
+    fn a_geometry_edit_and_a_style_edit_share_one_inline_attribute() {
+        // Both target the same element. Written separately they would either
+        // duplicate the attribute or the second would erase the first.
+        let root = scratch("landing");
+        let loaded = open_project(&root).expect("opens");
+        let target = node("spool-cta-primary");
+        save_project(
+            &root,
+            &loaded.document,
+            &[
+                SourceEdit::Geometry {
+                    node: target.clone(),
+                    placement: Some(Placement::Flow { dx: 30.0, dy: 40.0 }),
+                    width: None,
+                    height: None,
+                },
+                SourceEdit::Style {
+                    node: target.clone(),
+                    property: "border-radius".into(),
+                    value: "12px".into(),
+                },
+                SourceEdit::Style {
+                    node: target.clone(),
+                    property: "opacity".into(),
+                    value: "0.5".into(),
+                },
+            ],
+        )
+        .expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert_eq!(
+            html.matches("style=").count(),
+            1,
+            "one attribute holds the geometry and the unowned property: {html}"
+        );
+        assert!(
+            html.contains("transform: translate(30px, 40px)"),
+            "geometry is inline: {html}"
+        );
+        assert!(
+            html.contains("opacity: 0.5"),
+            "nothing authored an opacity, so it became a local declaration: {html}"
+        );
+
+        // `border-radius` is declared by `.cta`, so ownership sends that edit to
+        // the stylesheet instead — one attribute on the element, one declaration
+        // in the file that already owned it.
+        let css = std::fs::read_to_string(root.join("styles.css")).unwrap();
+        assert!(
+            css.contains("border-radius: 12px"),
+            "radius is in the rule: {css}"
+        );
+        assert_eq!(
+            css.matches("border-radius").count(),
+            1,
+            "rewritten in place, not duplicated: {css}"
+        );
+
+        // And a repeated edit of the same value changes nothing.
+        let reopened = open_project(&root).expect("reopens");
+        save_project(
+            &root,
+            &reopened.document,
+            &[SourceEdit::Style {
+                node: target.clone(),
+                property: "border-radius".into(),
+                value: "12px".into(),
+            }],
+        )
+        .expect("save succeeds");
+        assert_eq!(
+            std::fs::read_to_string(root.join("styles.css")).unwrap(),
+            css,
+            "a repeated edit is idempotent"
+        );
+    }
+
+    #[test]
+    fn a_hand_written_inline_declaration_survives_an_unrelated_edit() {
+        // The author wrote `z-index` by hand. Moving the element must not delete
+        // it: the editor merges into the existing value rather than replacing it.
+        let root = scratch("landing");
+        let html = std::fs::read_to_string(root.join("index.html")).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            html.replace(
+                r#"<h1 data-spool-id="spool-text-headline">"#,
+                r#"<h1 data-spool-id="spool-text-headline" style="z-index: 3">"#,
+            ),
+        )
+        .unwrap();
+        let loaded = open_project(&root).expect("opens");
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Geometry {
+                node: node("spool-text-headline"),
+                placement: Some(Placement::Flow { dx: 5.0, dy: 6.0 }),
+                width: None,
+                height: None,
+            }],
+        )
+        .expect("save succeeds");
+
+        let after = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(after.contains("z-index: 3"), "kept: {after}");
+        assert!(
+            after.contains("transform: translate(5px, 6px)"),
+            "and the move landed too: {after}"
         );
     }
 

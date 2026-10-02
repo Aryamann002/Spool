@@ -183,6 +183,10 @@ pub struct ProjectedNode {
     /// Resolved paint. `None` on both means the renderer default still applies.
     pub fill: Option<Fill>,
     pub stroke: Option<Stroke>,
+    /// CSS `border-radius` in pixels, zero when unauthored.
+    pub border_radius: f32,
+    /// CSS `opacity`, 1.0 when unauthored.
+    pub opacity: f32,
 }
 
 /// A disposable runtime view of a [`PersistentDocument`].
@@ -263,6 +267,14 @@ impl RuntimeProjection {
                 font_size: visuals.get(&node.id).map(|v| v.font_size).unwrap_or(16.0),
                 fill: visuals.get(&node.id).and_then(|v| v.style.fill),
                 stroke: visuals.get(&node.id).and_then(|v| v.style.stroke),
+                border_radius: visuals
+                    .get(&node.id)
+                    .map(|v| v.style.border_radius)
+                    .unwrap_or(0.0),
+                opacity: visuals
+                    .get(&node.id)
+                    .map(|v| v.style.opacity)
+                    .unwrap_or(1.0),
             });
         }
 
@@ -379,6 +391,11 @@ impl RuntimeProjection {
                     font_size: (node.font_size > 0.0).then_some(node.font_size),
                     fill: node.fill,
                     stroke: node.stroke,
+                    // Resolved paint the renderer applies directly. A zero
+                    // radius or full opacity is what "nobody authored it" looks
+                    // like once it is a concrete value.
+                    border_radius: node.border_radius,
+                    opacity: node.opacity,
                 })
             })
             .collect()

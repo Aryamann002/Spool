@@ -56,6 +56,7 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "right",
     "text-align",
     "top",
+    "transform",
     "width",
 ];
 
@@ -407,6 +408,43 @@ pub fn parse_length(value: &str) -> Option<f32> {
     numeric.trim().parse::<f32>().ok()
 }
 
+/// Parse a unitless CSS number, such as an `opacity` or a unitless `line-height`.
+///
+/// Distinct from [`parse_length`], which accepts the same syntax plus `px`:
+/// accepting `px` here would let `opacity: 0.5px` through, which is not a
+/// number CSS would accept.
+pub fn parse_number(value: &str) -> Option<f32> {
+    let value = value.trim();
+    // A percentage is a different unit of opacity, and this subset does not
+    // resolve it. Refusing it is better than reading `50%` as 50.
+    if value.ends_with('%') {
+        return None;
+    }
+    value.parse::<f32>().ok()
+}
+
+/// Parse `transform: translate(<x>, <y>)` into a pixel offset.
+///
+/// Only the `translate` function, and only a two-argument pixel one, is
+/// understood. Every other transform — rotate, scale, a matrix, a percentage —
+/// returns `None` rather than being approximated, because guessing at a
+/// transform would move an element somewhere the author never asked for.
+///
+/// This is what lets a moved element keep its place in the flow instead of
+/// being lifted out of it.
+pub fn parse_translate(value: &str) -> Option<(f32, f32)> {
+    let value = value.trim();
+    let inner = value.strip_prefix("translate(")?.strip_suffix(')')?;
+    let mut parts = inner.split(',').map(str::trim);
+    let x = parse_length(parts.next()?)?;
+    let y = parse_length(parts.next()?)?;
+    // A third component would be a translateZ this subset does not model.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((x, y))
+}
+
 /// Parse a one-to-four component box value such as `12px 20px` or `0`.
 pub fn parse_box(value: &str) -> Option<[f32; 4]> {
     let parts: Vec<f32> = value
@@ -473,14 +511,53 @@ a { background-color: #ffffff; padding: 4px; }
 
     #[test]
     fn an_unsupported_property_is_skipped_rather_than_approximated() {
-        // `transform` and `text-decoration` are real CSS. This milestone does
-        // not implement them, and silently approximating them would produce a
-        // visual nobody authored. They must simply not resolve.
-        let source = ".cta { transform: rotate(4deg); text-decoration: none; color: #ffffff; }";
+        // `text-decoration` is real CSS. This milestone does not implement it,
+        // and silently approximating it would produce a visual nobody
+        // authored. It must simply not resolve.
+        let source = ".cta { text-decoration: none; color: #ffffff; }";
         let resolved = resolved_map(source, "a", &["cta"]);
-        assert!(!resolved.contains_key("transform"));
         assert!(!resolved.contains_key("text-decoration"));
         assert_eq!(resolved.get("color").map(String::as_str), Some("#ffffff"));
+    }
+
+    #[test]
+    fn a_supported_property_in_an_unreadable_form_is_not_approximated() {
+        // `transform` is a supported property, but only the two-argument pixel
+        // `translate` is understood. A rotation is carried through resolution
+        // as authored text — it is the consumer that must decline it, because
+        // reading `rotate(4deg)` as a translate would move an element
+        // somewhere the author never asked for.
+        let source = ".cta { transform: rotate(4deg); }";
+        let resolved = resolved_map(source, "a", &["cta"]);
+        assert_eq!(
+            resolved.get("transform").map(String::as_str),
+            Some("rotate(4deg)"),
+            "resolution keeps the authored value; it does not drop or rewrite it"
+        );
+        assert_eq!(parse_translate("rotate(4deg)"), None);
+    }
+
+    #[test]
+    fn a_two_argument_pixel_translate_is_read_as_an_offset() {
+        assert_eq!(parse_translate("translate(12px, -4px)"), Some((12.0, -4.0)));
+        assert_eq!(parse_translate("  translate( 8 , 2 )  "), Some((8.0, 2.0)));
+    }
+
+    #[test]
+    fn a_translate_the_subset_cannot_read_is_refused() {
+        // A third component is a translateZ, a percentage needs a containing
+        // block, and a named function is not an offset. None of them is `None`
+        // of a single-argument translate; all are "not understood".
+        for value in [
+            "translate(4px, 8px, 9px)",
+            "translate(50%, 50%)",
+            "translateX(12px)",
+            "scale(2)",
+            "translate(4px)",
+            "none",
+        ] {
+            assert_eq!(parse_translate(value), None, "{value} is not an offset");
+        }
     }
 
     #[test]

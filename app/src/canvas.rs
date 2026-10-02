@@ -311,6 +311,38 @@ pub struct Stroke {
 pub struct ObjectStyle {
     pub fill: Option<Fill>,
     pub stroke: Option<Stroke>,
+    /// Corner radius in pixels; zero means square.
+    ///
+    /// Mirrors CSS `border-radius`. Carried in the style rather than folded
+    /// into geometry because it is paint, not layout.
+    pub border_radius: f32,
+    /// Alpha from 0 to 1. Mirrors CSS `opacity`.
+    pub opacity: f32,
+}
+
+impl Default for ObjectStyle {
+    fn default() -> Self {
+        Self {
+            fill: None,
+            stroke: None,
+            border_radius: 0.0,
+            opacity: 1.0,
+        }
+    }
+}
+
+/// Everything about one object's appearance that the editor can change.
+///
+/// One snapshot per object, so undo restores the appearance as it was rather
+/// than trying to reverse individual properties. Keeping text colour and font
+/// size here — rather than beside it on the object — is what lets one style edit
+/// cover "the label got smaller and darker" as a single history entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Appearance {
+    pub style: ObjectStyle,
+    pub text_color: Option<Color>,
+    /// Authored CSS `font-size` in pixels, when one was authored.
+    pub font_size: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -318,6 +350,15 @@ pub enum StyleEdit {
     Fill(Option<Color>),
     Stroke(Option<Color>),
     StrokeWidth(f32),
+    /// Text colour. `None` removes an explicit colour and lets the renderer
+    /// choose one again.
+    TextColor(Option<Color>),
+    /// Font size in pixels.
+    FontSize(f32),
+    /// Corner radius in pixels.
+    BorderRadius(f32),
+    /// Alpha from 0 to 1, clamped.
+    Opacity(f32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -355,6 +396,10 @@ pub struct DesignObject {
     pub font_size: Option<f32>,
     pub fill: Option<Fill>,
     pub stroke: Option<Stroke>,
+    /// CSS `border-radius` in pixels; zero means square corners.
+    pub border_radius: f32,
+    /// CSS `opacity`, 0 to 1.
+    pub opacity: f32,
 }
 
 impl DesignObject {
@@ -381,6 +426,19 @@ pub struct Geometry {
 
 type ObjectGeometry = Geometry;
 
+/// An Inspector geometry change that has not been recorded yet.
+///
+/// The Inspector owns the widget; the canvas owns the document and the history
+/// boundary. Keeping the boundary here is what stops a continuous control from
+/// becoming one history entry per pointer movement: the shell drags, and the
+/// whole drag is one operation when it ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeometryScrub {
+    pub id: ObjectId,
+    /// The geometry the object had before the scrub started.
+    pub before: Geometry,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GeometryChange {
     pub id: ObjectId,
@@ -391,8 +449,8 @@ pub struct GeometryChange {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleChange {
     pub id: ObjectId,
-    pub before: ObjectStyle,
-    pub after: ObjectStyle,
+    pub before: Appearance,
+    pub after: Appearance,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,7 +570,7 @@ impl DocumentCommand {
             }
             CommandOperation::Style(changes) => {
                 for change in changes {
-                    document.set_style(
+                    document.set_appearance(
                         change.id,
                         if forward { change.after } else { change.before },
                     );
@@ -722,6 +780,22 @@ impl Document {
         self.object(id)?.text_content.as_deref()
     }
 
+    /// Mirror a new name from the persistent document onto the runtime object.
+    ///
+    /// Not a second place a name can be edited: the persistent document is the
+    /// authority, and this only refreshes the copy the Inspector and the layers
+    /// list read. Called after a rename, never instead of one.
+    pub fn set_object_name(&mut self, id: ObjectId, name: String) -> bool {
+        let Some(object) = self.objects.iter_mut().find(|object| object.id == id) else {
+            return false;
+        };
+        if object.name == name {
+            return false;
+        }
+        object.name = name;
+        true
+    }
+
     pub fn set_text_content(&mut self, id: ObjectId, text: String) -> bool {
         let Some(object) = self.objects.iter_mut().find(|object| object.id == id) else {
             return false;
@@ -829,6 +903,8 @@ impl Document {
             font_size: None,
             fill: default_style(object_type).fill,
             stroke: default_style(object_type).stroke,
+            border_radius: default_style(object_type).border_radius,
+            opacity: 1.0,
         };
         self.insert_object(object.clone(), self.objects.len());
         object
@@ -896,18 +972,42 @@ impl Document {
     }
 
     fn style(&self, id: ObjectId) -> Option<ObjectStyle> {
-        self.object(id).map(|object| ObjectStyle {
-            fill: object.fill,
-            stroke: object.stroke,
+        self.appearance(id).map(|appearance| appearance.style)
+    }
+
+    /// The full appearance of an object: paint plus its text styling.
+    pub fn appearance(&self, id: ObjectId) -> Option<Appearance> {
+        self.object(id).map(|object| Appearance {
+            style: ObjectStyle {
+                fill: object.fill,
+                stroke: object.stroke,
+                border_radius: object.border_radius,
+                opacity: object.opacity,
+            },
+            text_color: object.text_color,
+            font_size: object.font_size,
         })
     }
 
     pub fn set_style(&mut self, id: ObjectId, style: ObjectStyle) -> bool {
+        let Some(current) = self.appearance(id) else {
+            return false;
+        };
+        self.set_appearance(id, Appearance { style, ..current })
+    }
+
+    /// Apply a whole appearance. The single write path for every style edit,
+    /// so a replayed history entry restores exactly what it recorded.
+    pub fn set_appearance(&mut self, id: ObjectId, appearance: Appearance) -> bool {
         let Some(object) = self.objects.iter_mut().find(|object| object.id == id) else {
             return false;
         };
-        object.fill = style.fill;
-        object.stroke = style.stroke;
+        object.fill = appearance.style.fill;
+        object.stroke = appearance.style.stroke;
+        object.border_radius = appearance.style.border_radius;
+        object.opacity = appearance.style.opacity;
+        object.text_color = appearance.text_color;
+        object.font_size = appearance.font_size;
         true
     }
 
@@ -979,6 +1079,8 @@ fn frame(
         font_size: None,
         fill: default_style(ObjectType::Frame).fill,
         stroke: default_style(ObjectType::Frame).stroke,
+        border_radius: default_style(ObjectType::Frame).border_radius,
+        opacity: 1.0,
     }
 }
 
@@ -986,8 +1088,13 @@ fn node_id(value: impl Into<String>) -> NodeId {
     NodeId::new(value).expect("generated Spool node IDs use the validated identifier alphabet")
 }
 
-fn edited_style(mut style: ObjectStyle, edit: StyleEdit) -> ObjectStyle {
+fn edited_style(mut appearance: Appearance, edit: StyleEdit) -> Appearance {
+    let style = &mut appearance.style;
     match edit {
+        StyleEdit::TextColor(color) => appearance.text_color = color,
+        StyleEdit::FontSize(size) => appearance.font_size = Some(size.max(1.0)),
+        StyleEdit::BorderRadius(radius) => style.border_radius = radius.max(0.0),
+        StyleEdit::Opacity(alpha) => style.opacity = alpha.clamp(0.0, 1.0),
         StyleEdit::Fill(color) => style.fill = color.map(|color| Fill { color }),
         StyleEdit::Stroke(color) => {
             style.stroke = color.map(|color| Stroke {
@@ -1002,33 +1109,34 @@ fn edited_style(mut style: ObjectStyle, edit: StyleEdit) -> ObjectStyle {
             style.stroke = Some(Stroke { color, width });
         }
     }
-    style
+    appearance
 }
 
 fn default_style(object_type: ObjectType) -> ObjectStyle {
-    match object_type {
-        ObjectType::Frame => ObjectStyle {
-            fill: Some(Fill {
+    ObjectStyle {
+        fill: match object_type {
+            ObjectType::Frame => Some(Fill {
                 color: Color::from_rgb(theme::PAPER),
             }),
-            stroke: Some(Stroke {
-                color: Color::from_rgb(theme::BORDER),
-                width: 1.0,
-            }),
-        },
-        ObjectType::Rectangle | ObjectType::Ellipse => ObjectStyle {
-            fill: Some(Fill {
+            ObjectType::Rectangle | ObjectType::Ellipse => Some(Fill {
                 color: Color::from_rgb(theme::SURFACE_RAISED),
             }),
-            stroke: Some(Stroke {
+            ObjectType::Text => None,
+        },
+        stroke: match object_type {
+            ObjectType::Text => None,
+            _ => Some(Stroke {
                 color: Color::from_rgb(theme::BORDER),
                 width: 1.0,
             }),
         },
-        ObjectType::Text => ObjectStyle {
-            fill: None,
-            stroke: None,
+        // Only a shape gets a default radius; giving every object one would
+        // look like a decision the editor made on the author's behalf.
+        border_radius: match object_type {
+            ObjectType::Rectangle | ObjectType::Ellipse => 4.0,
+            _ => 0.0,
         },
+        opacity: 1.0,
     }
 }
 
@@ -1378,10 +1486,27 @@ struct TextEditState {
 #[derive(Clone, Debug, PartialEq)]
 struct SourceSnapshot {
     position: Point<f32>,
+    /// Where the object sat relative to its parent's origin when it was opened.
+    ///
+    /// The baseline a flow element's move is measured from. A flow box has no
+    /// authored position of its own — the flow decides it — so the editor's only
+    /// honest way to express "the user moved this" is as a change from the
+    /// position the author wrote, not as an absolute coordinate.
+    parent_relative: Point<f32>,
     size: Size<f32>,
     text: Option<String>,
-    fill: Option<Fill>,
-    stroke: Option<Stroke>,
+    /// How the object looked when it was opened, so save can tell a user edit
+    /// from an authored value. The same shape undo restores, which keeps the two
+    /// paths from drifting apart.
+    appearance: Appearance,
+}
+
+/// Component-wise difference between two points.
+///
+/// Used to express a world position relative to a containing block, which is
+/// the coordinate system an authored `left`/`top` lives in.
+fn sub_point(a: Point<f32>, b: Point<f32>) -> Point<f32> {
+    point(a.x - b.x, a.y - b.y)
 }
 
 /// Format a colour the way source spells it.
@@ -1437,6 +1562,73 @@ pub struct CanvasView {
     /// Debug-only: true pre-gesture positions for the runtime history probe.
     #[cfg(debug_assertions)]
     drag_start_positions: Vec<(f32, f32)>,
+}
+
+/// Turn a changed appearance into one source edit per property that moved.
+///
+/// Only what actually changed becomes an edit. A change the editor cannot
+/// express in the supported CSS subset — removing a fill, clearing an authored
+/// text colour — produces no edit at all rather than a guessed one.
+fn style_edits(
+    node: &NodeId,
+    before: &Appearance,
+    after: &Appearance,
+) -> Vec<crate::project_save::SourceEdit> {
+    let mut edits = Vec::new();
+    let mut push = |property: &str, value: String| {
+        edits.push(crate::project_save::SourceEdit::Style {
+            node: node.clone(),
+            property: property.to_owned(),
+            value,
+        });
+    };
+
+    if before.style.fill != after.style.fill {
+        if let Some(fill) = after.style.fill {
+            push("background-color", css_color(fill.color));
+        }
+    }
+    if before.style.stroke != after.style.stroke {
+        if let Some(stroke) = after.style.stroke {
+            push(
+                "border",
+                format!(
+                    "{}px {}",
+                    crate::project_save::css_length(stroke.width),
+                    css_color(stroke.color)
+                ),
+            );
+        }
+    }
+    if before.text_color != after.text_color {
+        if let Some(color) = after.text_color {
+            push("color", css_color(color));
+        }
+    }
+    if before.font_size != after.font_size {
+        if let Some(size) = after.font_size {
+            push(
+                "font-size",
+                format!("{}px", crate::project_save::css_length(size)),
+            );
+        }
+    }
+    if before.style.border_radius != after.style.border_radius {
+        push(
+            "border-radius",
+            format!(
+                "{}px",
+                crate::project_save::css_length(after.style.border_radius)
+            ),
+        );
+    }
+    if before.style.opacity != after.style.opacity {
+        push(
+            "opacity",
+            crate::project_save::css_length(after.style.opacity),
+        );
+    }
+    edits
 }
 
 impl CanvasView {
@@ -1495,26 +1687,12 @@ impl CanvasView {
     /// would be meaningless rather than merely stale.
     pub fn load_project(&mut self, loaded: crate::project_open::LoadedProject) {
         self.project_root = Some(loaded.root.clone());
-        // Snapshot the runtime appearance before any edit, so save can tell an
-        // authored value from a change the user made in this session.
-        self.source_snapshot = loaded
-            .runtime
-            .objects()
-            .iter()
-            .map(|object| {
-                (
-                    object.spool_id.clone(),
-                    SourceSnapshot {
-                        position: object.position,
-                        size: object.size,
-                        text: object.text_content.clone(),
-                        fill: object.fill,
-                        stroke: object.stroke,
-                    },
-                )
-            })
-            .collect();
         self.session = EditSession::new(loaded.document, loaded.runtime);
+        // Snapshot the runtime state before any edit, so save can tell an
+        // authored value from a change the user made in this session. Taken
+        // after the session exists because the snapshot needs each object's
+        // parent origin, which is resolved through the runtime.
+        self.source_snapshot = self.opened_state();
         // A freshly loaded document has no selection, and keeping stale ids
         // would let hit-testing and layers refer to objects that no longer
         // exist.
@@ -1525,6 +1703,41 @@ impl CanvasView {
         // Projected objects are laid out by the projection's own placeholder
         // rule, so fitting the camera is what actually brings them on screen.
         self.camera.fit();
+    }
+
+    /// The runtime state the project was opened with, for every managed object.
+    ///
+    /// Derived state on the view, never in the document: this is how save
+    /// answers "did the user change this?" without recording anything new
+    /// anywhere.
+    fn opened_state(&self) -> BTreeMap<NodeId, SourceSnapshot> {
+        self.session
+            .runtime
+            .objects()
+            .iter()
+            .map(|object| {
+                let parent_origin = self.parent_origin(&object.spool_id);
+                (
+                    object.spool_id.clone(),
+                    SourceSnapshot {
+                        position: object.position,
+                        parent_relative: sub_point(object.position, parent_origin),
+                        size: object.size,
+                        text: object.text_content.clone(),
+                        appearance: Appearance {
+                            style: ObjectStyle {
+                                fill: object.fill,
+                                stroke: object.stroke,
+                                border_radius: object.border_radius,
+                                opacity: object.opacity,
+                            },
+                            text_color: object.text_color,
+                            font_size: object.font_size,
+                        },
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Where a node's containing block starts, in world coordinates.
@@ -1564,9 +1777,11 @@ impl CanvasView {
     /// change, and the save layer turns each into the smallest authored edit it
     /// can:
     ///
-    /// - geometry becomes an inline `style` on the element
+    /// - geometry becomes a `style` attribute on the element: a size outright,
+    ///   and a position as `left`/`top` for a box already out of the flow or
+    ///   `transform: translate(...)` for one that is in it
     /// - text replaces the element's authored text
-    /// - fill and stroke rewrite the CSS declaration that already owns them
+    /// - style rewrites the CSS declaration that already owns the property
     /// - metadata is written by the existing bundle writer
     ///
     /// Objects created during the session have no authored element yet, so they
@@ -1624,15 +1839,47 @@ impl CanvasView {
                 let moved = before.position != geometry.position;
                 let resized = before.size != geometry.size;
                 if moved || resized {
-                    // An absolute `left`/`top` is measured from the containing
-                    // block, which is the parent element. The editor works in
-                    // world coordinates, so a child has to be written relative
-                    // to where its parent now sits or it would jump on reopen.
                     let parent_origin = self.parent_origin(&object.spool_id);
+                    let placement = moved.then(|| {
+                        let Some(structure) = self
+                            .session
+                            .document
+                            .structure
+                            .nodes
+                            .iter()
+                            .find(|node| node.id == object.spool_id)
+                        else {
+                            return crate::project_save::Placement::Flow { dx: 0.0, dy: 0.0 };
+                        };
+                        // Already out of the flow: keep it that way and write a
+                        // position from the containing block, which is the
+                        // parent element. The editor works in world
+                        // coordinates, so a child has to be written relative to
+                        // where its parent now sits or it would jump on reopen.
+                        if crate::project_save::is_out_of_flow(&self.session.document, structure)
+                            .unwrap_or(false)
+                        {
+                            return crate::project_save::Placement::ContainingBlock {
+                                x: geometry.position.x - parent_origin.x,
+                                y: geometry.position.y - parent_origin.y,
+                            };
+                        }
+                        // In the flow: the authored position is wherever the
+                        // flow puts this element, so the edit is the change from
+                        // that — never an absolute coordinate, which would
+                        // delete the author's layout. Measured against the
+                        // parent origin *as it is now*, so a child that only
+                        // moved because its parent did writes nothing: in the
+                        // flow a child's position is its parent's business.
+                        let now = sub_point(geometry.position, parent_origin);
+                        crate::project_save::Placement::Flow {
+                            dx: now.x - before.parent_relative.x,
+                            dy: now.y - before.parent_relative.y,
+                        }
+                    });
                     edits.push(crate::project_save::SourceEdit::Geometry {
                         node: object.spool_id.clone(),
-                        x: moved.then_some(geometry.position.x - parent_origin.x),
-                        y: moved.then_some(geometry.position.y - parent_origin.y),
+                        placement,
                         width: resized.then_some(geometry.size.width),
                         height: resized.then_some(geometry.size.height),
                     });
@@ -1645,24 +1892,17 @@ impl CanvasView {
                     text: text.clone(),
                 });
             }
-            if before.fill != object.fill {
-                if let Some(fill) = object.fill {
-                    edits.push(crate::project_save::SourceEdit::Style {
-                        node: object.spool_id.clone(),
-                        property: "background-color".into(),
-                        value: css_color(fill.color),
-                    });
-                }
-            }
-            if before.stroke != object.stroke {
-                if let Some(stroke) = object.stroke {
-                    edits.push(crate::project_save::SourceEdit::Style {
-                        node: object.spool_id.clone(),
-                        property: "border".into(),
-                        value: format!("{}px {}", stroke.width, css_color(stroke.color)),
-                    });
-                }
-            }
+            let now = Appearance {
+                style: ObjectStyle {
+                    fill: object.fill,
+                    stroke: object.stroke,
+                    border_radius: object.border_radius,
+                    opacity: object.opacity,
+                },
+                text_color: object.text_color,
+                font_size: object.font_size,
+            };
+            edits.extend(style_edits(&object.spool_id, &before.appearance, &now));
         }
         let mut written = crate::project_save::save_project(root, &self.session.document, &edits)?;
         written.unsupported.append(&mut outcome.unsupported);
@@ -1684,6 +1924,28 @@ impl CanvasView {
 
     pub fn is_text_editing(&self) -> bool {
         self.text_edit.is_some()
+    }
+
+    /// The object under a world point that has text a user would expect to
+    /// edit.
+    ///
+    /// Not "anything typed as text": a source-backed `<a class="cta">` is
+    /// declared as a frame in `lamine.yaml` yet carries a label, and refusing to
+    /// edit it would make a correctly loaded project uneditable. The rule is
+    /// what the user sees — a non-empty text run — and it is the same rule the
+    /// renderer draws by.
+    fn editable_text_at(&self, world: Point<f32>) -> Option<ObjectId> {
+        let id = self.session.runtime.hit_test(world)?;
+        self.session
+            .runtime
+            .object(id)
+            .filter(|object| {
+                object
+                    .text_content
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+            })
+            .map(|object| object.id)
     }
 
     fn begin_text_edit(&mut self, id: ObjectId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1985,6 +2247,7 @@ impl CanvasView {
         let changed = self.session.undo().unwrap_or(false);
         if changed {
             self.retain_existing_selection();
+            self.refresh_object_names();
         }
         changed
     }
@@ -1999,6 +2262,7 @@ impl CanvasView {
         let changed = self.session.redo().unwrap_or(false);
         if changed {
             self.retain_existing_selection();
+            self.refresh_object_names();
         }
         changed
     }
@@ -2050,7 +2314,7 @@ impl CanvasView {
             .ids()
             .iter()
             .filter_map(|id| {
-                let before = self.session.runtime.style(*id)?;
+                let before = self.session.runtime.appearance(*id)?;
                 let after = edited_style(before, edit);
                 (before != after).then_some(StyleChange {
                     id: *id,
@@ -2063,10 +2327,182 @@ impl CanvasView {
             return false;
         }
         for change in &changes {
-            self.session.runtime.set_style(change.id, change.after);
+            self.session.runtime.set_appearance(change.id, change.after);
         }
         self.commit(DocumentCommand::style(changes));
         true
+    }
+
+    /// Replace one object's text as a single semantic operation.
+    ///
+    /// The same command a committed caret edit produces, for callers that
+    /// already know the text. It goes through the same history boundary rather
+    /// than around it: one call is one undo step, undo restores the exact
+    /// previous run of text, and redo re-applies this one. Used by the runtime
+    /// probe and by anything that needs to set text without a caret.
+    pub fn set_object_text(&mut self, id: ObjectId, text: String) -> bool {
+        self.commit_text_edit();
+        let Some(before) = self.session.runtime.text_content(id).map(str::to_owned) else {
+            return false;
+        };
+        if before == text {
+            return false;
+        }
+        let Some(change) = self
+            .session
+            .runtime
+            .set_text_content(id, text.clone())
+            .then_some(TextChange {
+                id,
+                before,
+                after: text,
+            })
+        else {
+            return false;
+        };
+        self.commit(DocumentCommand::text(vec![change]));
+        true
+    }
+
+    /// One object's current geometry.
+    ///
+    /// Read through this rather than reaching into the document from the shell:
+    /// the Inspector shows what the runtime holds, which is the same value the
+    /// canvas draws and the same one save diffs against.
+    pub fn object_geometry(&self, id: ObjectId) -> Option<Geometry> {
+        self.session.runtime.geometry(id)
+    }
+
+    /// Set one object's geometry as a single semantic operation.
+    ///
+    /// The Inspector's way of asking the same question a canvas drag asks. It
+    /// goes through the same history boundary instead of writing geometry
+    /// beside it, so one call is one undo step, a value that lands where it
+    /// started records nothing, and the document stays the only place a new
+    /// position lives.
+    pub fn set_object_geometry(&mut self, id: ObjectId, geometry: Geometry) -> bool {
+        self.commit_text_edit();
+        let Some(before) = self.session.runtime.geometry(id) else {
+            return false;
+        };
+        self.commit_geometry_change(id, before, geometry)
+    }
+
+    /// Start an Inspector geometry change that is not recorded yet.
+    ///
+    /// Returns the geometry the object had, which the caller has to hand back
+    /// on commit or cancel: while a continuous control is being dragged the
+    /// runtime already shows the new value, and only this remembers where it
+    /// started.
+    pub fn begin_geometry_scrub(&mut self, id: ObjectId) -> Option<GeometryScrub> {
+        self.commit_text_edit();
+        let before = self.session.runtime.geometry(id)?;
+        Some(GeometryScrub { id, before })
+    }
+
+    /// Move a scrubbing object without recording anything.
+    pub fn scrub_geometry(&mut self, scrub: &GeometryScrub, geometry: Geometry) -> bool {
+        self.session.runtime.set_geometry(scrub.id, geometry)
+    }
+
+    /// Finish a scrub as one semantic operation.
+    ///
+    /// A scrub that ended where it started records nothing, exactly as a canvas
+    /// drag that returns to its origin does.
+    pub fn commit_geometry_scrub(&mut self, scrub: GeometryScrub) -> bool {
+        let Some(after) = self.session.runtime.geometry(scrub.id) else {
+            return false;
+        };
+        self.commit_geometry_change(scrub.id, scrub.before, after)
+    }
+
+    /// Abandon a scrub: the runtime goes back to where it started and nothing is
+    /// recorded.
+    pub fn cancel_geometry_scrub(&mut self, scrub: GeometryScrub) -> bool {
+        self.session.runtime.set_geometry(scrub.id, scrub.before)
+    }
+
+    fn commit_geometry_change(&mut self, id: ObjectId, before: Geometry, after: Geometry) -> bool {
+        if before == after {
+            return false;
+        }
+        self.session.runtime.set_geometry(id, after);
+        self.commit(DocumentCommand::geometry(vec![GeometryChange {
+            id,
+            before,
+            after,
+        }]));
+        true
+    }
+
+    /// Rename a source-backed object, as one semantic operation.
+    ///
+    /// Goes through [`crate::operations::rename_node_in`] rather than writing a
+    /// name into the document beside the history, so a rename is the same kind
+    /// of undo step as a move and lands in the metadata file on save like every
+    /// other structural edit. The runtime object's name is refreshed from the
+    /// document afterwards, because the document is the authority and the
+    /// runtime only ever mirrors it.
+    ///
+    /// A created object has no node to rename yet, so nothing is recorded.
+    pub fn rename_object(&mut self, id: ObjectId, name: String) -> bool {
+        self.commit_text_edit();
+        let Some(object) = self.session.runtime.object(id) else {
+            return false;
+        };
+        let node = object.spool_id.clone();
+        let current = object.name.clone();
+        if current == name {
+            return false;
+        }
+        let Ok(operation) =
+            crate::operations::rename_node_in(&self.session.document, node.clone(), name)
+        else {
+            return false;
+        };
+        let changed = self.session.execute(operation).unwrap_or(false);
+        if !changed {
+            return false;
+        }
+        // The runtime carries a copy of the name so the Inspector and the layers
+        // list can read it without walking the persistent document.
+        let renamed = self
+            .session
+            .document
+            .structure
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == node)
+            .map(|candidate| candidate.name.clone());
+        if let Some(name) = renamed {
+            self.session.runtime.set_object_name(id, name);
+        }
+        true
+    }
+
+    /// Re-mirror the document's node names onto the runtime objects.
+    ///
+    /// The persistent document is the authority for a name; the runtime copy
+    /// exists so the Inspector and the layers list can read one without walking
+    /// the document. Anything that can change a name has to refresh that copy —
+    /// a rename, an undo, a redo — or the copy quietly becomes a second name
+    /// store that disagrees with the one that saves.
+    fn refresh_object_names(&mut self) {
+        let names: Vec<(NodeId, String)> = self
+            .session
+            .document
+            .structure
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.name.clone()))
+            .collect();
+        for object in self.session.runtime.objects().to_vec() {
+            if let Some((_, name)) = names.iter().find(|(id, _)| *id == object.spool_id) {
+                self.session
+                    .runtime
+                    .set_object_name(object.id, name.clone());
+            }
+        }
     }
 
     pub fn select_object(&mut self, id: ObjectId, additive: bool, cx: &mut Context<Self>) {
@@ -2224,33 +2660,19 @@ impl CanvasView {
         }
 
         if self.tool == Tool::Text {
-            if let Some(id) = self.session.runtime.hit_test(world) {
-                if self
-                    .session
-                    .runtime
-                    .object(id)
-                    .is_some_and(|object| object.object_type == ObjectType::Text)
-                {
-                    self.begin_text_edit(id, window, cx);
-                    self.begin_text_pointer_selection(screen, event.modifiers.shift, window, cx);
-                    cx.stop_propagation();
-                    return;
-                }
+            if let Some(id) = self.editable_text_at(world) {
+                self.begin_text_edit(id, window, cx);
+                self.begin_text_pointer_selection(screen, event.modifiers.shift, window, cx);
+                cx.stop_propagation();
+                return;
             }
         }
         if self.tool == Tool::Select && event.click_count >= 2 {
-            if let Some(id) = self.session.runtime.hit_test(world) {
-                if self
-                    .session
-                    .runtime
-                    .object(id)
-                    .is_some_and(|object| object.object_type == ObjectType::Text)
-                {
-                    self.begin_text_edit(id, window, cx);
-                    self.begin_text_pointer_selection(screen, event.modifiers.shift, window, cx);
-                    cx.stop_propagation();
-                    return;
-                }
+            if let Some(id) = self.editable_text_at(world) {
+                self.begin_text_edit(id, window, cx);
+                self.begin_text_pointer_selection(screen, event.modifiers.shift, window, cx);
+                cx.stop_propagation();
+                return;
             }
         }
 
@@ -3487,7 +3909,17 @@ fn render_object(
         .top(gpui_px(origin.y))
         .w(px!(object.size.width, zoom))
         .h(px!(object.size.height, zoom));
+    // Authored `opacity`, applied to the whole object the way CSS applies it:
+    // the element and everything it contains, not just its paint.
+    if object.opacity < 1.0 {
+        body = body.opacity(object.opacity.clamp(0.0, 1.0));
+    }
     if object.object_type != ObjectType::Text {
+        // Authored `border-radius`. Applied before the ellipse case below so a
+        // round shape still wins over a rectangular radius.
+        if object.border_radius > 0.0 {
+            body = body.rounded(gpui_px(object.border_radius * zoom));
+        }
         if let Some(fill) = object.fill {
             body = body.bg(rgb(fill.color.to_rgb()));
         }
@@ -4258,6 +4690,7 @@ mod tests {
             ObjectStyle {
                 fill: None,
                 stroke: None,
+                ..ObjectStyle::default()
             },
         );
         assert_eq!(layers.synchronize(&canvas), expected);
@@ -4389,6 +4822,7 @@ mod tests {
             ObjectStyle {
                 fill: None,
                 stroke: None,
+                ..ObjectStyle::default()
             },
         );
         canvas
@@ -6274,7 +6708,8 @@ mod tests {
             text,
             ObjectStyle {
                 fill: None,
-                stroke: None
+                stroke: None,
+                ..ObjectStyle::default()
             }
         );
     }
@@ -6288,7 +6723,7 @@ mod tests {
         let changes: Vec<_> = ids
             .iter()
             .filter_map(|id| {
-                let before = document.style(*id)?;
+                let before = document.appearance(*id)?;
                 let after = edited_style(before, edit);
                 (before != after).then_some(StyleChange {
                     id: *id,
@@ -6298,7 +6733,7 @@ mod tests {
             })
             .collect();
         for change in &changes {
-            document.set_style(change.id, change.after);
+            document.set_appearance(change.id, change.after);
         }
         history.record(SemanticOperation::Runtime(DocumentCommand::style(changes)));
     }
@@ -6941,6 +7376,8 @@ mod tests {
             font_size: None,
             fill: default_style(ObjectType::Rectangle).fill,
             stroke: None,
+            border_radius: default_style(ObjectType::Rectangle).border_radius,
+            opacity: 1.0,
         }
     }
 
@@ -7406,6 +7843,408 @@ mod tests {
                 "every object came back where it was left: want ({want_x}, {want_y}), got ({got_x}, {got_y})"
             );
         }
+    }
+
+    #[test]
+    fn an_inspector_field_change_is_one_operation_and_undoes_exactly() {
+        // The Inspector is a second way to ask the same question a canvas drag
+        // asks, not a second store: same command, same history, same undo.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let before = view.object_geometry(cta.id).expect("geometry");
+
+        assert!(view.set_object_geometry(
+            cta.id,
+            Geometry {
+                position: point(before.position.x + 24.0, before.position.y),
+                size: size(before.size.width, before.size.height + 8.0),
+            },
+        ));
+        assert_eq!(view.session.history.undo_len(), 1, "one edit, one entry");
+
+        assert!(view.undo_history());
+        assert_eq!(
+            view.object_geometry(cta.id),
+            Some(before),
+            "undo restores the exact geometry the field replaced"
+        );
+        assert!(view.redo_history());
+        assert_eq!(
+            view.object_geometry(cta.id).unwrap().position.x,
+            before.position.x + 24.0
+        );
+
+        // An edit that changes nothing is not an edit, and in particular does
+        // not destroy the redo that undo just made available.
+        assert!(view.undo_history());
+        assert_eq!(view.session.history.redo_len(), 1);
+        let undone = view.object_geometry(cta.id).unwrap();
+        assert!(!view.set_object_geometry(cta.id, undone));
+        assert_eq!(view.session.history.redo_len(), 1);
+        assert!(view.redo_history(), "the redo survived the no-op");
+    }
+
+    #[test]
+    fn an_inspector_field_drag_records_one_operation_not_one_per_movement() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let before = view.object_geometry(cta.id).expect("geometry");
+
+        // What the shell does across a drag: open, move, move again, commit.
+        let scrub = view.begin_geometry_scrub(cta.id).expect("scrub opens");
+        assert_eq!(
+            view.session.history.undo_len(),
+            0,
+            "an open scrub has recorded nothing"
+        );
+        for x in [4.0, 9.0, 15.0] {
+            view.scrub_geometry(
+                &scrub,
+                Geometry {
+                    position: point(before.position.x + x, before.position.y),
+                    size: before.size,
+                },
+            );
+        }
+        assert_eq!(
+            view.session.history.undo_len(),
+            0,
+            "still nothing: the drag is not over"
+        );
+        assert!(view.commit_geometry_scrub(scrub));
+        assert_eq!(view.session.history.undo_len(), 1);
+
+        assert!(view.undo_history());
+        assert_eq!(view.object_geometry(cta.id), Some(before));
+    }
+
+    #[test]
+    fn an_inspector_drag_that_ends_where_it_started_records_nothing() {
+        // The same rule a canvas drag already follows: a gesture that returns to
+        // its origin is not a change, so it must not clear redo either.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let before = view.object_geometry(cta.id).expect("geometry");
+
+        let scrub = view.begin_geometry_scrub(cta.id).expect("scrub opens");
+        for x in [30.0, 12.0, 0.0] {
+            view.scrub_geometry(
+                &scrub,
+                Geometry {
+                    position: point(before.position.x + x, before.position.y),
+                    size: before.size,
+                },
+            );
+        }
+        assert!(!view.commit_geometry_scrub(scrub));
+        assert_eq!(view.object_geometry(cta.id), Some(before));
+        assert_eq!(view.session.history.undo_len(), 0);
+    }
+
+    #[test]
+    fn a_cancelled_inspector_drag_restores_the_geometry_and_records_nothing() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let before = view.object_geometry(cta.id).expect("geometry");
+
+        let scrub = view.begin_geometry_scrub(cta.id).expect("scrub opens");
+        view.scrub_geometry(
+            &scrub,
+            Geometry {
+                position: point(before.position.x - 40.0, before.position.y - 12.0),
+                size: before.size,
+            },
+        );
+        view.cancel_geometry_scrub(scrub);
+
+        assert_eq!(
+            view.object_geometry(cta.id),
+            Some(before),
+            "a cancelled drag is not a move"
+        );
+        assert_eq!(view.session.history.undo_len(), 0);
+    }
+
+    #[test]
+    fn the_canvas_and_the_inspector_report_the_same_geometry() {
+        // Direct manipulation and the Inspector are two views of one fact: after
+        // a canvas drag, the value the Inspector reads is the dragged value.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let before = view.object_geometry(cta.id).expect("geometry");
+
+        view.selection.replace(vec![cta.id]);
+        begin_live_move(&mut view, &[cta.id]);
+        drag_to(&mut view, point(50.0, 30.0));
+
+        let dragged = view.object_geometry(cta.id).expect("geometry");
+        let object = view
+            .document_objects()
+            .iter()
+            .find(|object| object.id == cta.id)
+            .expect("still there");
+        assert_eq!(
+            (object.position.x, object.position.y),
+            (dragged.position.x, dragged.position.y),
+            "the object the Inspector draws its fields from holds the dragged value"
+        );
+        assert_ne!(
+            dragged.position, before.position,
+            "and the drag really moved something"
+        );
+    }
+
+    #[test]
+    fn renaming_an_object_is_one_operation_that_survives_save() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+
+        assert!(
+            view.rename_object(cta.id, "Primary action".to_owned()),
+            "a source-backed object renames"
+        );
+        assert_eq!(
+            view.document_objects()
+                .iter()
+                .find(|object| object.id == cta.id)
+                .map(|object| object.name.clone()),
+            Some("Primary action".to_owned()),
+            "the runtime mirrors the document, which is the authority"
+        );
+        assert_eq!(view.session.history.undo_len(), 1);
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+        let yaml = std::fs::read_to_string(root.join("lamine.yaml")).expect("read metadata");
+        assert!(
+            yaml.contains("Primary action"),
+            "the name reaches the metadata file: {yaml}"
+        );
+
+        let reopened = project_view(&root);
+        assert_eq!(
+            object_with_node(&reopened, "spool-cta-primary").name,
+            "Primary action"
+        );
+
+        assert!(view.undo_history());
+        assert_eq!(
+            view.document_objects()
+                .iter()
+                .find(|object| object.id == cta.id)
+                .map(|object| object.name.clone()),
+            Some("Primary CTA".to_owned()),
+            "undo restores the authored name"
+        );
+    }
+
+    #[test]
+    fn a_created_object_cannot_be_renamed_because_it_has_no_node_yet() {
+        // Reported, not invented: a created object has no metadata entry to
+        // rename, and writing one would be a structural edit the user did not
+        // ask for.
+        let mut view = CanvasView::new();
+        let created = view.session.runtime.create_object(
+            ObjectType::Rectangle,
+            point(10.0, 10.0),
+            size(20.0, 20.0),
+            None,
+        );
+        assert!(!view.rename_object(created.id, "New".to_owned()));
+        assert_eq!(view.session.history.undo_len(), 0);
+    }
+
+    #[test]
+    fn one_session_edits_text_style_geometry_and_a_name_and_all_of_it_survives() {
+        // The milestone in one test: one project, one history stack, four kinds
+        // of semantic operation, one save, one reopen. Every dimension is
+        // checked against what came back off disk rather than against what the
+        // editor was showing, because "the canvas looked right" is not the claim
+        // being made.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let headline = object_with_node(&view, "spool-text-headline");
+        let cta = object_with_node(&view, "spool-cta-primary");
+        let html_before = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        let css_before = std::fs::read_to_string(root.join("styles.css")).expect("read css");
+        let start_depth = view.session.history.undo_len();
+
+        // 1. Text.
+        let edited = "Design in source, structure in Spool — saved";
+        assert!(view.set_object_text(headline.id, edited.to_owned()));
+        assert_eq!(
+            view.session.history.undo_len() - start_depth,
+            1,
+            "a text edit is one operation"
+        );
+
+        // 2. Appearance, through the same edits the Inspector sends. The fill is
+        // owned by `.cta`, so it lands in the stylesheet; the opacity is owned
+        // by nobody, so it becomes a local declaration.
+        view.selection.replace(vec![cta.id]);
+        let depth_before_style = view.session.history.undo_len();
+        for edit in [
+            StyleEdit::Fill(Some(Color::from_rgb(0xc4_5d_5d))),
+            StyleEdit::TextColor(Some(Color::from_rgb(0x16_16_1d))),
+            StyleEdit::FontSize(24.0),
+            StyleEdit::BorderRadius(16.0),
+            StyleEdit::Opacity(0.5),
+        ] {
+            assert!(
+                view.apply_selected_style(edit),
+                "{edit:?} changed something"
+            );
+        }
+        assert_eq!(
+            view.session.history.undo_len() - depth_before_style,
+            5,
+            "five style edits are five operations, not one batch and not five per property"
+        );
+
+        // 3. Geometry, through the Inspector's own operation.
+        let moved_to = match view.object_geometry(cta.id) {
+            Some(geometry) => Geometry {
+                position: point(geometry.position.x + 40.0, geometry.position.y + 24.0),
+                size: size(geometry.size.width + 20.0, geometry.size.height + 8.0),
+            },
+            None => panic!("the CTA is projected"),
+        };
+        assert!(view.set_object_geometry(cta.id, moved_to));
+
+        // 4. A name, which is persistent metadata rather than runtime state.
+        assert!(view.rename_object(headline.id, "Page headline".to_owned()));
+        let history_count = view.session.history.undo_len() - start_depth;
+        assert_eq!(
+            history_count, 8,
+            "one entry per user action, across four kinds of operation"
+        );
+
+        // Undo the last two actions: the resize-then-move geometry edit and the
+        // rename. The text and the style must be untouched, which is what proves
+        // the stack is one stack and not four.
+        assert!(view.undo_history(), "undo the rename");
+        assert_eq!(
+            view.document_objects()
+                .iter()
+                .find(|object| object.id == headline.id)
+                .map(|object| object.name.clone()),
+            Some("Headline".to_owned())
+        );
+        assert_eq!(
+            view.object_geometry(cta.id),
+            Some(moved_to),
+            "geometry is a separate step"
+        );
+        assert!(view.undo_history(), "undo the geometry edit");
+        assert!(view.redo_history(), "redo it");
+        assert_eq!(view.object_geometry(cta.id), Some(moved_to));
+        assert!(view.redo_history(), "redo the rename as well");
+        assert_eq!(
+            view.document_objects()
+                .iter()
+                .find(|object| object.id == headline.id)
+                .map(|object| object.name.clone()),
+            Some("Page headline".to_owned()),
+            "two operations of different kinds share one stack in order"
+        );
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        // The authored files changed in exactly the places the edits name.
+        let html_after = std::fs::read_to_string(root.join("index.html")).expect("read html");
+        let css_after = std::fs::read_to_string(root.join("styles.css")).expect("read css");
+        assert!(html_after.contains(edited), "the headline text was written");
+        assert!(
+            html_after.contains("opacity: 0.5"),
+            "the unowned property became local"
+        );
+        assert!(
+            html_after.contains(&format!(
+                "width: {}px",
+                crate::project_save::css_length(moved_to.size.width)
+            )),
+            "the measured width was written: {html_after}"
+        );
+        assert!(
+            css_after.contains("#c45d5d"),
+            "the fill was rewritten where `.cta` owns it"
+        );
+        assert_ne!(html_before, html_after);
+        assert_ne!(css_before, css_after);
+        // The stylesheet gained a value and lost nothing: every rule the author
+        // wrote is still there, and no rule was added.
+        assert_eq!(
+            css_after.matches(".cta").count(),
+            css_before.matches(".cta").count(),
+            "no rule was added or removed"
+        );
+        assert!(
+            html_after.contains("href=\"#start\""),
+            "unrelated attributes survived"
+        );
+
+        // Reopen from disk and check every dimension against the disk.
+        let reopened = project_view(&root);
+        let headline_after = object_with_node(&reopened, "spool-text-headline");
+        let cta_after = object_with_node(&reopened, "spool-cta-primary");
+        assert_eq!(headline_after.text_content.as_deref(), Some(edited));
+        assert_eq!(headline_after.name, "Page headline");
+        assert_eq!(
+            cta_after.fill.map(|fill| fill.color.to_rgb()),
+            Some(0xc4_5d_5d)
+        );
+        assert_eq!(cta_after.font_size, Some(24.0));
+        assert_eq!(cta_after.border_radius, 16.0);
+        assert_eq!(cta_after.opacity, 0.5);
+        assert_eq!(cta_after.text_color, Some(Color::from_rgb(0x16_16_1d)));
+        assert!(
+            (cta_after.size.width - moved_to.size.width).abs() < 0.01
+                && (cta_after.size.height - moved_to.size.height).abs() < 0.01,
+            "the size survived: {:?}",
+            cta_after.size
+        );
+        assert!(
+            (cta_after.position.x - moved_to.position.x).abs() < 0.01
+                && (cta_after.position.y - moved_to.position.y).abs() < 0.01,
+            "and so did the move: {:?}",
+            cta_after.position
+        );
+    }
+
+    #[test]
+    fn an_undo_after_save_does_not_rewrite_a_file_that_still_matches() {
+        // Save writes the disk; undo changes only the editor. Nothing here says
+        // an undo must be persisted, and nothing here should quietly write the
+        // undone state either.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = object_with_node(&view, "spool-cta-primary");
+        view.selection.replace(vec![cta.id]);
+        view.apply_selected_style(StyleEdit::Opacity(0.25));
+        view.save_project().expect("save succeeds");
+        let after_save = std::fs::read_to_string(root.join("index.html")).expect("read html");
+
+        assert!(view.undo_history());
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(
+            !outcome
+                .written
+                .iter()
+                .any(|path| path.ends_with("index.html")),
+            "an undone edit that matches the file on disk writes nothing: {:?}",
+            outcome.written
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).expect("read html"),
+            after_save
+        );
     }
 
     #[test]

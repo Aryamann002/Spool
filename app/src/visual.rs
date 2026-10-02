@@ -396,6 +396,25 @@ fn layout_node(
     // authored `left`/`top`. This is the minimum needed for a moved object to
     // come back where the user left it.
     let absolute = entry.declarations.get("position").map(|value| value.trim()) == Some("absolute");
+
+    // `transform: translate(...)` offsets a box from where the flow would put
+    // it, without taking it out of the flow. That is what lets a moved element
+    // keep its place among its siblings instead of becoming an absolutely
+    // positioned box that no longer reflows with them. Only the two-argument
+    // pixel form is read; see [`style::parse_translate`].
+    //
+    // The offset is applied to the coordinate this node is laid out from, so
+    // everything below it — children, padding, the block cursor — moves with
+    // it. The offset is *not* applied to the cursor handed back to the parent,
+    // because a transform does not change where a box sits in the flow: an
+    // auto-height parent must not grow to contain a moved child.
+    let offset = if absolute {
+        (0.0, 0.0)
+    } else {
+        translate_of(entry)
+    };
+    let x = x + offset.0;
+    let cursor = cursor + offset.1;
     let authored_left = entry
         .declarations
         .get("left")
@@ -460,8 +479,17 @@ fn layout_node(
             // parent is not the `x` this node was laid out at.
             (origin_x, top),
         ) {
+            // The child's own offset is subtracted because a transform does not
+            // take part in layout: a moved child must not stretch the parent
+            // that flows around it.
+            let (_, child_offset_y) = match resolved.get(&child.id) {
+                Some(entry) => translate_of(entry),
+                None => (0.0, 0.0),
+            };
             content_height = content_height.max(
-                (child_box.y + child_box.height + child_box_margin_bottom(resolved, &child.id))
+                (child_box.y - child_offset_y
+                    + child_box.height
+                    + child_box_margin_bottom(resolved, &child.id))
                     - top,
             );
         }
@@ -482,14 +510,28 @@ fn layout_node(
         width: outer_width,
         height,
     };
-    // An absolutely positioned node does not advance the flow cursor.
+    // An absolutely positioned node does not advance the flow cursor, and
+    // neither does a transform: what the parent lays out next is the position
+    // the flow gives, not the position this box was drawn at.
     *cursor_out = if absolute {
         *cursor_out
     } else {
-        top + height + margin[2]
+        top - offset.1 + height + margin[2]
     };
     out.insert(id.clone(), geometry);
     Some(geometry)
+}
+
+/// A node's authored `transform: translate(...)` offset, or none.
+///
+/// Separate from layout so the parent can ask about a child's offset without
+/// laying it out again, and so the "not a translate" case reads as one place.
+fn translate_of(entry: &Resolved) -> (f32, f32) {
+    entry
+        .declarations
+        .get("transform")
+        .and_then(|value| style::parse_translate(value))
+        .unwrap_or((0.0, 0.0))
 }
 
 /// Properties that inherit, and only those.
@@ -671,6 +713,15 @@ fn visual_of(
     let style_out = ObjectStyle {
         fill: background.map(|color| Fill { color }),
         stroke: border.map(|(color, width)| Stroke { color, width }),
+        border_radius: declarations
+            .get("border-radius")
+            .and_then(|value| style::parse_length(value))
+            .unwrap_or(0.0),
+        opacity: declarations
+            .get("opacity")
+            .and_then(|value| style::parse_number(value))
+            .map(|value| value.clamp(0.0, 1.0))
+            .unwrap_or(1.0),
     };
 
     let text_color = declarations
@@ -886,6 +937,88 @@ mod tests {
                 height: 48.0
             },
             "an authored position is honoured exactly"
+        );
+    }
+
+    #[test]
+    fn a_transform_moves_a_box_without_moving_the_flow_around_it() {
+        // The whole point of writing a move as a transform rather than as an
+        // absolute position: the element is drawn where the user put it, and the
+        // flow around it is exactly what the author wrote. A sibling below it
+        // must not move, and a parent that grows with its content must not grow
+        // to contain the offset.
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}{}",
+            node_yaml(
+                "spool-frame-root",
+                "Root",
+                "frame",
+                None,
+                "\"spool-text-headline\", \"spool-text-body\""
+            ),
+            node_yaml(
+                "spool-text-headline",
+                "Headline",
+                "text",
+                Some("spool-frame-root"),
+                ""
+            ),
+            node_yaml(
+                "spool-text-body",
+                "Body",
+                "text",
+                Some("spool-frame-root"),
+                ""
+            )
+        );
+        let plain = scratch(
+            "flow-plain",
+            &yaml,
+            "<!doctype html>\n<body>\n  <div data-spool-id=\"spool-frame-root\">\n    <h1 data-spool-id=\"spool-text-headline\">Headline</h1>\n    <p data-spool-id=\"spool-text-body\">Body</p>\n  </div>\n</body>\n",
+            None,
+        );
+        let moved = scratch(
+            "flow-moved",
+            &yaml,
+            "<!doctype html>\n<body>\n  <div data-spool-id=\"spool-frame-root\">\n    <h1 data-spool-id=\"spool-text-headline\" style=\"transform: translate(0px, 60px)\">Headline</h1>\n    <p data-spool-id=\"spool-text-body\">Body</p>\n  </div>\n</body>\n",
+            None,
+        );
+
+        let before = crate::project_open::open_project(&plain)
+            .expect("opens")
+            .visuals;
+        let after = crate::project_open::open_project(&moved)
+            .expect("opens")
+            .visuals;
+
+        let headline_before = before.get(&node("spool-text-headline")).expect("headline");
+        let headline_after = after.get(&node("spool-text-headline")).expect("headline");
+        assert!(
+            (headline_after.geometry.y - (headline_before.geometry.y + 60.0)).abs() < 0.01,
+            "the box is drawn 60px lower: {} vs {}",
+            headline_after.geometry.y,
+            headline_before.geometry.y
+        );
+
+        let body_before = before.get(&node("spool-text-body")).expect("body");
+        let body_after = after.get(&node("spool-text-body")).expect("body");
+        assert_eq!(
+            body_after.geometry.y, body_before.geometry.y,
+            "the sibling below still starts where the flow puts it"
+        );
+
+        assert_eq!(
+            after
+                .get(&node("spool-frame-root"))
+                .expect("root")
+                .geometry
+                .height,
+            before
+                .get(&node("spool-frame-root"))
+                .expect("root")
+                .geometry
+                .height,
+            "and the auto-height parent did not grow to contain the offset"
         );
     }
 
