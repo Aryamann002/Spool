@@ -25,7 +25,7 @@ gpui::actions!(
     ]
 );
 
-use crate::{diagnostics, theme};
+use crate::{diagnostics, source_document::NodeId, theme};
 
 #[cfg(debug_assertions)]
 #[path = "canvas_workloads.rs"]
@@ -315,6 +315,9 @@ pub enum StyleEdit {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesignObject {
     pub id: ObjectId,
+    /// Stable source/document identity. `id` remains the current runtime lookup
+    /// key; this opaque value is persisted by `lamine.yaml`.
+    pub spool_id: NodeId,
     pub name: String,
     pub position: Point<f32>,
     pub size: Size<f32>,
@@ -431,6 +434,7 @@ pub struct History {
 pub struct Document {
     objects: Vec<DesignObject>,
     next_id: u64,
+    next_node_id: u64,
     next_names: [u64; 4],
     layer_structure_revision: u64,
 }
@@ -439,12 +443,45 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             objects: vec![
-                frame(ObjectId::LANDING, "Landing", 0.0, 24.0, 430.0, 286.0),
-                frame(ObjectId::EDITOR, "Editor", 454.0, 24.0, 310.0, 252.0),
-                frame(ObjectId::FEATURES, "Features", 106.0, 366.0, 394.0, 280.0),
-                frame(ObjectId::MOBILE, "Mobile", 524.0, 366.0, 192.0, 322.0),
+                frame(
+                    ObjectId::LANDING,
+                    node_id("spool-node-landing"),
+                    "Landing",
+                    0.0,
+                    24.0,
+                    430.0,
+                    286.0,
+                ),
+                frame(
+                    ObjectId::EDITOR,
+                    node_id("spool-node-editor"),
+                    "Editor",
+                    454.0,
+                    24.0,
+                    310.0,
+                    252.0,
+                ),
+                frame(
+                    ObjectId::FEATURES,
+                    node_id("spool-node-features"),
+                    "Features",
+                    106.0,
+                    366.0,
+                    394.0,
+                    280.0,
+                ),
+                frame(
+                    ObjectId::MOBILE,
+                    node_id("spool-node-mobile"),
+                    "Mobile",
+                    524.0,
+                    366.0,
+                    192.0,
+                    322.0,
+                ),
             ],
             next_id: 5,
+            next_node_id: 1,
             next_names: [1; 4],
             layer_structure_revision: 0,
         }
@@ -485,6 +522,12 @@ impl Document {
         id
     }
 
+    fn allocate_node_id(&mut self) -> NodeId {
+        let id = self.next_node_id;
+        self.next_node_id += 1;
+        node_id(format!("spool-node-{id:016x}"))
+    }
+
     fn allocate_name(&mut self, object_type: ObjectType) -> String {
         let index = match object_type {
             ObjectType::Frame => 0,
@@ -505,8 +548,10 @@ impl Document {
         text_content: Option<String>,
     ) -> DesignObject {
         let id = self.allocate_id();
+        let spool_id = self.allocate_node_id();
         let object = DesignObject {
             id,
+            spool_id,
             name: self.allocate_name(object_type),
             position,
             size: size(
@@ -573,6 +618,7 @@ impl Document {
         let mut duplicates = Vec::with_capacity(originals.len());
         for mut object in originals {
             object.id = self.allocate_id();
+            object.spool_id = self.allocate_node_id();
             object.name = self.allocate_name(object.object_type);
             object.position = point(object.position.x + 16.0, object.position.y + 16.0);
             let index = self.objects.len();
@@ -752,9 +798,18 @@ impl History {
     }
 }
 
-fn frame(id: ObjectId, name: &str, x: f32, y: f32, width: f32, height: f32) -> DesignObject {
+fn frame(
+    id: ObjectId,
+    spool_id: NodeId,
+    name: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+) -> DesignObject {
     DesignObject {
         id,
+        spool_id,
         name: name.to_string(),
         position: point(x, y),
         size: size(width, height),
@@ -763,6 +818,10 @@ fn frame(id: ObjectId, name: &str, x: f32, y: f32, width: f32, height: f32) -> D
         fill: default_style(ObjectType::Frame).fill,
         stroke: default_style(ObjectType::Frame).stroke,
     }
+}
+
+fn node_id(value: impl Into<String>) -> NodeId {
+    NodeId::new(value).expect("generated Spool node IDs use the validated identifier alphabet")
 }
 
 fn edited_style(mut style: ObjectStyle, edit: StyleEdit) -> ObjectStyle {
@@ -4120,10 +4179,27 @@ mod tests {
     fn overlapping_objects_resolve_to_the_topmost_document_object() {
         let document = Document {
             objects: vec![
-                frame(ObjectId::LANDING, "Back", 0.0, 0.0, 100.0, 100.0),
-                frame(ObjectId::EDITOR, "Front", 25.0, 25.0, 100.0, 100.0),
+                frame(
+                    ObjectId::LANDING,
+                    node_id("spool-node-test-back"),
+                    "Back",
+                    0.0,
+                    0.0,
+                    100.0,
+                    100.0,
+                ),
+                frame(
+                    ObjectId::EDITOR,
+                    node_id("spool-node-test-front"),
+                    "Front",
+                    25.0,
+                    25.0,
+                    100.0,
+                    100.0,
+                ),
             ],
             next_id: 5,
+            next_node_id: 1,
             next_names: [1; 4],
             layer_structure_revision: 0,
         };
@@ -4798,12 +4874,48 @@ mod tests {
         let duplicate = &duplicates[0].object;
 
         assert_ne!(duplicate.id, original.id);
+        assert_ne!(duplicate.spool_id, original.spool_id);
         assert_eq!(duplicate.name, "Text 2");
         assert_eq!(duplicate.object_type, original.object_type);
         assert_eq!(duplicate.size, original.size);
         assert_eq!(duplicate.text_content, original.text_content);
         assert_eq!(duplicate.position, point(47.0, 63.0));
         assert_eq!(document.object(duplicate.id), Some(duplicate));
+    }
+
+    #[test]
+    fn spool_node_identity_survives_history_and_is_unique_for_duplicates() {
+        let mut document = Document::default();
+        let original = document.create_object(
+            ObjectType::Rectangle,
+            point(10.0, 20.0),
+            size(80.0, 50.0),
+            None,
+        );
+        let original_node_id = original.spool_id.clone();
+        let mut history = History::default();
+        history.record(DocumentCommand::insert(vec![document
+            .placement(original.id)
+            .unwrap()]));
+
+        let duplicate = document.duplicate_objects(&[original.id]).remove(0);
+        assert_ne!(duplicate.object.spool_id, original_node_id);
+        history.record(DocumentCommand::insert(vec![duplicate.clone()]));
+        assert!(history.undo(&mut document));
+        assert!(history.redo(&mut document));
+
+        assert_eq!(
+            document.object(original.id).unwrap().spool_id,
+            original_node_id
+        );
+        assert_eq!(
+            document.object(duplicate.object.id).unwrap().spool_id,
+            duplicate.object.spool_id
+        );
+        assert_ne!(
+            document.object(original.id).unwrap().spool_id,
+            document.object(duplicate.object.id).unwrap().spool_id
+        );
     }
 
     #[test]
@@ -5742,6 +5854,7 @@ mod tests {
     fn culling_object(id: u64, position: Point<f32>, object_size: Size<f32>) -> DesignObject {
         DesignObject {
             id: ObjectId(id),
+            spool_id: node_id(format!("cull-probe-{id}")),
             name: "Cull probe".to_owned(),
             position,
             size: object_size,

@@ -2,6 +2,7 @@ mod canvas;
 mod diagnostics;
 mod layers;
 mod shell;
+pub mod source_document;
 mod theme;
 
 use gpui::{

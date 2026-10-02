@@ -24,6 +24,7 @@ fn core_workload_baseline() {
         document.objects = (0..count)
             .map(|index| DesignObject {
                 id: ObjectId(index as u64 + 5),
+                spool_id: node_id(format!("spool-bench-{index:016x}")),
                 name: format!("Text {index}"),
                 position: point((index % 100) as f32 * 40.0, (index / 100) as f32 * 40.0),
                 size: size(30.0, 30.0),

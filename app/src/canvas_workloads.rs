@@ -36,6 +36,7 @@ fn fixture(count: usize) -> Document {
     let objects = (0..count)
         .map(|index| DesignObject {
             id: ObjectId(index as u64 + 5),
+            spool_id: node_id(format!("spool-workload-{index:016x}")),
             name: format!("Rectangle {}", index + 1),
             position: point((index % 100) as f32 * 120.0, (index / 100) as f32 * 120.0),
             size: size(80.0, 80.0),
@@ -48,6 +49,7 @@ fn fixture(count: usize) -> Document {
     Document {
         objects,
         next_id: count as u64 + 5,
+        next_node_id: count as u64 + 1,
         next_names: [1, count as u64 + 1, 1, 1],
         layer_structure_revision: 0,
     }

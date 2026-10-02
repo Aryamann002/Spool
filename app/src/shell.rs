@@ -1686,6 +1686,7 @@ mod style_inspector_tests {
     fn object(fill: Option<u32>, stroke: Option<(u32, f32)>) -> canvas::DesignObject {
         canvas::DesignObject {
             id: canvas::ObjectId::LANDING,
+            spool_id: crate::source_document::NodeId::new("test-node").unwrap(),
             name: "Shape".to_string(),
             position: gpui::point(0.0, 0.0),
             size: gpui::size(20.0, 20.0),
