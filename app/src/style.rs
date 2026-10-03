@@ -21,9 +21,13 @@
 //!
 //! # Cascade
 //!
-//! Author order wins, with class selectors applied after tag selectors for the
-//! same element. That is enough for the fixtures and is deterministic. It is
-//! not the CSS cascade, and `docs/` records that as an open boundary.
+//! Two declarations that both match an element compete on specificity first
+//! (id, then class, then type — see [`Selector::specificity`]) and author
+//! order second. That is the CSS cascade for the selector subset this parser
+//! accepts. Origin (inline style beats stylesheet), `!important`, and inherited
+//! values are *not* part of it: the inline style is applied by the caller in
+//! `visual`, and inheritance belongs to the document tree rather than to a
+//! stylesheet. `docs/` records that boundary.
 
 use std::collections::BTreeMap;
 
@@ -46,12 +50,20 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "height",
     "left",
     "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
     "max-height",
     "max-width",
     "min-height",
     "min-width",
     "opacity",
     "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
     "position",
     "right",
     "text-align",
@@ -71,6 +83,35 @@ pub struct Declaration {
     pub order: usize,
 }
 
+impl Declaration {
+    /// This declaration's rank, for comparing against one from another rule.
+    ///
+    /// `specificity` is supplied by the owning rule, which is where the
+    /// selector — and therefore the specificity — actually lives. Taken as a
+    /// pair rather than a number so the two ranking criteria stay separable.
+    fn rank_for(&self, specificity: u32) -> (u32, usize) {
+        (specificity, self.order)
+    }
+}
+
+/// The canonical longhand a supported property resolves against.
+///
+/// `background` and `background-color` are one longhand spelled two ways. CSS
+/// expands a shorthand into longhands *before* the cascade runs, which is why a
+/// later `background: blue` overrides an earlier `background-color: red`. Keying
+/// both under one group is what makes author order mean the same thing here as
+/// in a browser, and it keeps the winning declaration's authored span pointing at
+/// the shorthand the author really wrote, so a later edit rewrites the text that
+/// produced the value.
+///
+/// Every other supported property is its own group.
+fn property_group(property: &str) -> String {
+    match property {
+        "background" | "background-color" => "background-color".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// A parsed stylesheet: its rules in author order and its `:root` custom
 /// properties.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -85,11 +126,15 @@ struct Rule {
     declarations: Vec<Declaration>,
 }
 
-/// A single compound selector: `main`, `.cta`, `#hero`, or `a.cta`.
+/// A single compound selector: `main`, `.cta`, `#hero`, `a.cta`, or `.a.b`.
+///
+/// A compound selector is one element matched by every simple part, with no
+/// combinator. More than one class is allowed because an element can carry
+/// several, and `.a.b` is how an author narrows a rule to that combination.
 #[derive(Clone, Debug, PartialEq)]
 struct Selector {
     tag: Option<String>,
-    class: Option<String>,
+    classes: Vec<String>,
     id: Option<String>,
 }
 
@@ -102,37 +147,43 @@ impl Selector {
         }
         let mut selector = Self {
             tag: None,
-            class: None,
+            classes: Vec::new(),
             id: None,
         };
         let mut rest = text;
-        while let Some(stripped) = rest.strip_prefix('.') {
-            let end = stripped
+        while !rest.is_empty() {
+            let first = rest.as_bytes()[0];
+            let is_class = first == b'.';
+            let is_id = first == b'#';
+            let body = if is_class || is_id { &rest[1..] } else { rest };
+            let end = body
                 .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-                .unwrap_or(stripped.len());
+                .unwrap_or(body.len());
+            // A bare `.` or `#` names nothing, so it is not a selector.
             if end == 0 {
                 return None;
             }
-            selector.class = Some(stripped[..end].to_owned());
-            rest = &stripped[end..];
-        }
-        if let Some(stripped) = rest.strip_prefix('#') {
-            let end = stripped
-                .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-                .unwrap_or(stripped.len());
-            if end == 0 {
-                return None;
+            let name = body[..end].to_owned();
+            if is_class {
+                selector.classes.push(name);
+            } else if is_id {
+                // `#a#b` matches nothing; refuse it rather than pick one.
+                if selector.id.is_some() {
+                    return None;
+                }
+                selector.id = Some(name);
+            } else {
+                // A type selector may only lead, and only appear once:
+                // `a.b` is valid CSS, `a.b c` is a combinator (already refused),
+                // and `b.a` is not a selector this parser can honour.
+                if selector.tag.is_some() || !selector.classes.is_empty() || selector.id.is_some() {
+                    return None;
+                }
+                selector.tag = Some(name.to_ascii_lowercase());
             }
-            selector.id = Some(stripped[..end].to_owned());
-            rest = &stripped[end..];
+            rest = &body[end..];
         }
-        if !rest.is_empty() {
-            if selector.tag.is_some() || selector.class.is_some() || selector.id.is_some() {
-                return None;
-            }
-            selector.tag = Some(rest.to_ascii_lowercase());
-        }
-        (selector.tag.is_some() || selector.class.is_some() || selector.id.is_some())
+        (selector.tag.is_some() || !selector.classes.is_empty() || selector.id.is_some())
             .then_some(selector)
     }
 
@@ -142,10 +193,13 @@ impl Selector {
                 return false;
             }
         }
-        if let Some(expected) = &self.class {
-            if !classes.iter().any(|class| class == expected) {
-                return false;
-            }
+        // Every class the selector names must be present: `.a.b` needs both.
+        if !self
+            .classes
+            .iter()
+            .all(|expected| classes.iter().any(|class| class == expected))
+        {
+            return false;
         }
         if let Some(expected) = &self.id {
             if id != Some(expected.as_str()) {
@@ -153,6 +207,23 @@ impl Selector {
             }
         }
         true
+    }
+
+    /// How specific this selector is, as a single comparable number.
+    ///
+    /// CSS ranks selectors as a tuple of three counts — ids, then classes and
+    /// attributes, then types — compared lexicographically. Collapsing that
+    /// into one number is only equivalent while each count stays below its
+    /// radix, which the 100/10000 weights guarantee for the selectors this
+    /// parser accepts (one id, and a bounded number of classes).
+    ///
+    /// It is computed from the selector rather than stored, so a selector and
+    /// the rank it wins by cannot disagree.
+    fn specificity(&self) -> u32 {
+        let ids = u32::from(self.id.is_some()) * 10_000;
+        let classes = self.classes.len() as u32 * 100;
+        let tags = u32::from(self.tag.is_some());
+        ids + classes + tags
     }
 }
 
@@ -207,32 +278,90 @@ impl Stylesheet {
 
     /// Resolve the declarations that apply to one element, in cascade order.
     ///
-    /// Later rules win. Within a rule, later declarations win. Returns the
-    /// resolved property values with the provenance of the winning
-    /// declaration.
+    /// One entry per computed longhand, keyed by that longhand's canonical name
+    /// — so a `background` shorthand and a `background-color` declaration land on
+    /// the same key and only one of them survives. Returns the resolved value
+    /// with the provenance of the winning declaration.
     pub fn resolve(
         &self,
         tag: &str,
         classes: &[String],
         id: Option<&str>,
     ) -> BTreeMap<String, ResolvedValue> {
-        let mut resolved: BTreeMap<String, ResolvedValue> = BTreeMap::new();
+        self.cascaded(tag, classes, id)
+            .into_iter()
+            .map(|(property, declaration)| {
+                (
+                    property,
+                    ResolvedValue {
+                        value: self.substitute_variables(&declaration.value),
+                        order: declaration.order,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Every declaration that wins for one computed longhand on one element.
+    ///
+    /// Single source of truth for the cascade: [`Stylesheet::resolve`] reads
+    /// values out of it and [`Stylesheet::declaration_value_range`] reads spans
+    /// out of it, so the value a node is drawn with and the authored text an edit
+    /// would rewrite cannot disagree.
+    fn cascaded<'a>(
+        &'a self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+    ) -> BTreeMap<String, &'a Declaration> {
+        // The incumbent's own specificity is carried alongside it. Reusing the
+        // candidate rule's specificity for the incumbent would make the
+        // comparison depend on the order the rules happen to be visited in.
+        let mut winners: BTreeMap<String, (&'a Declaration, u32)> = BTreeMap::new();
         for rule in &self.rules {
             if !rule.selector.matches(tag, classes, id) {
                 continue;
             }
+            let specificity = rule.selector.specificity();
             for declaration in &rule.declarations {
-                let value = self.substitute_variables(&declaration.value);
-                resolved.insert(
-                    declaration.property.clone(),
-                    ResolvedValue {
-                        value,
-                        order: declaration.order,
-                    },
-                );
+                let group = property_group(&declaration.property);
+                match winners.get(&group) {
+                    Some((current, current_specificity)) => {
+                        if declaration.rank_for(specificity)
+                            > current.rank_for(*current_specificity)
+                        {
+                            winners.insert(group, (declaration, specificity));
+                        }
+                    }
+                    None => {
+                        winners.insert(group, (declaration, specificity));
+                    }
+                }
             }
         }
-        resolved
+        winners
+            .into_iter()
+            .map(|(property, (declaration, _))| (property, declaration))
+            .collect()
+    }
+
+    /// The declaration that currently wins for one property on one element.
+    ///
+    /// `property` may be spelled either way — asking for `background` and asking
+    /// for `background-color` both answer with whichever spelling the cascade
+    /// actually chose. That is deliberate: a caller that rewrites a declaration
+    /// has to be able to ask for the property it means and get the span that
+    /// produced the value being replaced.
+    fn winner<'a>(
+        &'a self,
+        tag: &str,
+        classes: &[String],
+        id: Option<&str>,
+        property: &str,
+    ) -> Option<&'a Declaration> {
+        self.cascaded(tag, classes, id)
+            .get(&property_group(property))
+            .copied()
     }
 
     /// The authored span of the declaration that currently wins for `property`
@@ -240,8 +369,8 @@ impl Stylesheet {
     ///
     /// This is what makes CSS ownership checkable: a caller asking "does this
     /// element own `background`?" gets `None` when nothing declared it, and a
-    /// byte range into this stylesheet when something did. Returns the winning
-    /// declaration, so it agrees with [`Stylesheet::resolve`].
+    /// byte range into this stylesheet when something did — the span of
+    /// whichever spelling won, so it agrees with [`Stylesheet::resolve`].
     pub fn declaration_value_range(
         &self,
         tag: &str,
@@ -249,24 +378,8 @@ impl Stylesheet {
         id: Option<&str>,
         property: &str,
     ) -> Option<(usize, usize)> {
-        let mut best: Option<(usize, (usize, usize))> = None;
-        for rule in &self.rules {
-            if !rule.selector.matches(tag, classes, id) {
-                continue;
-            }
-            for declaration in &rule.declarations {
-                if declaration.property != property {
-                    continue;
-                }
-                if best
-                    .map(|(order, _)| declaration.order >= order)
-                    .unwrap_or(true)
-                {
-                    best = Some((declaration.order, declaration.value_range));
-                }
-            }
-        }
-        best.map(|(_, range)| range)
+        self.winner(tag, classes, id, property)
+            .map(|declaration| declaration.value_range)
     }
 
     /// Expand `var(--name)` against the `:root` custom properties.
@@ -445,6 +558,55 @@ pub fn parse_translate(value: &str) -> Option<(f32, f32)> {
     Some((x, y))
 }
 
+/// A parsed `border` shorthand: a width for every side, and a colour if one
+/// was authored.
+///
+/// Only the uniform form is understood. `border: 1px solid red`, `border: 1px
+/// red`, and `border: red` all parse; a per-side shorthand such as
+/// `border-left`, a `style` keyword that is not `solid`, and a width in a unit
+/// this subset cannot read all return `None` rather than being approximated.
+///
+/// The width is geometry and the colour is paint, and they are returned
+/// separately on purpose: `border: 1px solid` occupies a box with no authored
+/// colour, so treating the two as one either invents a stroke or silently
+/// drops the border from the layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BorderStyle {
+    pub width: f32,
+    pub color: Option<Color>,
+}
+
+/// Parse the `border` shorthand.
+pub fn parse_border(value: &str) -> Option<BorderStyle> {
+    let mut width = 1.0f32;
+    let mut color = None;
+    let mut components = 0usize;
+    for part in value.split_whitespace() {
+        if part.eq_ignore_ascii_case("none") {
+            // `border: none` is an explicit statement that there is no border.
+            return (components == 0).then_some(BorderStyle {
+                width: 0.0,
+                color: None,
+            });
+        }
+        if part.eq_ignore_ascii_case("solid") {
+            // The line style carries no geometry this subset can draw, but it
+            // is a real keyword in the shorthand rather than a parse error.
+            components += 1;
+            continue;
+        }
+        if let Some(parsed) = parse_length(part) {
+            width = parsed;
+        } else if let Some(parsed) = parse_color(part) {
+            color = Some(parsed);
+        } else {
+            return None;
+        }
+        components += 1;
+    }
+    (components > 0).then_some(BorderStyle { width, color })
+}
+
 /// Parse a one-to-four component box value such as `12px 20px` or `0`.
 pub fn parse_box(value: &str) -> Option<[f32; 4]> {
     let parts: Vec<f32> = value
@@ -464,12 +626,21 @@ mod tests {
     use super::*;
 
     fn resolved_map(source: &str, tag: &str, classes: &[&str]) -> BTreeMap<String, String> {
+        resolved_for(source, tag, classes, None)
+    }
+
+    fn resolved_for(
+        source: &str,
+        tag: &str,
+        classes: &[&str],
+        id: Option<&str>,
+    ) -> BTreeMap<String, String> {
         let sheet = Stylesheet::parse(source);
         sheet
             .resolve(
                 tag,
                 &classes.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-                None,
+                id,
             )
             .into_iter()
             .map(|(property, resolved)| (property, resolved.value))
@@ -492,6 +663,227 @@ a { background-color: #ffffff; padding: 4px; }
             resolved.get("padding").map(String::as_str),
             Some("4px"),
             "a property the class rule does not mention is kept from the tag rule"
+        );
+    }
+
+    #[test]
+    fn specificity_outranks_author_order() {
+        // The defect this exists for: author order was the *only* ranking, so a
+        // later bare-tag rule beat an earlier class rule. In CSS a class always
+        // beats a type selector no matter which came last.
+        let source = ".cta { color: #ff0000; }\na { color: #0000ff; }\n";
+        assert_eq!(
+            resolved_map(source, "a", &["cta"])
+                .get("color")
+                .map(String::as_str),
+            Some("#ff0000"),
+            "the earlier class rule still wins: specificity is checked first"
+        );
+        assert_eq!(
+            resolved_map(source, "a", &[])
+                .get("color")
+                .map(String::as_str),
+            Some("#0000ff"),
+            "and an element with no class still gets the tag rule's value"
+        );
+    }
+
+    #[test]
+    fn an_id_rule_outranks_a_class_rule_whatever_the_order() {
+        let source = "\
+#hero { color: #00ff00; }
+.cta { color: #ff0000; }
+";
+        assert_eq!(
+            resolved_for(source, "a", &["cta"], Some("hero"))
+                .get("color")
+                .map(String::as_str),
+            Some("#00ff00"),
+            "one id outranks any number of classes"
+        );
+        assert_eq!(
+            resolved_for(source, "a", &["cta"], Some("other"))
+                .get("color")
+                .map(String::as_str),
+            Some("#ff0000"),
+            "a different id does not match at all"
+        );
+    }
+
+    #[test]
+    fn a_compound_selector_matches_an_element_that_carries_every_part() {
+        // `a.cta` was documented as supported but parsed to nothing, because the
+        // parser only accepted `.`/`#` at the front and then refused the tag.
+        let source = "a.cta { color: #ff0000; }";
+        assert_eq!(
+            resolved_map(source, "a", &["cta"])
+                .get("color")
+                .map(String::as_str),
+            Some("#ff0000"),
+            "the tag and the class together match"
+        );
+        assert!(
+            resolved_map(source, "button", &["cta"])
+                .get("color")
+                .is_none(),
+            "the tag still has to match"
+        );
+        assert!(
+            resolved_map(source, "a", &[]).get("color").is_none(),
+            "and so does the class"
+        );
+    }
+
+    #[test]
+    fn a_multi_class_selector_needs_all_of_its_classes() {
+        let source = ".a.b { color: #ff0000; }";
+        assert_eq!(
+            resolved_map(source, "div", &["a", "b"])
+                .get("color")
+                .map(String::as_str),
+            Some("#ff0000")
+        );
+        assert!(
+            resolved_map(source, "div", &["a"]).get("color").is_none(),
+            "one of the two is not enough, and the rule must not half-apply"
+        );
+    }
+
+    #[test]
+    fn the_background_shorthand_and_its_longhand_are_one_property() {
+        // CSS expands a shorthand into longhands before the cascade, so a later
+        // `background` beats an earlier `background-color` and vice versa. Both
+        // spellings resolving to separate keys meant whichever the consumer
+        // preferred won, whatever the author wrote last.
+        let shorthand_last = resolved_map(
+            "a { background-color: #ff0000; background: #0000ff; }",
+            "a",
+            &[],
+        );
+        assert_eq!(
+            shorthand_last.get("background-color").map(String::as_str),
+            Some("#0000ff"),
+            "the later shorthand wins"
+        );
+        assert!(
+            !shorthand_last.contains_key("background"),
+            "and it resolves under its longhand name, not the spelling used"
+        );
+
+        let longhand_last = resolved_map(
+            "a { background: #0000ff; background-color: #ff0000; }",
+            "a",
+            &[],
+        );
+        assert_eq!(
+            longhand_last.get("background-color").map(String::as_str),
+            Some("#ff0000"),
+            "a later longhand beats an earlier shorthand too"
+        );
+    }
+
+    #[test]
+    fn the_winning_spans_belong_to_the_declaration_that_actually_won() {
+        // The save layer rewrites the authored span this reports, so it has to be
+        // the span of the winning spelling — not of a fixed first choice.
+        let source = "a { background-color: #ff0000; background: #0000ff; }";
+        let sheet = Stylesheet::parse(source);
+        for property in ["background", "background-color"] {
+            let range = sheet
+                .declaration_value_range("a", &[], None, property)
+                .expect("the shorthand owns the longhand either way it is spelled");
+            assert_eq!(
+                &source[range.0..range.1],
+                "#0000ff",
+                "asking for `{property}` must still find the declaration that won"
+            );
+        }
+    }
+
+    #[test]
+    fn a_border_shorthand_reports_geometry_and_paint_separately() {
+        // `border: 1px solid` takes up space with no authored colour. Returning
+        // the two as one value would either invent a stroke or drop the border
+        // from the layout; reporting them separately lets each consumer take the
+        // half it understands.
+        assert_eq!(
+            parse_border("1px solid #ff0000"),
+            Some(BorderStyle {
+                width: 1.0,
+                color: parse_color("#ff0000"),
+            })
+        );
+        assert_eq!(
+            parse_border("2px #ff0000"),
+            Some(BorderStyle {
+                width: 2.0,
+                color: parse_color("#ff0000"),
+            }),
+            "the `solid` keyword is optional"
+        );
+        assert_eq!(
+            parse_border("#ff0000"),
+            Some(BorderStyle {
+                width: 1.0,
+                color: parse_color("#ff0000"),
+            }),
+            "and so is the width, which defaults to the CSS initial value"
+        );
+        assert_eq!(
+            parse_border("1px solid"),
+            Some(BorderStyle {
+                width: 1.0,
+                color: None
+            }),
+            "a border with no colour occupies space and paints nothing"
+        );
+        assert_eq!(
+            parse_border("none"),
+            Some(BorderStyle {
+                width: 0.0,
+                color: None
+            }),
+            "`border: none` is an explicit zero, not a parse failure"
+        );
+        for unsupported in [
+            "1px dashed #ff0000",
+            "2em solid #ff0000",
+            "1px solid rgb(1,2,3,4,5)",
+        ] {
+            assert!(
+                parse_border(unsupported).is_none(),
+                "`{unsupported}` is outside the supported subset and must not be guessed at"
+            );
+        }
+    }
+
+    #[test]
+    fn a_specificity_that_does_not_come_from_the_current_rule_cannot_win() {
+        // The comparison has to rank the incumbent by *its own* rule's
+        // specificity. Comparing both against the candidate's is order-dependent:
+        // an incumbent from a weak rule that happens to be visited while a strong
+        // rule is in hand looks strong enough to keep the slot.
+        let source = "\
+a { padding: 1px; }
+.cta { padding: 2px; }
+";
+        let sheet = Stylesheet::parse(source);
+        assert_eq!(
+            sheet.resolve("a", &["cta".to_owned()], None)["padding"].value,
+            "2px",
+            "the class rule wins"
+        );
+        // Reversing the visit order must not change the answer.
+        let reversed = Stylesheet::parse(
+            "\
+.cta { padding: 2px; }
+a { padding: 1px; }
+",
+        );
+        assert_eq!(
+            reversed.resolve("a", &["cta".to_owned()], None)["padding"].value,
+            "2px",
+            "and it still wins when the tag rule is authored last"
         );
     }
 
@@ -595,7 +987,7 @@ a { background-color: #ffffff; padding: 4px; }
 ";
         let resolved = resolved_map(source, "a", &["cta"]);
         assert_eq!(
-            resolved.get("background").map(String::as_str),
+            resolved.get("background-color").map(String::as_str),
             Some("#3b5bfd"),
             "the fixture's variable resolves to its authored value"
         );
@@ -609,7 +1001,7 @@ a { background-color: #ffffff; padding: 4px; }
         let source = ".cta { background: var(--nope); }";
         let resolved = resolved_map(source, "a", &["cta"]);
         assert_eq!(
-            resolved.get("background").map(String::as_str),
+            resolved.get("background-color").map(String::as_str),
             Some("var(--nope)")
         );
         assert!(
