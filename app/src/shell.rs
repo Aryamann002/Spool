@@ -1,8 +1,9 @@
 use gpui::{
-    div, point, prelude::*, px, rgb, Context, Entity, Render, SharedString, Subscription, Window,
+    div, point, prelude::*, px, rgb, Context, Entity, Modifiers, Render, SharedString,
+    Subscription, Window,
 };
 
-use crate::{canvas, inspector, layers::LayersView, project_open, theme};
+use crate::{canvas, commands, inspector, layers::LayersView, project_open, theme};
 
 const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
     ("↖", "Select", "V", canvas::Tool::Select),
@@ -15,53 +16,6 @@ const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
 ];
 
 const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShortcutAction {
-    Undo,
-    Redo,
-    Delete,
-    Duplicate,
-    Save,
-    Tool(canvas::Tool),
-}
-
-fn shortcut_action(
-    key: &str,
-    platform: bool,
-    control: bool,
-    shift: bool,
-) -> Option<ShortcutAction> {
-    if (platform || control) && key == "z" {
-        return Some(if shift {
-            ShortcutAction::Redo
-        } else {
-            ShortcutAction::Undo
-        });
-    }
-    if control && key == "y" {
-        return Some(ShortcutAction::Redo);
-    }
-    if (platform || control) && key == "d" {
-        return Some(ShortcutAction::Duplicate);
-    }
-    if (platform || control) && key == "s" {
-        return Some(ShortcutAction::Save);
-    }
-    match key {
-        "delete" | "backspace" => Some(ShortcutAction::Delete),
-        "v" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Select)),
-        "f" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Frame)),
-        "r" if !platform && !control && !shift => {
-            Some(ShortcutAction::Tool(canvas::Tool::Rectangle))
-        }
-        "o" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Ellipse)),
-        "t" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Text)),
-        "p" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Pen)),
-        "c" if !platform && !control && !shift => Some(ShortcutAction::Tool(canvas::Tool::Comment)),
-        _ => None,
-    }
-}
 
 /// Open the project named by `SPOOL_PROJECT`, if one was requested.
 ///
@@ -178,83 +132,118 @@ impl AppShell {
     /// switch to the frame tool.
     /// Escape, as one ladder walked from the top.
     ///
-    /// The research is unambiguous that Escape means "leave the most recent
-    /// thing you entered" — Figma calls it a chart traversal, tldraw the same.
-    /// Spool's handler used to do four unrelated jobs in one block, and what it
-    /// cancelled depended on which listener saw the key first. This is the one
-    /// place that decides, in the order every product in the corpus implies:
+    /// What Escape cancels must never depend on which listener happened to see
+    /// the key first, so this is the only place that decides and it decides by
+    /// reading [`commands::EscapeState`]: the ladder and its order live there,
+    /// where they can be tested without a window, and this function is the only
+    /// place that acts on the rung it returns.
     ///
-    /// 1. an open panel (a modal is above everything)
-    /// 2. an in-progress rename (a text buffer the user opened)
-    /// 3. an in-flight drag, whether it came from the canvas or the Inspector
+    /// The order is the finding, not a preference. Figma, tldraw and Affinity
+    /// all treat Escape as "up one level" — a selection scope, a state chart, a
+    /// tool mode — and Canva treats it as cancel:
+    ///
+    /// 1. an open panel, because a modal is above everything
+    /// 2. the Inspector, which walks its own rungs in the same order: a text
+    ///    buffer before a gesture, because what the user typed into is above
+    ///    what they are dragging
+    /// 3. a canvas gesture
     /// 4. an open text session
     /// 5. the selection
     /// 6. a non-Select tool, which returns to Select
     ///
     /// Returns whether anything was cancelled, so the caller knows the key was
     /// consumed.
+    /// Release the pan modifier, whatever else happens.
+    ///
+    /// The space bar is the one piece of state in the editor that a key-down
+    /// sets and a key-up clears, and it is only correct while both halves arrive.
+    /// Escape is the way to lose the second half deliberately: the user is
+    /// asking to back out of whatever they started, and "you are still holding
+    /// the pan modifier" is not it.
+    ///
+    /// Cheap and unconditional: the worst a redundant call costs is one
+    /// comparison, and being wrong here is a canvas that silently stops
+    /// responding to drags.
+    fn release_pan_modifier(&mut self, cx: &mut Context<Self>) {
+        self.canvas
+            .update(cx, |canvas, _| canvas.set_space_held(false));
+    }
+
     fn escape_topmost(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.ai_open || self.share_open || self.export_open || self.zoom_open {
-            self.ai_open = false;
-            self.share_open = false;
-            self.export_open = false;
-            self.zoom_open = false;
-            cx.notify();
-            return true;
+        // Any rung at all, so the pan modifier is released on the way past.
+        self.release_pan_modifier(cx);
+        // Whatever the Inspector is part-way through — a number being typed, a
+        // name being typed, or a drag in flight — is read as one rung. The
+        // panel walks its own rungs internally, in the same order, so the two
+        // cannot disagree about which of its two states is on top.
+        let state = commands::EscapeState {
+            panel: self.ai_open || self.share_open || self.export_open || self.zoom_open,
+            inspector: self
+                .inspector
+                .update(cx, |inspector, _| inspector.is_busy()),
+            gesture: self.canvas.read(cx).is_manipulating(),
+            text_editing: self.canvas.read(cx).is_text_editing(),
+            selection: !self.canvas.read(cx).selection().is_empty(),
+            tool: self.selected_tool != canvas::Tool::Select,
+        };
+        match state.next() {
+            Some(commands::Rung::Panel) => {
+                self.ai_open = false;
+                self.share_open = false;
+                self.export_open = false;
+                self.zoom_open = false;
+                cx.notify();
+                true
+            }
+            Some(commands::Rung::Inspector) => self
+                .inspector
+                .update(cx, |inspector, cx| inspector.cancel_in_flight(cx)),
+            Some(commands::Rung::Gesture) => self
+                .canvas
+                .update(cx, |canvas, cx| canvas.cancel_manipulation(cx)),
+            Some(commands::Rung::TextEditing) => self
+                .canvas
+                .update(cx, |canvas, cx| canvas.cancel_text_edit(cx)),
+            Some(commands::Rung::Selection) => {
+                self.canvas
+                    .update(cx, |canvas, cx| canvas.clear_selection(cx));
+                true
+            }
+            Some(commands::Rung::Tool) => {
+                self.selected_tool = canvas::Tool::Select;
+                self.canvas
+                    .update(cx, |canvas, _| canvas.set_tool(canvas::Tool::Select));
+                cx.notify();
+                true
+            }
+            None => false,
         }
-        // Whatever the Inspector is part-way through: a number being typed, a
-        // name being typed, or a drag in flight. It walks its own rungs in the
-        // same order this ladder does — a text buffer above a gesture — so
-        // handing the whole thing over keeps the two from disagreeing about
-        // which thing is on top.
-        if self
-            .inspector
-            .update(cx, |inspector, cx| inspector.cancel_in_flight(cx))
-        {
-            return true;
-        }
-        let cancelled_gesture = self
-            .canvas
-            .update(cx, |canvas, cx| canvas.cancel_manipulation(cx));
-        if cancelled_gesture {
-            return true;
-        }
-        if self.canvas.read(cx).is_text_editing() {
-            self.canvas
-                .update(cx, |canvas, cx| canvas.cancel_text_edit(cx));
-            return true;
-        }
-        let had_selection = !self.canvas.read(cx).selection().is_empty();
-        if had_selection {
-            self.canvas
-                .update(cx, |canvas, cx| canvas.clear_selection(cx));
-            return true;
-        }
-        if self.selected_tool != canvas::Tool::Select {
-            self.selected_tool = canvas::Tool::Select;
-            self.canvas
-                .update(cx, |canvas, _| canvas.set_tool(canvas::Tool::Select));
-            cx.notify();
-            return true;
-        }
-        false
     }
 
     /// Arrow keys: nudge a selection, otherwise pan the canvas.
     ///
     /// Figma's rule, recorded in `navigation.md`: with nothing selected the
     /// arrow keys pan, and with a selection they nudge it by 1px, or 10px with
-    /// `⇧`. Both are one semantic operation, so one arrow press is one undo
-    /// step — which is what makes holding an arrow key feel cheap to undo.
-    fn canvas_arrow_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
-        let (dx, dy) = match key {
-            "left" => (-1.0, 0.0),
-            "right" => (1.0, 0.0),
-            "up" => (0.0, -1.0),
-            "down" => (0.0, 1.0),
-            _ => return false,
+    /// `⇧`. One press is one semantic operation, so it is one undo step — which
+    /// is what makes holding an arrow key cheap to undo.
+    ///
+    /// Which of the two a key means is a fact about the document, not about the
+    /// key, so it is read here rather than in
+    /// [`commands::resolve`](commands::resolve): the resolver can only say "an
+    /// arrow key was pressed".
+    fn arrow_key(
+        &mut self,
+        direction: commands::Direction,
+        coarse: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (dx, dy) = match direction {
+            commands::Direction::Left => (-1.0, 0.0),
+            commands::Direction::Right => (1.0, 0.0),
+            commands::Direction::Up => (0.0, -1.0),
+            commands::Direction::Down => (0.0, 1.0),
         };
-        let step = if shift { 10.0 } else { 1.0 };
+        let step = if coarse { 10.0 } else { 1.0 };
         let moved = self.edit_canvas(cx, |canvas, _| canvas.nudge_selection(dx * step, dy * step));
         if moved {
             return true;
@@ -262,12 +251,143 @@ impl AppShell {
         // Nothing selected: the same keys move the view instead. A bigger jump,
         // because panning is navigation rather than an edit and does not need
         // the fine granularity a nudge does.
-        let pan_step = if shift { 400.0 } else { 40.0 };
+        let pan_step = if coarse { 400.0 } else { 40.0 };
         self.canvas.update(cx, |canvas, _| {
             canvas.pan_by(point(dx * pan_step, dy * pan_step))
         });
         cx.notify();
         true
+    }
+
+    /// The one place a keystroke the whole editor answers to is handled.
+    ///
+    /// Four steps, always in this order, and the order is the whole point: what
+    /// a key means is decided by which surface is above, never by which listener
+    /// happened to run first.
+    ///
+    /// 1. A performance workload owns the input outright while it is running.
+    /// 2. The Inspector gets first refusal. A number or a name being typed is
+    ///    not an editor shortcut, so letters go into the field rather than into
+    ///    the tool shortcuts. It declines Escape, which is the ladder's.
+    /// 3. Escape walks [`commands::EscapeState`] from the top. It is not in the
+    ///    command table, because "leave the most recent thing you entered" is
+    ///    not one of the table's verbs.
+    /// 4. Everything else is one row of [`commands::resolve`].
+    fn handle_key(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) {
+        if self.canvas.read(cx).workload_controls_input() {
+            return;
+        }
+        if self.inspector.update(cx, |inspector, cx| {
+            inspector.handle_key(key, modifiers.shift, cx)
+        }) {
+            return;
+        }
+        if key == "escape" {
+            self.escape_topmost(cx);
+            return;
+        }
+        // The pan modifier is held rather than pressed, so it is not a command
+        // and has no place in the table: it is answered on the way down and
+        // released on the way up. Space still scrolls the page when there is
+        // nothing to pan, so it is answered only here and nowhere else.
+        if matches!(key, "space" | " ") {
+            self.canvas
+                .update(cx, |canvas, _| canvas.set_space_held(true));
+            return;
+        }
+        let scope = if self.canvas.read(cx).is_text_editing() {
+            commands::Scope::TextEditing
+        } else {
+            commands::Scope::Editor
+        };
+        if let Some(command) = commands::resolve(key, modifiers, scope) {
+            self.run_command(command, cx);
+        }
+    }
+
+    /// Carry out one editor-wide command.
+    ///
+    /// Every history-affecting arm below goes through the canvas, which commits
+    /// to the one `EditSession` history the pointer uses. There is no second
+    /// route from the keyboard to the document, and no arm that edits state
+    /// directly: a command that mutated here would be invisible to undo.
+    fn run_command(&mut self, command: commands::Command, cx: &mut Context<Self>) {
+        match command {
+            commands::Command::Undo => {
+                self.canvas.update(cx, |canvas, cx| canvas.undo(cx));
+            }
+            commands::Command::Redo => {
+                self.canvas.update(cx, |canvas, cx| canvas.redo(cx));
+            }
+            commands::Command::Save => self.save_project(cx),
+            commands::Command::Delete => {
+                self.canvas
+                    .update(cx, |canvas, cx| canvas.delete_selection(cx));
+            }
+            commands::Command::Duplicate => {
+                self.canvas
+                    .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
+            }
+            commands::Command::SelectAll => {
+                self.canvas.update(cx, |canvas, cx| canvas.select_all(cx));
+            }
+            commands::Command::Rename => self.rename_selection(cx),
+            commands::Command::Tool(tool) => {
+                self.selected_tool = tool;
+                self.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
+                cx.notify();
+            }
+            commands::Command::Nudge { direction, coarse } => {
+                self.arrow_key(direction, coarse, cx);
+            }
+            commands::Command::Traverse(step) => {
+                self.canvas
+                    .update(cx, |canvas, cx| canvas.traverse(step, cx));
+            }
+            commands::Command::ZoomIn => {
+                self.canvas.update(cx, |canvas, _| canvas.zoom_in());
+            }
+            commands::Command::ZoomOut => {
+                self.canvas.update(cx, |canvas, _| canvas.zoom_out());
+            }
+            commands::Command::ZoomToFit => {
+                self.canvas.update(cx, |canvas, _| canvas.fit_canvas());
+            }
+            commands::Command::ZoomToSelection => {
+                self.canvas
+                    .update(cx, |canvas, _| canvas.zoom_to_selection());
+            }
+            commands::Command::ZoomToActualSize => {
+                self.canvas
+                    .update(cx, |canvas, _| canvas.zoom_to_actual_size());
+            }
+        }
+        // A camera command moves no document state, so the chrome around the
+        // canvas has to be told even though the canvas already notified.
+        if command.is_camera() {
+            cx.notify();
+        }
+    }
+
+    /// Open a rename on the selection — `Enter` or `F2`.
+    ///
+    /// The Inspector owns the one rename model, whichever surface asked for it:
+    /// the Layers panel states a rename request and this states the same kind of
+    /// request, so a name typed from the canvas is the same buffer, the same
+    /// commit, and the same Escape behaviour as one typed from the panel.
+    ///
+    /// Only a single selection. Figma renames the layer it has selected and
+    /// does nothing otherwise, and renaming forty layers into one string would
+    /// not be a rename.
+    fn rename_selection(&mut self, cx: &mut Context<Self>) {
+        let ids = self.canvas.read(cx).selection().ids().to_vec();
+        let [id] = ids.as_slice() else {
+            return;
+        };
+        self.inspector.update(cx, |inspector, cx| {
+            inspector.open_rename(*id, cx);
+            cx.notify();
+        });
     }
 
     /// Save the open project and report what actually happened.
@@ -979,125 +1099,7 @@ impl Render for AppShell {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if this.canvas.read(cx).workload_controls_input() {
-                    return;
-                }
-                let key = event.keystroke.key.as_str();
-                let modifiers = event.keystroke.modifiers;
-                // The Inspector gets first refusal on every key: a name or a
-                // number being typed is not an editor shortcut, so letters go
-                // into the field rather than into tool shortcuts. It declines
-                // Escape, which belongs to the ladder below.
-                if this.inspector.update(cx, |inspector, cx| {
-                    inspector.handle_key(key, modifiers.shift, cx)
-                }) {
-                    return;
-                }
-                // Escape is one ladder, always walked from the top, so that what
-                // it cancels never depends on which listener happened to see the
-                // key first. See `escape_topmost`.
-                if key == "escape" && this.escape_topmost(cx) {
-                    return;
-                }
-                if this.canvas.read(cx).is_text_editing() {
-                    match shortcut_action(
-                        key,
-                        modifiers.platform,
-                        modifiers.control,
-                        modifiers.shift,
-                    ) {
-                        Some(ShortcutAction::Undo) => {
-                            this.canvas.update(cx, |canvas, cx| canvas.undo(cx));
-                        }
-                        Some(ShortcutAction::Redo) => {
-                            this.canvas.update(cx, |canvas, cx| canvas.redo(cx));
-                        }
-                        Some(ShortcutAction::Duplicate) => {
-                            this.canvas
-                                .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
-                        }
-                        Some(ShortcutAction::Delete)
-                        | Some(ShortcutAction::Tool(_))
-                        | Some(ShortcutAction::Save)
-                        | None => {
-                            if key == "escape" {
-                                this.canvas
-                                    .update(cx, |canvas, cx| canvas.cancel_text_edit(cx));
-                            }
-                        }
-                    }
-                    return;
-                }
-                match shortcut_action(key, modifiers.platform, modifiers.control, modifiers.shift) {
-                    Some(ShortcutAction::Undo) => {
-                        this.canvas.update(cx, |canvas, cx| canvas.undo(cx));
-                        return;
-                    }
-                    Some(ShortcutAction::Save) => {
-                        this.save_project(cx);
-                        return;
-                    }
-                    Some(ShortcutAction::Redo) => {
-                        this.canvas.update(cx, |canvas, cx| canvas.redo(cx));
-                        return;
-                    }
-                    Some(ShortcutAction::Delete) => {
-                        this.canvas
-                            .update(cx, |canvas, cx| canvas.delete_selection(cx));
-                        return;
-                    }
-                    Some(ShortcutAction::Duplicate) => {
-                        this.canvas
-                            .update(cx, |canvas, cx| canvas.duplicate_selection(cx));
-                        return;
-                    }
-                    Some(ShortcutAction::Tool(tool)) => {
-                        this.selected_tool = tool;
-                        this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
-                        cx.notify();
-                        return;
-                    }
-                    None => {}
-                }
-                // Arrow keys: nudge a selection, or pan when there is none.
-                // Reached here rather than in `shortcut_action` because these
-                // are not shortcuts but two different jobs chosen by whether
-                // anything is selected — a rule a keymap cannot express.
-                if this.canvas_arrow_key(key, modifiers.shift, cx) {
-                    return;
-                }
-                let tool = match key {
-                    // Figma: `⇧1` fits the document, `⇧2` frames the
-                    // selection, `⇧0` returns to actual size.
-                    "1" if modifiers.shift => {
-                        this.canvas.update(cx, |canvas, _| canvas.fit_canvas());
-                        cx.notify();
-                        return;
-                    }
-                    "2" if modifiers.shift => {
-                        this.canvas
-                            .update(cx, |canvas, _| canvas.zoom_to_selection());
-                        cx.notify();
-                        return;
-                    }
-                    "0" if modifiers.shift => {
-                        this.canvas
-                            .update(cx, |canvas, _| canvas.zoom_to_actual_size());
-                        cx.notify();
-                        return;
-                    }
-                    "space" | " " => {
-                        this.canvas
-                            .update(cx, |canvas, _| canvas.set_space_held(true));
-                        None
-                    }
-                    _ => None,
-                };
-                if let Some(tool) = tool {
-                    this.selected_tool = tool;
-                    this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
-                    cx.notify();
-                }
+                this.handle_key(event.keystroke.key.as_str(), event.keystroke.modifiers, cx);
             }))
             .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "space" | " ") {
@@ -1206,87 +1208,4 @@ fn popover_row(label: &'static str, shortcut: &'static str) -> impl IntoElement 
         .text_color(rgb(theme::TEXT_SECONDARY))
         .child(label)
         .child(div().text_color(rgb(theme::TEXT_MUTED)).child(shortcut))
-}
-
-#[cfg(test)]
-mod shortcut_tests {
-    use super::*;
-
-    #[test]
-    fn delete_and_backspace_map_to_delete_command() {
-        for key in ["delete", "backspace"] {
-            assert_eq!(
-                shortcut_action(key, false, false, false),
-                Some(ShortcutAction::Delete)
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_uses_platform_or_control_modifier() {
-        assert_eq!(
-            shortcut_action("d", true, false, false),
-            Some(ShortcutAction::Duplicate)
-        );
-        assert_eq!(
-            shortcut_action("d", false, true, false),
-            Some(ShortcutAction::Duplicate)
-        );
-        assert_eq!(shortcut_action("d", false, false, false), None);
-    }
-
-    #[test]
-    fn undo_redo_shortcuts_and_tool_keys_remain_available() {
-        assert_eq!(
-            shortcut_action("z", true, false, false),
-            Some(ShortcutAction::Undo)
-        );
-        assert_eq!(
-            shortcut_action("z", false, true, true),
-            Some(ShortcutAction::Redo)
-        );
-        assert_eq!(
-            shortcut_action("y", false, true, false),
-            Some(ShortcutAction::Redo)
-        );
-        assert_eq!(
-            shortcut_action("v", false, false, false),
-            Some(ShortcutAction::Tool(canvas::Tool::Select))
-        );
-        assert_eq!(
-            shortcut_action("f", false, false, false),
-            Some(ShortcutAction::Tool(canvas::Tool::Frame))
-        );
-        assert_eq!(
-            shortcut_action("r", false, false, false),
-            Some(ShortcutAction::Tool(canvas::Tool::Rectangle))
-        );
-        assert_eq!(
-            shortcut_action("o", false, false, false),
-            Some(ShortcutAction::Tool(canvas::Tool::Ellipse))
-        );
-        assert_eq!(
-            shortcut_action("t", false, false, false),
-            Some(ShortcutAction::Tool(canvas::Tool::Text))
-        );
-        assert_eq!(shortcut_action("r", true, false, false), None);
-    }
-
-    #[test]
-    fn save_is_reachable_from_the_keyboard_on_both_platform_conventions() {
-        // The save half of the loop needs a real command, not only a developer
-        // workflow. Both conventions map to it so the shortcut works wherever
-        // the editor runs.
-        assert_eq!(
-            shortcut_action("s", true, false, false),
-            Some(ShortcutAction::Save)
-        );
-        assert_eq!(
-            shortcut_action("s", false, true, false),
-            Some(ShortcutAction::Save)
-        );
-        // A bare "s" is still not a command: it must keep falling through to
-        // text entry rather than silently saving.
-        assert_eq!(shortcut_action("s", false, false, false), None);
-    }
 }

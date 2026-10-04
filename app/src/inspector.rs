@@ -1049,6 +1049,17 @@ impl Inspector {
         self.rename.as_ref().map(|session| session.id)
     }
 
+    /// Whether the Inspector is part-way through something Escape could give up.
+    ///
+    /// Read-only, and kept deliberately in step with
+    /// [`Self::cancel_in_flight`]: the editor's Escape ladder reads this to
+    /// decide which rung is on top, and only then asks the Inspector to act on
+    /// it. Two separate questions, so the ladder can be decided from state
+    /// rather than from whatever happened to be cancelled first.
+    pub fn is_busy(&self) -> bool {
+        self.edit.is_some() || self.rename.is_some() || self.scrub.is_some()
+    }
+
     /// Give up whatever the Inspector is part-way through.
     ///
     /// A text buffer before a gesture, in the order the editor's Escape ladder

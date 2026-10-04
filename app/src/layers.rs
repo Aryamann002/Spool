@@ -217,7 +217,11 @@ enum Navigation {
 fn navigation(key: &str, modifiers: Modifiers) -> Option<Navigation> {
     let command = modifiers.platform || modifiers.control;
     match key {
-        "enter" | "f2" => Some(Navigation::Rename),
+        // `F2` alone opens the rename. `Enter` used to sit here too, and Figma
+        // does read `Enter` as rename in a layer list — but the panel gives the
+        // key back instead of claiming it, so it reaches the editor-wide table
+        // and descends the hierarchy. One key, one meaning, on both surfaces.
+        "f2" => Some(Navigation::Rename),
         "tab" => Some(Navigation::Sibling(if modifiers.shift { -1 } else { 1 })),
         // `⇧` is never in the match: it is a modifier on these keys, never a
         // way to reach them, so `⇧⌘↓` extends and `⌘↓` replaces.
@@ -2327,12 +2331,15 @@ mod tests {
             navigation("end", modifiers(false, false)),
             Some(Navigation::Extreme(true))
         );
-        for key in ["enter", "f2"] {
-            assert_eq!(
-                navigation(key, modifiers(false, false)),
-                Some(Navigation::Rename)
-            );
-        }
+        assert_eq!(
+            navigation("f2", modifiers(false, false)),
+            Some(Navigation::Rename)
+        );
+        // `Enter` and `⇧Enter` belong to the hierarchy ladder now. The panel
+        // returns `None` so the key is not swallowed here and reaches the
+        // editor-wide table, which resolves them to descend and ascend.
+        assert_eq!(navigation("enter", modifiers(false, false)), None);
+        assert_eq!(navigation("enter", modifiers(true, false)), None);
         assert_eq!(navigation("delete", modifiers(false, false)), None);
         assert_eq!(navigation("v", modifiers(false, false)), None);
     }

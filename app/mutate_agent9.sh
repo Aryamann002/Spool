@@ -86,15 +86,28 @@ source = source.replace(old, new, 1)' \
 
 # 4. Each axis compares against its own candidate lines. Sharing one list makes a
 #    purely horizontal drag move the object vertically as well.
+#
+#    Re-derived when the axis loop moved into `candidate_lines(&rects, axis)`:
+#    the mutation is now "both axes are handed the same list", which is the same
+#    bug at the same seam.
 run_mutation "the vertical axis compares against horizontal candidate lines" \
   src/snap.rs \
-  'old = """        [moved.top(), moved.center_y(), moved.bottom()],
-        horizontal_lines.into_iter(),"""
-new = """        [moved.top(), moved.center_y(), moved.bottom()],
-        vertical_lines.into_iter(),"""
-assert old in source, "horizontal line list not found"
+  'old = """    let mut guides = Vec::new();
+    for axis in [Axis::Vertical, Axis::Horizontal] {
+        if !lock.allows(axis) {
+            continue;
+        }
+        let candidates = candidate_lines(&rects, axis);"""
+new = """    let mut guides = Vec::new();
+    let shared = candidate_lines(&rects, Axis::Vertical);
+    for axis in [Axis::Vertical, Axis::Horizontal] {
+        if !lock.allows(axis) {
+            continue;
+        }
+        let candidates = &shared;"""
+assert old in source, "per-axis candidate list not found"
 source = source.replace(old, new, 1)' \
-  "a_drag_near_a_neighbour_snap_into_line_and_say_so"
+  "the_axes_are_considered_independently"
 
 # 5. `⌘` suspends snapping for the whole gesture.
 run_mutation "the command modifier no longer suspends snapping" \
@@ -127,8 +140,9 @@ source = source.replace(old, new, 1)' \
 # 7. `⇧` constrains a move to the dominant axis.
 run_mutation "shift no longer constrains a move to one axis" \
   src/canvas.rs \
-  'old = """        let raw = if self.constrain_drag {"""
-new = """        let raw = if false && self.constrain_drag {"""
+  'old = """        let lock = dragged_axis(raw, self.constrain_drag);"""
+new = """        let lock = snap::AxisLock::Free;
+        let _ = dragged_axis(raw, self.constrain_drag);"""
 assert old in source, "constrain_drag branch not found"
 source = source.replace(old, new, 1)' \
   "shift_constrains_a_move_to_the_axis_the_pointer_chose"
@@ -191,24 +205,32 @@ source = source.replace(old, new, 1)' \
 # 12. A rename opened from Layers opens with the existing name selected, so the
 #     first keystroke replaces rather than appends.
 run_mutation "a rename appends to the old name instead of replacing it" \
-  src/shell.rs \
+  src/inspector.rs \
   'old = """                if self.select_all {
                     self.buffer.clear();
                     self.select_all = false;
                 }
-                self.buffer.push_str(other);"""
+                self.buffer.push_str(other);
+                RenameEffect::Continue"""
 new = """                if false {
                     self.buffer.clear();
                     self.select_all = false;
                 }
-                self.buffer.push_str(other);"""
+                self.buffer.push_str(other);
+                RenameEffect::Continue"""
 assert old in source, "select_all branch not found"
+# `inspector.rs` has two edit sessions with the same select-all rule — one for a
+# numeric field, one for a rename — and `replace(..., 1)` takes the *first*. The
+# `RenameEffect` tail is what makes this pattern name the rename session rather
+# than the field session; without it the mutation lands in the wrong one and
+# SURVIVES, which is a broken mutation rather than a missing test.
+assert source.count(old) == 1, f"pattern is ambiguous: {source.count(old)} matches"
 source = source.replace(old, new, 1)' \
   "a_rename_opens_with_the_old_name_selected_so_the_first_key_replaces_it"
 
 # 13. Escape abandons an open rename without touching the document.
 run_mutation "escape commits an abandoned rename" \
-  src/shell.rs \
+  src/inspector.rs \
   'old = """            "escape" => {
                 self.close();
                 RenameEffect::Abandon
@@ -242,38 +264,46 @@ source = source.replace(old, new, 1)' \
 
 # 15. An Inspector section index must not be able to index past the array.
 run_mutation "the typography section claims a slot that is already taken" \
-  src/shell.rs \
-  'old = """const SECTION_TYPOGRAPHY: usize = 3;"""
-new = """const SECTION_TYPOGRAPHY: usize = 2;"""
+  src/inspector.rs \
+  'old = """    pub const TYPOGRAPHY: Self = Self(3);"""
+new = """    pub const TYPOGRAPHY: Self = Self(2);"""
 assert old in source, "typography slot not found"
 source = source.replace(old, new, 1)' \
-  "every_inspector_section_has_its_own_slot_in_range"
+  "every_section_has_its_own_slot_in_range"
 
 # 16. A `⇧`-click in Layers toggles the row instead of replacing the selection.
 run_mutation "shift-clicking a layer row always replaces the selection" \
   src/layers.rs \
-  'old = """        RowAction::Select { additive: shift }"""
-new = """        RowAction::Select { additive: false }"""
-assert old in source, "row additive not found"
+  'old = """    let mode = if input.shift {
+        SelectMode::Range"""
+new = """    let mode = if false && input.shift {
+        SelectMode::Range"""
+assert old in source, "row mode not found"
 source = source.replace(old, new, 1)' \
-  "a_row_click_replaces_the_selection_shifted_click_toggles_and_a_double_click_renames"
+  "a_click_replaces_command_click_is_additive_and_shift_click_is_a_range"
 
 # 17. A double click on a layer row opens a rename rather than selecting.
 run_mutation "double-clicking a layer row does not open a rename" \
   src/layers.rs \
-  'old = """    if click_count >= 2 {"""
-new = """    if false && click_count >= 2 {"""
+  'old = """    if input.clicks >= 2 {"""
+new = """    if false && input.clicks >= 2 {"""
 assert old in source, "double click branch not found"
 source = source.replace(old, new, 1)' \
-  "a_row_click_replaces_the_selection_shifted_click_toggles_and_a_double_click_renames"
+  "a_second_click_renames_rather_than_selecting_again"
 
 # 18. Snap targets exclude the moving object and its descendants.
+#
+#     Re-derived when the viewport bound was added in front of the descendant
+#     filter: the mutation now drops only the descendant half, so it still
+#     targets the same rule rather than the viewport one.
 run_mutation "an object snaps to its own child" \
   src/canvas.rs \
-  'old = """                !moving_nodes
-                    .iter()
-                    .any(|candidate| self.is_within(node, candidate))"""
-new = """                true"""
+  'old = """                self.camera.sees(*rect)
+                    && !moving_nodes
+                        .iter()
+                        .any(|candidate| self.is_within(node, candidate))"""
+new = """                let _ = node;
+                self.camera.sees(*rect)"""
 assert old in source, "snap target filter not found"
 source = source.replace(old, new, 1)' \
   "an_object_does_not_snap_to_its_own_child"

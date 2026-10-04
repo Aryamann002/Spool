@@ -1,6 +1,8 @@
 mod canvas;
+mod commands;
 mod diagnostics;
 mod document_runtime_bridge;
+mod hierarchy;
 mod inspector;
 mod layers;
 mod operations;

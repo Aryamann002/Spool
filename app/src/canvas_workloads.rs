@@ -144,6 +144,9 @@ impl CanvasView {
                     pointer_start_world: point(0.0, 0.0),
                     click_selection: ClickSelection::SelectOnly(selected_ids[0]),
                     suspend_snap: false,
+                    duplicate: false,
+                    duplicates: Vec::new(),
+                    placements: Vec::new(),
                     objects,
                     selected_ids,
                 });
@@ -175,6 +178,9 @@ impl CanvasView {
                     selected_ids: vec![root_id],
                     click_selection: ClickSelection::SelectOnly(root_id),
                     suspend_snap: false,
+                    duplicate: false,
+                    duplicates: Vec::new(),
+                    placements: Vec::new(),
                 });
             }
             diagnostics::count("canvas_notify", 1);
@@ -752,9 +758,12 @@ guides_cleared={} hover_cleared={} entries_added={depth_added} history_restored=
             selected_ids: vec![id],
             click_selection: ClickSelection::SelectOnly(id),
             suspend_snap,
+            duplicate: false,
+            duplicates: Vec::new(),
+            placements: Vec::new(),
         };
         self.interaction = Interaction::PotentialMove(gesture);
-        self.update_interaction_with(screen, constrain);
+        self.update_interaction_with(screen, constrain, false);
         let position = self.session.runtime.geometry(id).unwrap().position;
         let guides = self.snap_guides().len();
         self.finish_interaction(screen);
