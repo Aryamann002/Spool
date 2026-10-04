@@ -27,6 +27,16 @@
 //! is located at the bundle root; the `file` of each source binding is
 //! resolved relative to that root, so a project may use `pages/`, `styles/`,
 //! `assets/`, or anything else without this module being changed.
+//!
+//! # The `sources` key namespace
+//!
+//! [`PersistentDocument::sources`] is keyed by a project-root-relative path,
+//! spelled with `/` separators: the same namespace metadata's `file` field
+//! uses, and the same one a later write resolves against. A stylesheet reached
+//! through a `<link>` is therefore keyed by where it *landed*
+//! (`styles/site.css`), never by the href that found it
+//! (`../styles/site.css`). Keeping one namespace is what lets a save address a
+//! file without knowing whether metadata or markup discovered it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -59,6 +69,13 @@ pub enum BundleError {
         selector: String,
         matches: usize,
     },
+    /// The document about to be written would not bind against the source about
+    /// to be written.
+    ///
+    /// Reported instead of written because the alternative is a project on disk
+    /// that no longer opens — the one failure a source-backed editor cannot
+    /// repair for the user.
+    UnsavableStructure { path: PathBuf, detail: String },
     /// Reading or writing failed. Metadata replacement is failure-safe, so
     /// this never leaves a partially written `lamine.yaml` behind.
     Io {
@@ -101,6 +118,11 @@ impl fmt::Display for BundleError {
                 f,
                 "node {} binds to {selector} in {file}, which matched {matches} elements (expected exactly 1)",
                 id.as_str()
+            ),
+            Self::UnsavableStructure { path, detail } => write!(
+                f,
+                "{} would not describe a project that can be opened: {detail}",
+                path.display()
             ),
             Self::Io { path, source } => {
                 write!(f, "{} could not be accessed: {source}", path.display())
@@ -164,6 +186,10 @@ impl ProjectBundle {
         // Read each bound file once, in deterministic order. A reference that
         // escapes the root is rejected before any file is opened.
         let mut authored: BTreeMap<String, String> = BTreeMap::new();
+        // One file, one key. Two metadata spellings of the same path (`a.css`
+        // and `./a.css`) must not become two copies of one stylesheet, or a
+        // later write would not know which key it owns.
+        let mut loaded: BTreeMap<PathBuf, String> = BTreeMap::new();
         for node in &structure.nodes {
             if authored.contains_key(&node.source.file) {
                 continue;
@@ -176,39 +202,53 @@ impl ProjectBundle {
             })?;
             // A missing file is the common case and deserves its own
             // actionable variant rather than a generic IO error.
-            let contents = std::fs::read_to_string(&path).map_err(|source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    BundleError::MissingSource {
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BundleError::MissingSource {
                         file: node.source.file.clone(),
                         referenced_by: node.id.clone(),
-                    }
-                } else {
-                    BundleError::Io { path, source }
+                    });
                 }
-            })?;
+                Err(source) => return Err(BundleError::Io { path, source }),
+            };
+            loaded.insert(path, node.source.file.clone());
             authored.insert(node.source.file.clone(), contents);
         }
 
         // Stylesheets the HTML links are part of the authored project and are
         // loaded alongside it. Without them the runtime cannot know how the
         // source is meant to look, and would fall back to invented defaults.
-        // The link is followed the way a browser would: out of the HTML, into
-        // the project root, never outside it.
-        let linked: Vec<String> = authored
-            .values()
-            .flat_map(|contents| linked_stylesheets(contents))
+        // The link is followed the way a browser would: out of the document
+        // that wrote it, into the project, never above the root.
+        //
+        // Collected before reading, because the references come from the
+        // documents already loaded and inserting into that map while reading
+        // it would not be a sequential pass.
+        let linked: Vec<(String, PathBuf)> = authored
+            .iter()
+            .flat_map(|(file, contents)| {
+                linked_stylesheets(contents)
+                    .into_iter()
+                    .filter_map(|href| resolve_document_reference(&root, file, &href))
+            })
             .collect();
-        for href in linked {
-            if authored.contains_key(&href) {
+        for (key, path) in linked {
+            if authored.contains_key(&key) || loaded.contains_key(&path) {
                 continue;
             }
-            let Some(path) = resolve_within_root(&root, &href) else {
-                // A stylesheet outside the project is not followed. It is left
-                // unstyled rather than resolved against an unexpected path.
-                continue;
-            };
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                authored.insert(href, contents);
+            // A stylesheet that is not there is left unstyled rather than
+            // resolved against an unexpected path, and a stylesheet that
+            // cannot be read is reported rather than silently styled without.
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    loaded.insert(path, key.clone());
+                    authored.insert(key, contents);
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(BundleError::Io { path, source });
+                }
             }
         }
 
@@ -236,6 +276,23 @@ impl ProjectBundle {
                 structure,
                 sources: authored.into_iter().collect(),
             },
+        })
+    }
+
+    /// Read only `lamine.yaml`, as it currently stands on disk.
+    ///
+    /// A save needs to know whether the structure it holds differs from the one
+    /// on disk, and answering that must not re-read and re-validate every
+    /// authored file: by the time a save runs, its edits are already resolved,
+    /// and a full reload could fail for a reason that has nothing to do with
+    /// the metadata being written. Nothing here touches authored source.
+    pub fn load_structure(root: impl AsRef<Path>) -> Result<LamineStructure, BundleError> {
+        let root = root.as_ref();
+        let metadata_path = Self::locate_metadata(root)?;
+        let metadata = read(&metadata_path)?;
+        LamineStructure::from_yaml(&metadata).map_err(|source| BundleError::MalformedMetadata {
+            path: metadata_path,
+            source,
         })
     }
 
@@ -349,11 +406,80 @@ fn quoted_attribute(tag: &str, name: &str) -> Vec<String> {
     values
 }
 
+/// Resolve a reference a document makes to another file in the project.
+///
+/// The rule is the browser's, not the bundle root's: a relative reference
+/// resolves against the directory of the document that wrote it. A document at
+/// `pages/index.html` that links `../styles/site.css` therefore reaches
+/// `styles/site.css` — the layout a real site uses, and the one this loader
+/// used to miss entirely because it measured the href from the root. Climbing
+/// above the root is still refused, so "in this project" survives.
+///
+/// Returns the project-root-relative key the file is stored under, so callers
+/// never have to reconstruct one from an href.
+fn resolve_document_reference(
+    root: &Path,
+    document: &str,
+    reference: &str,
+) -> Option<(String, PathBuf)> {
+    let reference = Path::new(reference);
+    if reference.is_absolute() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let push_normal = |component: &Component, parts: &mut Vec<String>| -> bool {
+        match component {
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => {
+                    parts.push(part.to_owned());
+                    true
+                }
+                None => false,
+            },
+            Component::CurDir => true,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => false,
+        }
+    };
+    for component in Path::new(document)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        if !push_normal(&component, &mut parts) {
+            return None;
+        }
+    }
+    // `..` is how a reference climbs, which is why the root is checked as a
+    // floor rather than banned: `pages/../styles/site.css` is a legal way to
+    // name `styles/site.css`, and `../outside.css` is refused because it would
+    // have to climb above an empty stack.
+    for component in reference.components() {
+        match component {
+            Component::Normal(part) => match part.to_str() {
+                Some(part) => parts.push(part.to_owned()),
+                None => return None,
+            },
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let key = parts.join("/");
+    Some((key.clone(), root.join(Path::new(&key))))
+}
+
 /// Resolve `reference` inside `root`, rejecting anything that escapes it.
 ///
 /// Absolute paths and `..` traversal are rejected: a binding names a file in
 /// this project, not anywhere on the filesystem.
-fn resolve_within_root(root: &Path, reference: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_within_root(root: &Path, reference: &str) -> Option<PathBuf> {
     let relative = Path::new(reference);
     if relative.is_absolute() {
         return None;
@@ -378,19 +504,27 @@ fn read(path: &Path) -> Result<String, BundleError> {
 }
 
 /// Replace `target` with `bytes` without ever exposing a partial write.
+///
+/// The temporary name carries the process id *and* a counter, so two saves in
+/// one process — which is the normal shape of an editor, not an exotic one —
+/// cannot pick the same scratch file and write through each other.
 pub(crate) fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), BundleError> {
     use std::io::Write;
+
+    static NEXT_TEMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let directory = target.parent().unwrap_or_else(|| Path::new("."));
     // A sibling temp file keeps the rename on one filesystem, which is what
     // makes the replacement atomic.
     let temporary = directory.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         target
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| METADATA_FILE.into()),
-        std::process::id()
+        std::process::id(),
+        sequence
     ));
 
     let write_result = (|| -> std::io::Result<()> {
@@ -507,15 +641,127 @@ mod tests {
         // Nothing in the loader knows these directory names; they come only
         // from each node's own `file` binding.
         let bundle = ProjectBundle::load(fixture_root("nested")).expect("nested fixture loads");
-        let files: Vec<&String> = bundle.document.sources.keys().collect();
-        assert_eq!(files, ["pages/index.html"]);
+        // The page's own file, plus the stylesheet it links — resolved the way a
+        // browser resolves it, from `pages/` upward, and keyed by where it
+        // landed rather than by the href that found it. Compared as a set
+        // because the map is not ordered.
+        let mut files: Vec<&String> = bundle.document.sources.keys().collect();
+        files.sort();
+        assert_eq!(files, ["pages/index.html", "styles/site.css"]);
         assert!(bundle.document.sources["pages/index.html"].contains("spool-page-home"));
+        assert!(
+            bundle.document.sources["styles/site.css"].contains("letter-spacing"),
+            "the linked stylesheet is authored source the runtime must see"
+        );
 
-        // styles/ and assets/ exist but carry no data-spool-id binding, so
-        // they are deliberately not loaded: this phase resolves what
-        // metadata references and does not go looking for more.
-        assert!(bundle.root().join("styles/site.css").is_file());
+        // assets/ carries no data-spool-id binding and no link, so it is
+        // deliberately not loaded: this phase resolves what the project
+        // references and does not go looking for more.
         assert!(bundle.root().join("assets/logo.svg").is_file());
+        assert!(!bundle.document.sources.contains_key("assets/logo.svg"));
+    }
+
+    #[test]
+    fn a_linked_stylesheet_is_keyed_by_where_it_landed_not_by_its_href() {
+        // The key a file is stored under has to be resolvable as a write
+        // target. An href of `../styles/site.css` is not; `styles/site.css`,
+        // which is the same file measured from the project root, is.
+        let bundle = ProjectBundle::load(fixture_root("nested")).expect("nested fixture loads");
+        for key in bundle.document.sources.keys() {
+            assert!(
+                !key.contains(".."),
+                "a sources key must be project-root-relative: {key}"
+            );
+            let path = resolve_within_root(bundle.root(), key).expect("key resolves in-project");
+            assert!(path.is_file(), "{key} should name a file that exists");
+        }
+    }
+
+    #[test]
+    fn a_link_that_climbs_out_of_the_project_is_not_followed() {
+        // `../outside.css` from a page at the root would escape the project.
+        // It is left unfollowed rather than read from the filesystem above it,
+        // which is the same rule a binding reference follows.
+        let dir = scratch("landing");
+        let html = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            html.replace(
+                r#"<link rel="stylesheet" href="styles.css" />"#,
+                "<link rel=\"stylesheet\" href=\"../outside.css\" />",
+            ),
+        )
+        .unwrap();
+
+        let bundle = ProjectBundle::load(&dir).expect("the project still loads");
+        assert!(
+            !bundle.document.sources.contains_key("../outside.css"),
+            "an escaping href must not become a source key"
+        );
+        assert!(!bundle.document.sources.contains_key("styles.css"));
+    }
+
+    #[test]
+    fn one_file_loaded_twice_keeps_one_key() {
+        // Two spellings of the same stylesheet must not become two copies: a
+        // later write addresses a file by key and would not know which one it
+        // owns.
+        let dir = scratch("landing");
+        let bundle = ProjectBundle::load(&dir).expect("scratch loads");
+        let css: Vec<String> = bundle
+            .document
+            .sources
+            .keys()
+            .filter(|key| key.ends_with(".css"))
+            .cloned()
+            .collect();
+        assert_eq!(css, ["styles.css"]);
+
+        // Same file, spelled differently in metadata, reached through the link
+        // as well: still one entry.
+        let metadata = std::fs::read_to_string(dir.join(METADATA_FILE)).unwrap();
+        std::fs::write(
+            dir.join(METADATA_FILE),
+            metadata.replace("file: \"index.html\"", "file: \"./index.html\""),
+        )
+        .unwrap();
+        let bundle = ProjectBundle::load(&dir).expect("scratch loads with a dotted path");
+        assert!(
+            bundle.document.sources.contains_key("./index.html"),
+            "metadata keeps the spelling it authored"
+        );
+        assert_eq!(
+            bundle
+                .document
+                .sources
+                .keys()
+                .filter(|key| key.ends_with(".css"))
+                .count(),
+            1,
+            "the linked stylesheet is not loaded a second time"
+        );
+    }
+
+    #[test]
+    fn load_structure_reads_metadata_without_reading_authored_source() {
+        let dir = scratch("landing");
+        let structure = ProjectBundle::load_structure(&dir).expect("metadata alone loads");
+        assert_eq!(structure.nodes.len(), 3);
+
+        // It is metadata only: deleting an authored file the bindings name does
+        // not affect the answer, which is exactly why a save may use it.
+        std::fs::remove_file(dir.join("index.html")).unwrap();
+        assert_eq!(
+            ProjectBundle::load_structure(&dir)
+                .expect("still loads")
+                .nodes
+                .len(),
+            3
+        );
+        assert!(
+            ProjectBundle::load(&dir).is_err(),
+            "a full load still refuses a project whose source is missing"
+        );
     }
 
     #[test]
@@ -917,14 +1163,17 @@ mod tests {
         }
     }
 
+    /// Whether any atomic-write scratch file survived in `dir`.
+    ///
+    /// Matches every file Spool stages, not just the metadata one: authored
+    /// sources go through the same replace, so a save that leaves a scratch
+    /// file behind has a bug a metadata-only check would miss.
     fn has_temp_files(dir: &Path) -> bool {
         std::fs::read_dir(dir)
             .map(|entries| {
                 entries.filter_map(Result::ok).any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".lamine.yaml.tmp")
+                    entry.file_name().to_string_lossy().starts_with('.')
+                        && entry.file_name().to_string_lossy().contains(".tmp-")
                 })
             })
             .unwrap_or(false)

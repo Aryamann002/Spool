@@ -37,7 +37,7 @@ pub const IDENTITY_ATTRIBUTE: &str = "data-spool-id";
 ///
 /// CSS is deliberately not one of these: this phase resolves element identity
 /// only, and a stylesheet is an opaque referenced file.
-fn is_markup(file: &str) -> bool {
+pub fn is_markup(file: &str) -> bool {
     let extension = Path::new(file)
         .extension()
         .and_then(|value| value.to_str())
@@ -77,6 +77,7 @@ pub struct ElementBinding {
     ///
     /// `None` when the content is not a single run of text — an element with
     /// no children, with a nested element, or with markup between its words.
+    /// Character references count as content, so `R&amp;D` is one run.
     /// That is not a failure: it is the honest answer to "which bytes does this
     /// node's text own?", and a writer that gets `None` reports the edit as
     /// unsupported instead of guessing at a range. Recorded from the same parse
@@ -92,6 +93,14 @@ pub struct SourceIndex {
     /// a round trip was byte-identical and so patches are checked against it.
     pub source: String,
     bindings: Vec<ElementBinding>,
+    /// Every element in the file, identity-bearing or not, in document order.
+    ///
+    /// A census rather than a lookup: answering "which authored elements does
+    /// this stylesheet rule govern?" needs the elements no node claims just as
+    /// much as the ones it does, because a rule shared with an unmarked element
+    /// is still shared. Recorded from the same parse as `bindings`, so a range
+    /// here describes the same bytes a binding describes.
+    elements: Vec<ByteRange>,
     /// Whether the parser recovered from a malformed region. Error recovery
     /// means ranges may not reflect a browser's tree, so it is surfaced.
     has_error: bool,
@@ -113,6 +122,7 @@ impl SourceIndex {
         let mut builder = IndexBuilder {
             source,
             bindings: Vec::new(),
+            elements: Vec::new(),
             stack: Vec::new(),
             has_error: tree.root_node().has_error(),
         };
@@ -121,6 +131,7 @@ impl SourceIndex {
         Self {
             source: source.to_owned(),
             bindings: builder.bindings,
+            elements: builder.elements,
             has_error: builder.has_error,
         }
     }
@@ -137,6 +148,7 @@ impl SourceIndex {
         let mut builder = IndexBuilder {
             source,
             bindings: Vec::new(),
+            elements: Vec::new(),
             stack: Vec::new(),
             has_error: tree.root_node().has_error(),
         };
@@ -146,6 +158,7 @@ impl SourceIndex {
             Self {
                 source: source.to_owned(),
                 bindings: builder.bindings,
+                elements: builder.elements,
                 has_error: builder.has_error,
             },
             tree,
@@ -154,6 +167,15 @@ impl SourceIndex {
 
     pub fn bindings(&self) -> &[ElementBinding] {
         &self.bindings
+    }
+
+    /// The range of every authored element, in document order.
+    ///
+    /// Includes elements no `data-spool-id` claims. That is the point: a
+    /// stylesheet rule that also governs an unmarked element is still a shared
+    /// rule, and a writer that only asked about bound elements would not know.
+    pub fn element_ranges(&self) -> &[ByteRange] {
+        &self.elements
     }
 
     /// True when the parser had to recover from malformed markup.
@@ -170,6 +192,8 @@ impl SourceIndex {
 struct IndexBuilder<'a> {
     source: &'a str,
     bindings: Vec<ElementBinding>,
+    /// Every element seen, whether or not it carries an identity.
+    elements: Vec<ByteRange>,
     /// Indices of currently-open bound elements, outermost first.
     stack: Vec<usize>,
     has_error: bool,
@@ -193,6 +217,10 @@ impl<'a> IndexBuilder<'a> {
     }
 
     fn visit_element(&mut self, node: Node) {
+        // Every element joins the census before anything else is decided, so
+        // an unmarked element is as countable as a bound one.
+        self.elements.push(node.byte_range());
+
         // An element may carry `data-spool-id` more than once. Both are
         // recorded here so `reconcile` can report the ambiguity instead of
         // silently binding to whichever came first.
@@ -280,24 +308,24 @@ impl<'a> IndexBuilder<'a> {
     /// Text ownership is all-or-nothing on purpose. `<h1>Hello</h1>` owns
     /// `Hello`, and `<h1>Hello <em>world</em></h1>` owns nothing: rewriting one
     /// range there would either drop the `<em>` or write text across it. An
-    /// element whose children are exactly text nodes owns the span from the
+    /// element whose children are exactly content nodes owns the span from the
     /// first to the last of them, which covers the whitespace between them
     /// without ever crossing a tag.
     fn own_text_range(&self, element: Node) -> Option<ByteRange> {
-        let mut text_nodes: Vec<Node> = Vec::new();
+        let mut content: Vec<Node> = Vec::new();
         let mut cursor = element.walk();
         for child in element.children(&mut cursor) {
             // The start tag and end tag are structural, not content.
             if matches!(child.kind(), "start_tag" | "end_tag") {
                 continue;
             }
-            if child.kind() != "text" {
+            if !is_content(child.kind()) {
                 return None;
             }
-            text_nodes.push(child);
+            content.push(child);
         }
-        let first = text_nodes.first()?;
-        let last = text_nodes.last()?;
+        let first = content.first()?;
+        let last = content.last()?;
         let start = first.start_byte();
         let end = last.end_byte();
         (start < end).then_some(start..end)
@@ -360,6 +388,16 @@ impl<'a> IndexBuilder<'a> {
         let id = NodeId::new(raw).ok()?;
         Some((id, value.byte_range(), quoted))
     }
+}
+
+/// Whether a node kind is element *content* rather than markup.
+///
+/// tree-sitter-html calls a character reference `&amp;` its own `entity` node,
+/// not a `text` node. It is content: `R&amp;D` is one run of text the author
+/// wrote, and treating the entity as markup would make every element that uses
+/// an ampersand, an em dash, or a non-breaking space permanently un-editable.
+fn is_content(kind: &str) -> bool {
+    matches!(kind, "text" | "entity")
 }
 
 fn text<'a>(source: &'a str, node: Node) -> &'a str {
@@ -968,6 +1006,11 @@ mod tests {
                 .count(),
             1
         );
+
+        // The census covers every authored element in the same file, which for
+        // this fixture is exactly the six bound ones: it is a hand-written
+        // fragment with no wrapper markup.
+        assert_eq!(index.element_ranges().len(), ids.len());
     }
 
     // -- Invariant 2: an identity edit changes only the intended byte range.
@@ -1377,6 +1420,119 @@ mod tests {
             "spool-a",
             "ranges remain exact even when the grammar recovered"
         );
+    }
+
+    // -- The element census a style-ownership check reads.
+
+    #[test]
+    fn the_element_census_counts_elements_no_identity_claims() {
+        // A shared stylesheet rule is shared with elements Spool has no node
+        // for, so the census has to see them. It reads the same parse as the
+        // bindings: each range slices back to real authored markup.
+        let source = concat!(
+            "<!doctype html>\n",
+            "<html lang=\"en\">\n",
+            "  <head><title>Landing</title></head>\n",
+            "  <body class=\"page\">\n",
+            "    <!-- <div data-spool-id=\"spool-ghost\"></div> -->\n",
+            "    <main data-spool-id=\"spool-frame-root\">\n",
+            "      <h1 data-spool-id=\"spool-text-headline\">Hi</h1>\n",
+            "      <a class=\"cta\" href=\"#start\">Start</a>\n",
+            "    </main>\n",
+            "  </body>\n",
+            "</html>\n"
+        );
+        let index = SourceIndex::parse(source);
+        let census: Vec<&str> = index
+            .element_ranges()
+            .iter()
+            .map(|range| &source[range.clone()])
+            .collect();
+
+        // html, head, title, body, main, h1, a — and not the commented-out div,
+        // and not a bare text run.
+        assert_eq!(census.len(), 7, "{census:?}");
+        assert!(census
+            .iter()
+            .any(|slice| *slice == "<title>Landing</title>"));
+        assert!(
+            census
+                .iter()
+                .any(|slice| *slice == r##"<a class="cta" href="#start">Start</a>"##),
+            "an element no identity claims is still an element: {census:?}"
+        );
+        // Checked against each element's own start tag: the comment is inside
+        // `<body>`, so `body`'s slice legitimately contains the ghost's text.
+        fn open_tag(slice: &str) -> &str {
+            &slice[..slice.find('>').unwrap_or(slice.len())]
+        }
+        assert!(
+            !census
+                .iter()
+                .any(|slice| open_tag(slice).contains("spool-ghost")),
+            "markup inside a comment is not an element: {census:?}"
+        );
+        assert_eq!(
+            census.iter().filter(|slice| slice.starts_with('<')).count(),
+            census.len(),
+            "every entry begins a tag"
+        );
+        // Ranges nest the way the document does, which is what makes a census
+        // usable without re-parsing: an ancestor's range contains its
+        // descendants', and the whole list is in document order.
+        let main = index
+            .element_ranges()
+            .iter()
+            .position(|range| source[range.start..range.end].starts_with("<main"))
+            .expect("main is an element");
+        let body = index
+            .element_ranges()
+            .iter()
+            .position(|range| source[range.start..range.end].starts_with("<body"))
+            .expect("body is an element");
+        let range_at = |at: usize| index.element_ranges()[at].clone();
+        assert!(
+            main < range_at(body).start / 1 && body < main,
+            "census is in document order"
+        );
+        assert!(
+            range_at(body).start < range_at(main).start && range_at(main).end <= range_at(body).end,
+            "main sits inside body"
+        );
+        for at in [main + 1, main + 2] {
+            assert!(
+                range_at(main).start < range_at(at).start && range_at(at).end <= range_at(main).end,
+                "the headline and the link sit inside main"
+            );
+        }
+    }
+
+    #[test]
+    fn the_census_and_the_bindings_describe_the_same_bytes() {
+        // The census is collected during the same walk that produces the
+        // bindings, so every bound element's range appears in it verbatim — and
+        // it holds elements no identity claims, which is the whole reason it
+        // exists.
+        let source = concat!(
+            "<body>\n",
+            "  <div data-spool-id=\"spool-a\">\n",
+            "    <p data-spool-id=\"spool-b\">B</p>\n",
+            "    <span>no identity here</span>\n",
+            "  </div>\n",
+            "</body>\n"
+        );
+        let index = SourceIndex::parse(source);
+        for binding in index.bindings() {
+            assert!(
+                index.element_ranges().contains(&binding.element_range),
+                "{} should appear in the census",
+                binding.id.as_str()
+            );
+        }
+        // body, div, p, span: two bound elements and two that are not.
+        assert_eq!(index.element_ranges().len(), 4);
+        assert_eq!(index.bindings().len(), 2);
+        assert!(source[index.element_ranges()[3].clone()].starts_with("<span>"));
     }
 
     /// Build a metadata node carrying the identity selector this phase supports.
