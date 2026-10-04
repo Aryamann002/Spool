@@ -1,0 +1,2994 @@
+//! The Inspector: the surface that shows what is selected and asks for changes
+//! to it.
+//!
+//! # What this module owns
+//!
+//! A *surface*, not a store. Three things live here:
+//!
+//! 1. The vocabulary every row is built from — [`Value`], [`Availability`],
+//!    [`NumberSpec`], [`Property`], [`Paint`], [`Focus`].
+//! 2. The interaction grammars — [`NumberEdit`] for typing and [`Scrub`] for
+//!    dragging — as pure functions of what happened, so they can be pinned down
+//!    in tests without a window.
+//! 3. The widgets that draw them, and the composition that decides which rows
+//!    belong to which selection.
+//!
+//! # What this module must never own
+//!
+//! Document state, and any way to change it. Every control here ends in
+//! [`Inspector::commit_number`] or [`Inspector::commit_paint`], which hand a
+//! request to the canvas — the one place that owns geometry, appearance and the
+//! history boundary. That boundary is why adding rotation, constraints,
+//! alignment or auto-layout is a new [`Property`] and a new row rather than an
+//! edit to `canvas.rs` or to a gesture handler:
+//!
+//! - one typed value is one semantic operation, because it is one
+//!   `set_object_geometry` or one `set_selected_style`;
+//! - one drag is one semantic operation, because [`Scrub`] holds an unrecorded
+//!   gesture and the canvas records it when the drag ends — this module never
+//!   sees the individual moves, so it cannot record one per frame;
+//! - a drag that ends where it started records nothing, and Escape abandons a
+//!   gesture rather than committing it, because both are already decisions the
+//!   canvas makes.
+//!
+//! # The three states of a property
+//!
+//! A property of a *selection* is never just a value. It is one of three
+//! things — set, unset, or mixed — and all three are first class.
+//! [`Value::across`] folds a selection's readings into exactly one of them, so
+//! `Mixed` can never be produced by a row that forgot to check, and can never
+//! be a number the user did not choose and could not act on.
+//!
+//! The three states are not equally editable, and the difference is the point:
+//! paint can be set across a mixed selection because "make these all this
+//! colour" is one operation, while geometry cannot be, because a box has one
+//! position and a mixed selection has no agreed one to show. That asymmetry
+//! lives in [`Inspector::availability`], not in each row.
+
+use gpui::{
+    div, prelude::*, px, rgb, AnyElement, Context, Div, Entity, FontWeight, IntoElement,
+    MouseButton, Render, SharedString, Stateful, Window,
+};
+
+use crate::{canvas, theme};
+
+/// The word for a property the selected objects disagree about.
+///
+/// `selection.md` is explicit that this is a state and not a number: a sidebar
+/// "shows a value when uniform and a 'mixed' state otherwise". Reusing one word
+/// everywhere is what makes that true across every section rather than only in
+/// the one that remembers.
+const MIXED: &str = "Mixed";
+
+/// The word for a property nobody has set.
+const UNSET: &str = "None";
+
+/// The mark for a number that exists but has no value to print.
+const NO_VALUE: &str = "—";
+
+/// Why a geometry field on a mixed selection is read-only.
+///
+/// A number here would have to be an average, and an average is a position the
+/// user never chose. The field says so instead of showing one.
+const MIXED_GEOMETRY: &str = "Mixed selection has no agreed position";
+
+/// Why a stroke width is unavailable when there is no stroke.
+const NO_STROKE: &str = "No stroke to be wide";
+
+/// Why the layout rows exist but do nothing.
+///
+/// The document model has no auto-layout to put a gap in. These rows say that
+/// rather than drawing a control that looks live and does nothing, which is the
+/// only kind of lie a property panel should not tell.
+const NOT_MODELLED: &str = "Not modelled yet";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sections
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// How many collapsible sections the Inspector can have.
+///
+/// Fixed rather than growable, so a section's slot can be baked into the click
+/// closure that toggles it.
+pub const SECTION_COUNT: usize = 6;
+
+/// A collapsible section, addressed by a slot.
+///
+/// The *name* of a section travels with the call and the slot is what a click
+/// writes, so a section can never collapse the wrong one by being renamed or
+/// moved. The slot is private: only the constants below can name one, so adding
+/// a section without giving it a slot is a compile error rather than an index
+/// panic inside a render, where nothing can catch it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionSlot(usize);
+
+impl SectionSlot {
+    pub const POSITION: Self = Self(0);
+    pub const LAYOUT: Self = Self(1);
+    pub const APPEARANCE: Self = Self(2);
+    pub const TYPOGRAPHY: Self = Self(3);
+    pub const EFFECTS: Self = Self(4);
+    pub const EXPORT: Self = Self(5);
+
+    fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// Which sections are collapsed.
+///
+/// One flag per slot, in section order. Collapsed is presentation only: it is
+/// never in the document, and collapsing a section cannot change what any row
+/// says.
+#[derive(Clone, Copy, Debug)]
+pub struct Sections {
+    collapsed: [bool; SECTION_COUNT],
+}
+
+impl Sections {
+    pub const fn new() -> Self {
+        Self {
+            collapsed: [false; SECTION_COUNT],
+        }
+    }
+
+    pub fn is_collapsed(&self, slot: SectionSlot) -> bool {
+        self.collapsed[slot.index()]
+    }
+
+    pub fn toggle(&mut self, slot: SectionSlot) {
+        self.collapsed[slot.index()] = !self.collapsed[slot.index()];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The three states of a property
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What one property is across a whole selection.
+///
+/// Three states, never two. [`Value::Set`] is a value every selected object
+/// agrees on, [`Value::Unset`] is agreement that the property is off or was
+/// never authored, and [`Value::Mixed`] is the absence of agreement. A panel
+/// that only had a value and a nothing would have to invent a third thing at
+/// every row that faced a disagreement, and inventing it per row is how a panel
+/// starts showing numbers the user never chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value<T> {
+    Set(T),
+    Unset,
+    Mixed,
+}
+
+impl<T: PartialEq> Value<T> {
+    /// Fold a selection's per-object readings into the one state that is honest
+    /// for all of them.
+    ///
+    /// `None` for an object means "this property is not set on that object",
+    /// which is an answer rather than missing data — so the fold is over
+    /// `Option<T>` and never has to invent a default.
+    pub fn across(readings: impl IntoIterator<Item = Option<T>>) -> Self {
+        let mut readings = readings.into_iter();
+        // An empty selection has no reading at all. `Unset` is the honest
+        // answer: nothing is set, and nothing claims to be.
+        let Some(first) = readings.next() else {
+            return Self::Unset;
+        };
+        readings.fold(Self::from(first), |state, next| {
+            let next = Self::from(next);
+            match (state, next) {
+                // A disagreement can only ever widen. Once two objects
+                // differ, no later agreement can make the selection
+                // uniform again, so `Mixed` absorbs everything after it.
+                (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
+                (state, next) if state == next => state,
+                _ => Self::Mixed,
+            }
+        })
+    }
+
+    fn from(reading: Option<T>) -> Self {
+        match reading {
+            Some(value) => Self::Set(value),
+            None => Self::Unset,
+        }
+    }
+
+    pub fn is_mixed(self) -> bool {
+        matches!(self, Self::Mixed)
+    }
+
+    pub fn is_unset(self) -> bool {
+        matches!(self, Self::Unset)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Availability
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Whether a control can be used on the selection in front of it, and why not.
+///
+/// The reason is not decoration. Affinity's own rule is that an action which
+/// does not apply is *disabled* rather than silently absent, and Figma's is that
+/// a property with no meaning for this layer says so — vertical text alignment
+/// only works on fixed-size text layers. A row that cannot answer these three
+/// questions has no way to tell the truth about itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Availability {
+    /// The control works here.
+    Supported,
+    /// The control is real and has a value, but does not apply to this
+    /// selection right now. The value stays readable.
+    Disabled(&'static str),
+    /// The document model cannot express the property yet. There is nothing to
+    /// show, so nothing is drawn that could be mistaken for a control.
+    Unsupported(&'static str),
+}
+
+impl Availability {
+    pub fn is_editable(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Why this control cannot be used, in the words the panel shows.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Supported => None,
+            Self::Disabled(reason) | Self::Unsupported(reason) => Some(reason),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Numbers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// How many decimal places a number is written with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    /// Whole units.
+    Whole,
+    /// Whole units, or one decimal place when the value is not whole.
+    Tenth,
+}
+
+impl Precision {
+    fn decimals(self) -> usize {
+        match self {
+            Self::Whole => 0,
+            Self::Tenth => 1,
+        }
+    }
+}
+
+/// Everything about a number that is not its value.
+///
+/// Held in one place so that "pixels", "a proportion" and "a length with a
+/// floor" cannot each invent their own rounding, their own suffix, or their own
+/// idea of what a drag step is. The unit the user reads is `scale` away from the
+/// unit the document stores, which is the only reason opacity needs a spec at
+/// all rather than a special case.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NumberSpec {
+    /// How far one pixel of drag moves the value, in display units.
+    pub step: f32,
+    /// The finest step a drag may stop on, in display units.
+    ///
+    /// A drag that could settle between two values that read the same would make
+    /// the field flicker, so a scrub lands on the quantum rather than wherever
+    /// the pointer happened to be.
+    pub step_quantum: f32,
+    pub precision: Precision,
+    /// Appended to the formatted number: `%`, or nothing.
+    pub suffix: &'static str,
+    /// Display units per stored unit. 100 for a proportion stored as 0 to 1.
+    pub scale: f32,
+    /// The display-unit floor this property cannot go below, if it has one.
+    pub min: Option<f32>,
+    pub max: Option<f32>,
+}
+
+impl NumberSpec {
+    /// A length in pixels, with a floor.
+    ///
+    /// A floor of `None` is a position, which may sit off the left edge. A floor
+    /// of one pixel is a size, because a zero-sized box cannot be hit again, so
+    /// shrinking one to nothing would make it unrecoverable rather than small.
+    const fn length(min: Option<f32>) -> Self {
+        Self {
+            step: 1.0,
+            step_quantum: 1.0,
+            precision: Precision::Tenth,
+            suffix: "",
+            scale: 1.0,
+            min,
+            max: None,
+        }
+    }
+
+    /// A proportion from 0 to 100, stored as 0 to 1.
+    const fn percent() -> Self {
+        Self {
+            step: 1.0,
+            step_quantum: 1.0,
+            precision: Precision::Whole,
+            suffix: "%",
+            scale: 100.0,
+            min: Some(0.0),
+            max: Some(100.0),
+        }
+    }
+
+    /// The value as the user reads it.
+    pub fn display(self, stored: f32) -> f32 {
+        stored * self.scale
+    }
+
+    /// What the user typed, back into the unit the document stores.
+    pub fn stored(self, typed: f32) -> f32 {
+        typed / self.scale
+    }
+
+    /// How much one pixel of drag moves the value, in stored units.
+    fn drag_step(self) -> f32 {
+        self.step / self.scale
+    }
+
+    /// Keep a display value inside this property's own range.
+    pub fn clamp_display(self, display: f32) -> f32 {
+        let display = match self.min {
+            Some(min) => display.max(min),
+            None => display,
+        };
+        match self.max {
+            Some(max) => display.min(max),
+            None => display,
+        }
+    }
+
+    /// Round a display value onto the quantum a drag may stop on.
+    pub fn snap(self, display: f32) -> f32 {
+        if self.step_quantum <= 0.0 {
+            return display;
+        }
+        (display / self.step_quantum).round() * self.step_quantum
+    }
+}
+
+/// The bare number, in the units the user reads, with no unit attached.
+///
+/// This is what a field being typed holds. The unit is decoration the field adds
+/// when it is not being edited: a buffer that carried `%` would not parse, so the
+/// arrows would stop working the moment a value was typed.
+fn bare_number(display: f32, spec: NumberSpec) -> String {
+    let decimals = spec.precision.decimals();
+    let text = format!("{display:.decimals$}");
+    // `12.0` is not a different number from `12`, and a panel that spells it two
+    // ways makes the eye do the comparison instead of the model.
+    text.strip_suffix(".0").unwrap_or(&text).to_owned()
+}
+
+/// The one way a number is written.
+///
+/// Geometry, radius, stroke width, opacity and font size all render through
+/// here, so the panel cannot end up with two rounding rules for two kinds of
+/// value — which is what it had, and why `0` meant different things in
+/// different rows.
+pub fn format_number(value: f32, spec: NumberSpec) -> String {
+    let display = spec.clamp_display(spec.display(value));
+    match spec.suffix.is_empty() {
+        true => bare_number(display, spec),
+        false => format!("{}{}", bare_number(display, spec), spec.suffix),
+    }
+}
+
+/// A number being typed into a field.
+///
+/// A buffer, not a second copy of the property: the value becomes real only when
+/// Enter hands it to the canvas as one semantic operation, exactly as a layer
+/// rename does. `select_all` is the whole of the convention and it is the
+/// convention every product in the corpus uses — the value the user sees
+/// arrives selected, so the first keystroke replaces it rather than appending
+/// to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NumberEdit {
+    pub focus: Focus,
+    buffer: String,
+    select_all: bool,
+}
+
+/// What a keystroke did to an open number field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditEffect {
+    /// The buffer changed; the field is still open.
+    Continue,
+    /// The field closed and this text should be committed, if it parses.
+    Commit(String),
+    /// The field closed and nothing should reach the document.
+    Abandon,
+}
+
+impl NumberEdit {
+    /// Open a field for typing, with its current text selected.
+    pub fn editing(focus: Focus, current: String) -> Self {
+        Self {
+            focus,
+            buffer: current,
+            select_all: true,
+        }
+    }
+
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    /// Apply one keystroke to the open field.
+    ///
+    /// The whole grammar in one pure function, because it is a grammar: Enter
+    /// commits, Escape abandons without touching the document, the first
+    /// printable key replaces the selected text, and a modifier combination is
+    /// an editor shortcut rather than a character.
+    pub fn apply_key(&mut self, key: &str) -> EditEffect {
+        match key {
+            "enter" | "return" => {
+                let buffer = std::mem::take(&mut self.buffer);
+                self.select_all = false;
+                EditEffect::Commit(buffer)
+            }
+            "escape" => {
+                self.close();
+                EditEffect::Abandon
+            }
+            "backspace" => {
+                // With the text selected, Backspace deletes the selection — the
+                // same rule typing follows. Treating it as "delete one
+                // character" would leave the user staring at the rest of the old
+                // number after the key they expected to clear it.
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                } else {
+                    self.buffer.pop();
+                }
+                EditEffect::Continue
+            }
+            // Arrows are a nudge, not a character. The caller reads the arrow
+            // itself so the step it uses is the one the editor's ladder chose.
+            "up" | "down" | "left" | "right" => EditEffect::Continue,
+            other if other.chars().count() == 1 => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                }
+                self.buffer.push_str(other);
+                EditEffect::Continue
+            }
+            _ => EditEffect::Continue,
+        }
+    }
+
+    /// Move the typed value by whole steps while the field is open.
+    ///
+    /// Only when the buffer is a number. An arrow pressed in the middle of
+    /// typing `-` or `1.` must not silently drop the digits the user entered,
+    /// so a buffer that does not parse simply keeps the key.
+    pub fn nudge(&mut self, delta: f32) -> bool {
+        let Ok(current) = self.buffer.trim().parse::<f32>() else {
+            return false;
+        };
+        // The buffer already holds what the user reads, so the step is added in
+        // those units and no scale conversion happens here.
+        let spec = self.focus.property.spec();
+        self.buffer = bare_number(spec.clamp_display(current + delta), spec);
+        self.select_all = false;
+        true
+    }
+
+    fn close(&mut self) {
+        self.buffer.clear();
+        self.select_all = false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Scrubbing
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A continuous edit in progress.
+///
+/// The value is a pure function of the value the gesture started at and how far
+/// the pointer has moved. Nothing accumulates frame to frame, which is what
+/// `transformation.md` asks for and what makes the gesture safe to re-derive on
+/// any frame: a dropped pointer event cannot leave the field disagreeing with
+/// the document, because the field is not remembering where it was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scrub {
+    property: Property,
+    object: canvas::ObjectId,
+    /// The gesture the canvas opened. It remembers where the box started, which
+    /// is the only way a drag can be re-derived from its first pixel.
+    gesture: canvas::GeometryScrub,
+    start_x: f32,
+    start_value: f32,
+}
+
+impl Scrub {
+    /// Open a scrub against a gesture the canvas has already started.
+    ///
+    /// The baseline is read from the gesture rather than from the widget, and
+    /// the widget is not asked at all: by the time the pointer goes down it may
+    /// already have moved into the field, so anything read here would be late.
+    pub fn begin(
+        property: Property,
+        object: canvas::ObjectId,
+        gesture: canvas::GeometryScrub,
+        start_x: f32,
+    ) -> Self {
+        Self {
+            property,
+            object,
+            gesture,
+            start_x,
+            start_value: property.read_geometry(gesture.before),
+        }
+    }
+
+    /// Where the field should read, given where the pointer is.
+    pub fn value_at(&self, screen_x: f32, spec: NumberSpec) -> f32 {
+        let dragged = self.start_value + (screen_x - self.start_x) * spec.drag_step();
+        spec.snap(spec.clamp_display(spec.display(dragged)))
+    }
+
+    /// The geometry this scrub is describing, given where the pointer is.
+    pub fn geometry_at(&self, screen_x: f32) -> canvas::Geometry {
+        self.property.write(
+            self.gesture.before,
+            self.value_at(screen_x, self.property.spec()),
+        )
+    }
+
+    pub fn property(&self) -> Property {
+        self.property
+    }
+
+    pub fn object(&self) -> canvas::ObjectId {
+        self.object
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Properties
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One property the Inspector can show, named by what it means.
+///
+/// Not by where it is drawn and not by which section holds it. Adding rotation,
+/// a corner-radius pair, a constraint or an alignment is a new variant here plus
+/// a row that uses it: the read, the write, the spec and the element id all come
+/// from this one declaration, and none of them reach into `canvas.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Property {
+    X,
+    Y,
+    Width,
+    Height,
+    BorderRadius,
+    Opacity,
+    StrokeWidth,
+    FontSize,
+}
+
+impl Property {
+    /// The short label that fits inside a boxed field.
+    ///
+    /// Rows that have room for a word pass their own label instead; this is the
+    /// abbreviated form for the two-up geometry boxes, where `Width` would not
+    /// fit beside a value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Width => "W",
+            Self::Height => "H",
+            Self::BorderRadius => "Radius",
+            Self::Opacity => "Opacity",
+            Self::StrokeWidth => "Width",
+            Self::FontSize => "Size",
+        }
+    }
+
+    /// A short stable name, used for element ids and for nothing else.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Width => "width",
+            Self::Height => "height",
+            Self::BorderRadius => "radius",
+            Self::Opacity => "opacity",
+            Self::StrokeWidth => "stroke-width",
+            Self::FontSize => "font-size",
+        }
+    }
+
+    /// The element id for this property's control.
+    ///
+    /// Keyed by name and by object, never by position in a section, so adding a
+    /// property between two others cannot leave one field's element state behind
+    /// on another's control.
+    pub fn control_id(self, object: Option<canvas::ObjectId>) -> SharedString {
+        SharedString::from(format!(
+            "inspector-{}",
+            match object {
+                Some(object) => format!("{}-{}", object.0, self.slug()),
+                None => format!("selection-{}", self.slug()),
+            }
+        ))
+    }
+
+    /// Whether this property lives in the object's box rather than in its paint.
+    pub fn is_geometry(self) -> bool {
+        matches!(self, Self::X | Self::Y | Self::Width | Self::Height)
+    }
+
+    /// Whether this property has a horizontal axis the arrow keys can move it
+    /// along.
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, Self::X | Self::Width)
+    }
+
+    /// Whether this property can be driven continuously.
+    ///
+    /// Only geometry can today, because only geometry has an operation that
+    /// records a change when the user lets go rather than on every frame. A
+    /// field without one gets typing and presets instead of a scrub that would
+    /// record an operation per pointer movement — the widget is the same either
+    /// way; only the affordance differs.
+    pub fn is_continuous(self) -> bool {
+        self.is_geometry()
+    }
+
+    /// How this property is written down for one object.
+    ///
+    /// `None` is a real answer, not missing data: it is how "nobody authored a
+    /// font size" stays distinguishable from "the font size is zero".
+    pub fn read(self, object: &canvas::DesignObject) -> Option<f32> {
+        match self {
+            Self::X => Some(object.position.x),
+            Self::Y => Some(object.position.y),
+            Self::Width => Some(object.size.width),
+            Self::Height => Some(object.size.height),
+            Self::BorderRadius => Some(object.border_radius),
+            Self::Opacity => Some(object.opacity),
+            // A width with no stroke is not a width of zero. Keeping the two
+            // apart is what lets the panel disable the field with a reason
+            // instead of inviting the user to author a stroke that is not there.
+            Self::StrokeWidth => object.stroke.map(|stroke| stroke.width),
+            Self::FontSize => object.font_size,
+        }
+    }
+
+    /// How this property is spelled for one geometry.
+    fn read_geometry(self, geometry: canvas::Geometry) -> f32 {
+        match self {
+            Self::X => geometry.position.x,
+            Self::Y => geometry.position.y,
+            Self::Width => geometry.size.width,
+            Self::Height => geometry.size.height,
+            _ => 0.0,
+        }
+    }
+
+    /// The same geometry with this property replaced.
+    ///
+    /// A size cannot go below one pixel however the value arrived: a zero-sized
+    /// box cannot be clicked again, so shrinking one to nothing would make it
+    /// unrecoverable rather than small. The spec stops the user being offered
+    /// the value; this is the document's own guarantee that it cannot happen.
+    pub fn write(self, geometry: canvas::Geometry, value: f32) -> canvas::Geometry {
+        let mut next = geometry;
+        match self {
+            Self::X => next.position.x = value,
+            Self::Y => next.position.y = value,
+            Self::Width => next.size.width = floor_size(value),
+            Self::Height => next.size.height = floor_size(value),
+            _ => {}
+        }
+        next
+    }
+
+    /// The style edit this property commits as, if it is paint rather than
+    /// geometry.
+    pub fn style_edit(self, value: f32) -> Option<canvas::StyleEdit> {
+        Some(match self {
+            Self::BorderRadius => canvas::StyleEdit::BorderRadius(value),
+            Self::Opacity => canvas::StyleEdit::Opacity(value),
+            Self::StrokeWidth => canvas::StyleEdit::StrokeWidth(value),
+            Self::FontSize => canvas::StyleEdit::FontSize(value),
+            _ => return None,
+        })
+    }
+
+    pub fn spec(self) -> NumberSpec {
+        match self {
+            // A position has no floor: a box may sit off the left edge.
+            Self::X | Self::Y => NumberSpec::length(None),
+            Self::Width | Self::Height => NumberSpec::length(Some(1.0)),
+            Self::BorderRadius | Self::StrokeWidth => NumberSpec::length(Some(0.0)),
+            // Zero is not a size anything can be, so a font size has a floor
+            // even though nothing about the renderer requires one.
+            Self::FontSize => NumberSpec::length(Some(1.0)),
+            Self::Opacity => NumberSpec::percent(),
+        }
+    }
+}
+
+fn floor_size(value: f32) -> f32 {
+    value.max(1.0)
+}
+
+/// Which property the keyboard is pointed at, and at what.
+///
+/// `object` names the box a geometry edit applies to. A paint edit applies to
+/// whatever is selected and so carries no object at all rather than a convenient
+/// one: a field that remembered an object it did not mean would be a bug waiting
+/// for a selection change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Focus {
+    pub object: Option<canvas::ObjectId>,
+    pub property: Property,
+}
+
+/// Read a property across a whole selection.
+///
+/// The single place a number becomes a three-state value, so a property cannot
+/// be shown with one selection rule in one row and another in the next.
+fn selected_value(selected: &[canvas::DesignObject], property: Property) -> Value<f32> {
+    Value::across(selected.iter().map(|object| property.read(object)))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Paint
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Which paint a control owns. Every one of them has an off state, a colour,
+/// and a place in the appearance or typography section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleProperty {
+    Fill,
+    Stroke,
+    TextColor,
+}
+
+impl StyleProperty {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Stroke => "stroke",
+            Self::TextColor => "text-color",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fill => "Fill",
+            Self::Stroke => "Stroke",
+            Self::TextColor => "Text colour",
+        }
+    }
+
+    /// The edit that applies, or removes, this paint.
+    pub fn edit(self, color: Option<canvas::Color>) -> canvas::StyleEdit {
+        match self {
+            Self::Fill => canvas::StyleEdit::Fill(color),
+            Self::Stroke => canvas::StyleEdit::Stroke(color),
+            Self::TextColor => canvas::StyleEdit::TextColor(color),
+        }
+    }
+}
+
+/// A paint property as the selection presents it.
+///
+/// Two independent three-states, because "is this filled" and "what colour is
+/// it" disagree on different selections and for different reasons. A row that
+/// derived the colour's state from whether the paint was on would call a
+/// half-filled selection uniform, which is the mistake the three-state model
+/// exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Paint {
+    /// Whether the paint is applied at all.
+    pub present: Value<bool>,
+    /// The colour it is applied with.
+    pub color: Value<canvas::Color>,
+    /// The first colour the paint *is* applied with, even when the selection
+    /// disagrees.
+    ///
+    /// Offered when switching the paint on for a selection that has none:
+    /// "fill these with something" needs a colour, and this is the only one the
+    /// selection actually has.
+    pub representative: Option<canvas::Color>,
+}
+
+impl Paint {
+    /// Read one paint across a selection.
+    pub fn read(
+        selected: &[canvas::DesignObject],
+        read: impl Fn(&canvas::DesignObject) -> Option<canvas::Color>,
+    ) -> Self {
+        let color = Value::across(selected.iter().map(&read));
+        Self {
+            present: Value::across(selected.iter().map(|object| Some(read(object).is_some()))),
+            color,
+            representative: selected.iter().find_map(&read),
+        }
+    }
+
+    /// What the colour trigger reads.
+    pub fn label(&self) -> String {
+        match self.color {
+            Value::Set(color) => color_hex(color),
+            Value::Unset => UNSET.to_owned(),
+            Value::Mixed => MIXED.to_owned(),
+        }
+    }
+
+    /// The colour to put on the swatch: the agreed one, else a representative,
+    /// else the panel's own surface so an absent paint looks absent rather than
+    /// looking like black.
+    pub fn swatch(&self, fallback: u32) -> u32 {
+        match self.color {
+            Value::Set(color) => color.to_rgb(),
+            _ => self.representative.map_or(fallback, canvas::Color::to_rgb),
+        }
+    }
+}
+
+pub fn color_hex(color: canvas::Color) -> String {
+    format!("#{:06X}", color.to_rgb())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The layer name
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A layer name being edited.
+///
+/// A buffer, not a second name store: the name only becomes real when Enter
+/// hands it to the canvas as one semantic operation. Escape and an empty name
+/// abandon it, leaving the document untouched.
+struct RenameSession {
+    id: canvas::ObjectId,
+    buffer: String,
+    select_all: bool,
+}
+
+/// What a key did to an open rename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenameEffect {
+    /// The buffer changed; the rename is still open.
+    Continue,
+    /// The rename closed and this name should be committed, if it is not empty.
+    Commit(String),
+    /// The rename closed and nothing should reach the document.
+    Abandon,
+}
+
+impl RenameSession {
+    /// Open a rename.
+    ///
+    /// An empty buffer is the right one when the user clicked the name: the
+    /// caret is already where the text goes, and `select_all` still means the
+    /// first keystroke replaces rather than appends.
+    fn opening(id: canvas::ObjectId) -> Self {
+        Self {
+            id,
+            buffer: String::new(),
+            select_all: true,
+        }
+    }
+
+    /// Open a rename on a name that already exists.
+    fn replacing(id: canvas::ObjectId, buffer: String) -> Self {
+        Self {
+            id,
+            buffer,
+            select_all: true,
+        }
+    }
+
+    /// Apply one keystroke to the open rename.
+    fn apply_key(&mut self, key: &str) -> RenameEffect {
+        match key {
+            "enter" | "return" => {
+                let name = self.buffer.clone();
+                self.close();
+                RenameEffect::Commit(name)
+            }
+            "escape" => {
+                self.close();
+                RenameEffect::Abandon
+            }
+            "backspace" => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                } else {
+                    self.buffer.pop();
+                }
+                RenameEffect::Continue
+            }
+            // A modifier combination is an editor shortcut, not a character. It
+            // is swallowed so it cannot leak into the name.
+            other if other.chars().count() == 1 => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                }
+                self.buffer.push_str(other);
+                RenameEffect::Continue
+            }
+            _ => RenameEffect::Continue,
+        }
+    }
+
+    fn close(&mut self) {
+        self.buffer.clear();
+        self.select_all = false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The Inspector
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The tabs across the top of the Inspector.
+///
+/// Labels only; the chrome is [`segmented`], which is also what a paint's
+/// on/off uses, so the two cannot drift into two looks for one gesture.
+const TABS: [(&str, bool); 3] = [("Design", true), ("Prototype", true), ("AI", true)];
+
+/// Swatches offered by every colour control.
+///
+/// A fixed palette rather than a colour wheel, because a wheel is a second
+/// editing model and a picker the document model cannot round-trip is worse
+/// than a small set of values it can definitely express.
+const PALETTE: [(&str, u32); 9] = [
+    ("Ink", theme::INK),
+    ("Paper", theme::PAPER),
+    ("Gray", 0x777d84),
+    ("Red", 0xc45d5d),
+    ("Orange", 0xd2844d),
+    ("Yellow", 0xd5b957),
+    ("Green", theme::SAGE),
+    ("Blue", 0x6689c7),
+    ("Purple", 0x9576b8),
+];
+
+/// The Inspector.
+///
+/// Owns interaction state — which section is collapsed, which field the keyboard
+/// is pointed at, what is being typed, what is being dragged — and owns no
+/// document state at all. Every edit leaves through [`Inspector::commit_number`]
+/// or [`Inspector::commit_paint`], which hand it to the canvas.
+pub struct Inspector {
+    canvas: Entity<canvas::CanvasView>,
+    tab: usize,
+    sections: Sections,
+    /// The property the arrow keys move, once a field has been touched.
+    ///
+    /// Runtime state, and it says so: a field that remembers where the pointer
+    /// was would be a second copy of the document.
+    focus: Option<Focus>,
+    /// The field being typed into, if one is open.
+    edit: Option<NumberEdit>,
+    /// The drag in progress, if one is open.
+    scrub: Option<Scrub>,
+    /// The layer name being typed, if one is open.
+    rename: Option<RenameSession>,
+    /// Which colour control has its palette open, if any.
+    palette: Option<StyleProperty>,
+    /// Repaints that must outlive the constructor.
+    ///
+    /// The Inspector is a view of the document: a canvas edit has to repaint it
+    /// or a field shows a value the canvas has already moved past. Held, not
+    /// dropped, because a GPUI subscription detaches its observer when it goes.
+    #[allow(dead_code)]
+    observations: Vec<gpui::Subscription>,
+}
+
+impl Inspector {
+    pub fn new(canvas: Entity<canvas::CanvasView>, cx: &mut Context<Self>) -> Self {
+        let observations = vec![cx.observe(&canvas, |_, _, cx| cx.notify())];
+        Self {
+            canvas,
+            tab: 0,
+            sections: Sections::new(),
+            focus: None,
+            edit: None,
+            scrub: None,
+            rename: None,
+            palette: None,
+            observations,
+        }
+    }
+
+    /// Open a rename on a layer another surface asked about.
+    ///
+    /// The panel states the request and the surface that owns the editing model
+    /// opens it, so a name typed from either side is the same buffer, the same
+    /// commit, and the same Escape behaviour. The existing name arrives
+    /// selected, because a rename that appends to the old name is a different
+    /// command from renaming.
+    pub fn open_rename(&mut self, id: canvas::ObjectId, cx: &mut Context<Self>) {
+        let name = self
+            .canvas
+            .read(cx)
+            .document_objects()
+            .iter()
+            .find(|object| object.id == id)
+            .map(|object| object.name.clone())
+            .unwrap_or_default();
+        self.rename = Some(RenameSession::replacing(id, name));
+    }
+
+    /// Which layer is being renamed, if any.
+    ///
+    /// Presentation only: the Layers panel shows the row without owning an
+    /// editing model of its own.
+    pub fn renaming(&self) -> Option<canvas::ObjectId> {
+        self.rename.as_ref().map(|session| session.id)
+    }
+
+    /// Give up whatever the Inspector is part-way through.
+    ///
+    /// A text buffer before a gesture, in the order the editor's Escape ladder
+    /// implies: what the user typed into is above what they are dragging.
+    /// Returns whether anything was given up, so the ladder knows the key was
+    /// consumed.
+    pub fn cancel_in_flight(&mut self, cx: &mut Context<Self>) -> bool {
+        // The two are mutually exclusive — opening either closes the other — so
+        // short-circuiting cannot leave one open.
+        if self.edit.take().is_some() || self.rename.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if let Some(scrub) = self.scrub.take() {
+            // Abandoning restores the runtime and records nothing: the same
+            // promise the canvas keeps for a canvas drag.
+            self.canvas
+                .update(cx, |canvas, _| canvas.cancel_geometry_scrub(scrub.gesture));
+            self.repaint(cx);
+            return true;
+        }
+        false
+    }
+
+    /// Keys the Inspector claims before the editor's own shortcuts.
+    ///
+    /// A text buffer is not an editor shortcut: typing `f` into a name must not
+    /// also switch to the frame tool, and typing `12` into a field must not also
+    /// select the rectangle tool. So the Inspector gets first refusal on every
+    /// key and declines the ones it has nothing open for.
+    ///
+    /// Returns whether the key was consumed. Escape is never claimed here: it
+    /// belongs to the editor's ladder, which walks down from the topmost thing,
+    /// and a text buffer that answered it first would make the rung it belongs
+    /// to depend on which listener saw the key first.
+    pub fn handle_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        if key == "escape" {
+            return false;
+        }
+        if self.rename.is_some() {
+            return self.rename_key(key, cx);
+        }
+        if self.edit.is_some() {
+            return self.edit_key(key, shift, cx);
+        }
+        self.arrow_key(key, shift, cx)
+    }
+
+    /// One keystroke into the open number field.
+    fn edit_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        // Arrows nudge a typed value instead of being characters, and `⇧` makes
+        // the nudge ten steps the way it does everywhere else in the editor.
+        let arrow = match key {
+            "up" => Some(-1.0),
+            "down" => Some(1.0),
+            "left" => Some(-1.0),
+            "right" => Some(1.0),
+            _ => None,
+        };
+        if let Some(sign) = arrow {
+            let step = if shift { 10.0 } else { 1.0 };
+            if let Some(edit) = self.edit.as_mut() {
+                edit.nudge(sign * step);
+            }
+            cx.notify();
+            return true;
+        }
+        let Some(edit) = self.edit.as_mut() else {
+            return false;
+        };
+        let focus = edit.focus;
+        match edit.apply_key(key) {
+            EditEffect::Continue => cx.notify(),
+            EditEffect::Commit(text) => {
+                self.edit = None;
+                self.commit_text(focus, &text, cx);
+            }
+            EditEffect::Abandon => cx.notify(),
+        }
+        true
+    }
+
+    /// One keystroke into the open layer name.
+    fn rename_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.rename.as_mut() else {
+            return false;
+        };
+        let id = session.id;
+        let effect = session.apply_key(key);
+        if effect == RenameEffect::Continue {
+            cx.notify();
+            return true;
+        }
+        self.rename = None;
+        if let RenameEffect::Commit(name) = effect {
+            let name = name.trim().to_owned();
+            if !name.is_empty() {
+                self.canvas
+                    .update(cx, |canvas, _| canvas.rename_object(id, name));
+                self.repaint(cx);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Arrow keys moving the field the user last touched.
+    ///
+    /// One key press is one semantic operation, the same as one field drag. The
+    /// field owns only its own axis: `↑` on the X field is a request for
+    /// vertical movement, and the editor's own nudge is better placed to answer
+    /// it than a horizontal field is.
+    fn arrow_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        let Some(focus) = self.focus else {
+            return false;
+        };
+        let step = if shift { 10.0 } else { 1.0 };
+        let (vertical, delta) = match key {
+            "left" => (false, -step),
+            "right" => (false, step),
+            "up" => (true, -step),
+            "down" => (true, step),
+            _ => return false,
+        };
+        if vertical == focus.property.is_horizontal() {
+            return false;
+        }
+        let Some(object) = focus.object else {
+            return false;
+        };
+        let spec = focus.property.spec();
+        let Some(current) = self.canvas.read(cx).object_geometry(object) else {
+            return false;
+        };
+        let display = spec.display(focus.property.read_geometry(current)) + delta;
+        self.commit_number(focus, display, cx);
+        true
+    }
+
+    // ── The one way a number reaches the document ──────────────────────────
+
+    /// Commit a number the user read in display units.
+    ///
+    /// Every numeric control ends here, so "one edit is one semantic operation"
+    /// is a property of this function rather than something each row has to
+    /// remember. Geometry is per-object because a box has one position; paint is
+    /// a property of whatever is selected, which is why the same field can be
+    /// typed for one object and for forty.
+    fn commit_number(&mut self, focus: Focus, display: f32, cx: &mut Context<Self>) {
+        let spec = focus.property.spec();
+        let stored = spec.stored(spec.clamp_display(display));
+        if focus.property.is_geometry() {
+            let Some(object) = focus.object else {
+                return;
+            };
+            let Some(before) = self.canvas.read(cx).object_geometry(object) else {
+                return;
+            };
+            let next = focus.property.write(before, stored);
+            self.canvas
+                .update(cx, |canvas, _| canvas.set_object_geometry(object, next));
+            self.repaint(cx);
+        } else if let Some(edit) = focus.property.style_edit(stored) {
+            self.canvas
+                .update(cx, |canvas, cx| canvas.set_selected_style(edit, cx));
+            self.repaint(cx);
+        }
+    }
+
+    /// Commit typed text, if it is a number this property can hold.
+    ///
+    /// Text that does not parse is not an error the user needs told about; it is
+    /// a keystroke that produced something that is not a value, and the field
+    /// simply closes.
+    fn commit_text(&mut self, focus: Focus, text: &str, cx: &mut Context<Self>) {
+        let Ok(typed) = text.trim().parse::<f32>() else {
+            return;
+        };
+        let spec = focus.property.spec();
+        if !typed.is_finite() {
+            return;
+        }
+        self.commit_number(focus, spec.clamp_display(typed), cx);
+    }
+
+    /// Commit a style change, which is always one operation across the
+    /// selection.
+    ///
+    /// The one exit for paint, so a preset chip, a colour trigger and a
+    /// segmented choice all produce the same single history entry rather than
+    /// each deciding for itself what "one edit" means.
+    fn commit_style(&mut self, edit: canvas::StyleEdit, cx: &mut Context<Self>) {
+        self.canvas
+            .update(cx, |canvas, cx| canvas.set_selected_style(edit, cx));
+        self.repaint(cx);
+    }
+
+    /// Commit a paint, which is a style change with the colour already decided.
+    fn commit_paint(
+        &mut self,
+        property: StyleProperty,
+        color: Option<canvas::Color>,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_style(property.edit(color), cx);
+    }
+
+    /// Ask both sides of the editor to redraw.
+    ///
+    /// The canvas and the Inspector are two views of one document, so a change
+    /// made through either has to show in both.
+    fn repaint(&mut self, cx: &mut Context<Self>) {
+        self.canvas.update(cx, |_, cx| cx.notify());
+    }
+
+    // ── Scrubbing ───────────────────────────────────────────────────────────
+
+    fn begin_scrub(&mut self, focus: Focus, screen_x: f32, cx: &mut Context<Self>) {
+        // Pressing the pointer anywhere ends whatever was open in this panel: a
+        // previous drag is finished rather than abandoned, because the pointer
+        // went down somewhere else, and a rename loses to a drag the same way.
+        self.end_scrub(cx);
+        self.rename = None;
+        let Some(object) = focus.object else {
+            return;
+        };
+        let Some(gesture) = self
+            .canvas
+            .update(cx, |canvas, _| canvas.begin_geometry_scrub(object))
+        else {
+            return;
+        };
+        self.focus = Some(focus);
+        self.scrub = Some(Scrub::begin(focus.property, object, gesture, screen_x));
+        cx.notify();
+    }
+
+    fn move_scrub(&mut self, screen_x: f32, cx: &mut Context<Self>) {
+        let Some(scrub) = self.scrub else {
+            return;
+        };
+        // Recomputed from where the gesture started, never accumulated, so the
+        // field and the document cannot drift apart over a long drag.
+        let next = scrub.geometry_at(screen_x);
+        self.canvas
+            .update(cx, |canvas, _| canvas.scrub_geometry(&scrub.gesture, next));
+        self.repaint(cx);
+    }
+
+    fn end_scrub(&mut self, cx: &mut Context<Self>) {
+        let Some(scrub) = self.scrub.take() else {
+            return;
+        };
+        // One semantic operation for the whole drag, or none at all if it landed
+        // where it started — the canvas decides which, exactly as it does for a
+        // drag that began on the canvas itself.
+        self.canvas
+            .update(cx, |canvas, _| canvas.commit_geometry_scrub(scrub.gesture));
+        self.repaint(cx);
+    }
+
+    // ── Opening a field ─────────────────────────────────────────────────────
+
+    /// Open a field for typing, with its current text selected.
+    fn open_edit(&mut self, focus: Focus, cx: &mut Context<Self>) {
+        // Closing the others first is what makes the interaction states
+        // mutually exclusive: a rename, a typed number and a drag are three
+        // different things to be doing, and the Escape ladder above them is
+        // simpler when at most one of them can be true.
+        self.cancel_in_flight(cx);
+        let selected = self.canvas.read(cx).selected_objects();
+        let text = match selected_value(&selected, focus.property) {
+            Value::Set(value) => format_number(value, focus.property.spec()),
+            // `Mixed` and `Unset` both open empty. A field the user cannot read
+            // has nothing to select, and the first keystroke supplies it.
+            _ => String::new(),
+        };
+        self.focus = Some(focus);
+        self.edit = Some(NumberEdit::editing(focus, text));
+        cx.notify();
+    }
+
+    /// Drop interaction state the current selection has invalidated.
+    ///
+    /// A field can be open when the selection changes underneath it — clicking
+    /// the canvas replaces the selection — and a field left editing an object
+    /// that is no longer selected would commit a number into the wrong place, or
+    /// into nothing at all.
+    fn reconcile(&mut self, selected: &[canvas::DesignObject]) {
+        let gone = |object: Option<canvas::ObjectId>| match object {
+            Some(object) => !selected.iter().any(|other| other.id == object),
+            // A field with no object is a paint field, and paint applies to
+            // whatever is selected — so a changed selection never invalidates it.
+            None => false,
+        };
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|edit| gone(edit.focus.object))
+        {
+            self.edit = None;
+        }
+        if self.focus.is_some_and(|focus| gone(focus.object)) {
+            self.focus = None;
+        }
+    }
+
+    /// Whether a control can be used, and why not.
+    ///
+    /// The asymmetry is the interesting part. Paint can be set across a mixed
+    /// selection because "make these all this colour" is one operation, so a
+    /// mixed colour is still editable. Geometry cannot, because there is no one
+    /// position to show and therefore no one position to set.
+    fn availability(&self, property: Property, value: &Value<f32>, count: usize) -> Availability {
+        if count > 1 && property.is_geometry() {
+            return Availability::Disabled(MIXED_GEOMETRY);
+        }
+        if property == Property::StrokeWidth && value.is_unset() {
+            return Availability::Disabled(NO_STROKE);
+        }
+        Availability::Supported
+    }
+}
+
+impl Render for Inspector {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::diagnostics::count("inspector_build", 1);
+        let start = crate::diagnostics::start();
+        let selected = self.canvas.read(cx).selected_objects();
+        crate::diagnostics::record("inspector_projection", start);
+        crate::diagnostics::count("inspector_objects_copied", selected.len() as u64);
+        self.reconcile(&selected);
+
+        let body = match self.tab {
+            1 => prototype_body(),
+            2 => ai_body(),
+            _ => self.design_body(&selected, cx),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(264.0))
+            .flex_shrink_0()
+            .bg(rgb(theme::SURFACE))
+            .border_l_1()
+            .border_color(rgb(theme::BORDER_SOFT))
+            .child(self.tabs(cx))
+            .child(
+                div()
+                    .id("inspector-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+    }
+}
+
+impl Inspector {
+    // ── Chrome ──────────────────────────────────────────────────────────────
+
+    /// The tab strip, drawn by the same segmented control as a paint's on/off.
+    fn tabs(&self, cx: &mut Context<Self>) -> Div {
+        segmented(
+            "inspector-tab",
+            &TABS,
+            Some(self.tab),
+            None,
+            true,
+            |index, this: &mut Inspector, cx: &mut Context<Inspector>| {
+                this.tab = index;
+                cx.notify();
+            },
+            cx,
+        )
+    }
+
+    /// A collapsible section, its header always drawn and its body only when
+    /// open.
+    ///
+    /// The slot decides *which* section collapses and the title says what it is
+    /// called. Deriving the name from the slot instead is how a section ends up
+    /// labelled "Effects" while showing font sizes.
+    fn inspector_section(
+        &self,
+        title: &'static str,
+        slot: SectionSlot,
+        body: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let collapsed = self.sections.is_collapsed(slot);
+        let mut section = column()
+            .border_b_1()
+            .border_color(rgb(theme::BORDER_SOFT))
+            .child(
+                div()
+                    .id(SharedString::from(format!("section-{}", slot.index())))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .hover(|style| style.bg(rgb(theme::SURFACE_RAISED)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sections.toggle(slot);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(if collapsed { "＋" } else { "−" }),
+                    ),
+            );
+        if !collapsed {
+            section = section.child(body);
+        }
+        section
+    }
+
+    // ── Composition ─────────────────────────────────────────────────────────
+
+    fn design_body(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> AnyElement {
+        match selected {
+            [] => section_body()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT))
+                        .child("No selection"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("Select an object on the canvas or in Layers."),
+                )
+                .into_any_element(),
+            [object] => {
+                let selection = std::slice::from_ref(object);
+                // Typography appears only when the object has text, and the
+                // content travels with it. Figma groups them for the same
+                // reason: a font size with nothing to set is a control that
+                // cannot mean anything.
+                let typography = match object.text_content.as_deref() {
+                    Some(text) => {
+                        let text = text.to_owned();
+                        column()
+                            .child(text_block(&text))
+                            .child(self.typography_fields(selection, cx))
+                    }
+                    None => section_body().child(empty_note("This layer has no text")),
+                };
+                column()
+                    .child(self.layer_header(object, cx))
+                    .child(self.position_section(selection, cx))
+                    .child(self.inspector_section(
+                        "Layout",
+                        SectionSlot::LAYOUT,
+                        self.layout_fields(),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Appearance",
+                        SectionSlot::APPEARANCE,
+                        self.appearance_fields(selection, cx),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Typography",
+                        SectionSlot::TYPOGRAPHY,
+                        typography,
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Effects",
+                        SectionSlot::EFFECTS,
+                        empty_note("No effects yet."),
+                        cx,
+                    ))
+                    .child(self.inspector_section(
+                        "Export",
+                        SectionSlot::EXPORT,
+                        empty_note("Add export setting"),
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+            _ => {
+                let mut sections = column()
+                    .child(multi_header(selected.len()))
+                    .child(self.position_section(selected, cx))
+                    .child(self.inspector_section(
+                        "Appearance",
+                        SectionSlot::APPEARANCE,
+                        self.appearance_fields(selected, cx),
+                        cx,
+                    ));
+                // Typography is offered when any selected object has text: a
+                // mixed selection of shapes and words still has words in it, and
+                // setting one colour applies to all of them at once.
+                if selected.iter().any(|object| object.text_content.is_some()) {
+                    sections = sections.child(self.inspector_section(
+                        "Typography",
+                        SectionSlot::TYPOGRAPHY,
+                        self.typography_fields(selected, cx),
+                        cx,
+                    ));
+                }
+                sections.into_any_element()
+            }
+        }
+    }
+
+    fn layer_header(&self, object: &canvas::DesignObject, cx: &mut Context<Self>) -> Div {
+        column().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(14.0))
+                .py(px(13.0))
+                .border_b_1()
+                .border_color(rgb(theme::BORDER_SOFT))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child("▱"),
+                        )
+                        .child(self.object_name(object, cx)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(object.object_type.label()),
+                ),
+        )
+    }
+
+    /// The object's name, or the rename buffer while one is open.
+    ///
+    /// Clicking the name opens a rename; the typed text is a buffer in this
+    /// view and becomes a real name only when Enter hands it to the canvas as
+    /// one semantic operation. Escape and an empty name abandon it, leaving the
+    /// document untouched.
+    fn object_name(&self, object: &canvas::DesignObject, cx: &mut Context<Self>) -> Stateful<Div> {
+        let renaming = self
+            .rename
+            .as_ref()
+            .filter(|session| session.id == object.id)
+            .map(|session| session.buffer.clone());
+        let name = div()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(if renaming.is_some() {
+                theme::ACCENT
+            } else {
+                theme::TEXT
+            }))
+            .child(match &renaming {
+                Some(buffer) => format!("{buffer}|"),
+                None => object.name.clone(),
+            });
+        let id = object.id;
+        let already_open = renaming.is_some();
+        let name = if already_open {
+            name.cursor_text()
+        } else {
+            name.cursor_pointer()
+        };
+        name.id(SharedString::from(format!("rename-{}", object.id.0)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if already_open {
+                    return;
+                }
+                this.rename = Some(RenameSession::opening(id));
+                cx.notify();
+            }))
+    }
+
+    // ── Sections ────────────────────────────────────────────────────────────
+
+    fn position_section(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+        let object = selected.first().map(|object| object.id);
+        let count = selected.len();
+        let body = section_body()
+            .child(field_pair(
+                self.number_field(
+                    Property::X,
+                    object,
+                    selected_value(selected, Property::X),
+                    count,
+                    cx,
+                ),
+                self.number_field(
+                    Property::Y,
+                    object,
+                    selected_value(selected, Property::Y),
+                    count,
+                    cx,
+                ),
+            ))
+            .child(field_pair(
+                self.number_field(
+                    Property::Width,
+                    object,
+                    selected_value(selected, Property::Width),
+                    count,
+                    cx,
+                ),
+                self.number_field(
+                    Property::Height,
+                    object,
+                    selected_value(selected, Property::Height),
+                    count,
+                    cx,
+                ),
+            ));
+        self.inspector_section("Position and size", SectionSlot::POSITION, body, cx)
+    }
+
+    /// The layout rows, as things the document model cannot yet express.
+    ///
+    /// Drawn as unsupported notes rather than as working controls. A control
+    /// that looks live and does nothing is a promise the model cannot keep, and
+    /// the only way to make the promise true is to implement the operation — not
+    /// to draw the control early.
+    fn layout_fields(&self) -> Div {
+        let unsupported = Availability::Unsupported(NOT_MODELLED);
+        section_body()
+            .child(unsupported_pair("Auto layout", "Direction", unsupported))
+            .child(unsupported_pair("Gap", "Padding", unsupported))
+            .child(unsupported_pair("Align", "Wrap", unsupported))
+    }
+
+    fn appearance_fields(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+        let count = selected.len();
+        let fill = Paint::read(selected, |object| object.fill.map(|fill| fill.color));
+        let stroke = Paint::read(selected, |object| object.stroke.map(|stroke| stroke.color));
+        section_body()
+            .child(self.paint_block(StyleProperty::Fill, fill, theme::SURFACE_RAISED, cx))
+            .child(self.paint_block(StyleProperty::Stroke, stroke, theme::BORDER, cx))
+            .child(self.preset_row(
+                "Width",
+                Property::StrokeWidth,
+                selected_value(selected, Property::StrokeWidth),
+                count,
+                &["1", "2", "4", "8"],
+                cx,
+            ))
+            .child(self.preset_row(
+                "Radius",
+                Property::BorderRadius,
+                selected_value(selected, Property::BorderRadius),
+                count,
+                &["0", "4", "8", "16"],
+                cx,
+            ))
+            .child(self.preset_row(
+                "Opacity",
+                Property::Opacity,
+                selected_value(selected, Property::Opacity),
+                count,
+                &["25", "50", "75", "100"],
+                cx,
+            ))
+    }
+
+    fn typography_fields(&self, selected: &[canvas::DesignObject], cx: &mut Context<Self>) -> Div {
+        let color = Paint::read(selected, |object| object.text_color);
+        section_body()
+            .child(self.paint_block(StyleProperty::TextColor, color, theme::TEXT, cx))
+            .child(self.preset_row(
+                "Size",
+                Property::FontSize,
+                selected_value(selected, Property::FontSize),
+                selected.len(),
+                &["12", "16", "24", "32"],
+                cx,
+            ))
+    }
+
+    // ── Numbers ─────────────────────────────────────────────────────────────
+
+    /// One labelled number.
+    ///
+    /// The same control for every numeric property, which is what makes the
+    /// differences between properties honest: a field is editable, disabled or
+    /// unsupported because the property said so, not because a row forgot to
+    /// check. The affordances follow from what the document model can do —
+    /// dragging where there is an unrecorded-then-committed operation, typing
+    /// everywhere, and nothing at all where neither applies.
+    fn number_field(
+        &self,
+        property: Property,
+        object: Option<canvas::ObjectId>,
+        value: Value<f32>,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let spec = property.spec();
+        let availability = self.availability(property, &value, count);
+        let focus = Focus { object, property };
+        let editable = availability.is_editable();
+        let scrubbable = editable && property.is_continuous();
+
+        let editing = self
+            .edit
+            .as_ref()
+            .filter(|edit| edit.focus == focus)
+            .map(|edit| SharedString::from(edit.buffer().to_owned()));
+        let shown = match value {
+            Value::Set(number) => format_number(number, spec),
+            // A dash rather than `None`: `None` is the answer for a paint, and a
+            // width is not a paint.
+            Value::Unset => NO_VALUE.to_owned(),
+            Value::Mixed => MIXED.to_owned(),
+        };
+        let text = editing.unwrap_or_else(|| SharedString::from(shown));
+        let dragging = self.scrub.is_some() && self.focus == Some(focus);
+        let border = if dragging {
+            theme::ACCENT
+        } else {
+            theme::BORDER_SOFT
+        };
+
+        let field = field_chrome(
+            SharedString::from(property.label()),
+            text,
+            border,
+            !editable,
+        );
+        let field = if scrubbable {
+            field.cursor_ew_resize()
+        } else {
+            field.cursor_default()
+        };
+
+        field
+            .id(property.control_id(object))
+            // A single click points the arrow keys at the field. Typing is a
+            // double click, because a click is also how a drag starts, and a
+            // control that opened an editor at the end of every scrub would make
+            // scrubbing unusable.
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                if !editable {
+                    return;
+                }
+                if event.click_count() >= 2 {
+                    this.open_edit(focus, cx);
+                } else {
+                    this.focus = Some(focus);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if scrubbable {
+                        this.begin_scrub(focus, event.position.x.into(), cx);
+                    }
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    let owns = this.scrub.is_some_and(|scrub| {
+                        scrub.property() == property
+                            && object.is_some_and(|object| scrub.object() == object)
+                    });
+                    if owns {
+                        this.move_scrub(event.position.x.into(), cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_scrub(cx);
+                }),
+            )
+    }
+
+    /// A number offered as one-click values.
+    ///
+    /// Presets rather than a scrub for paint: only geometry has an operation
+    /// that records when the user lets go, and a drag on a field without one
+    /// would be one history entry per pointer movement. Every preset is a value
+    /// the style model can definitely express, so every chip is a control whose
+    /// edit saves — and one click is one semantic operation, the same as a drag.
+    fn preset_row(
+        &self,
+        label: &'static str,
+        property: Property,
+        value: Value<f32>,
+        count: usize,
+        presets: &'static [&'static str],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let spec = property.spec();
+        let availability = self.availability(property, &value, count);
+        let editable = availability.is_editable();
+        let text = match value {
+            Value::Set(number) => format_number(number, spec),
+            Value::Unset => NO_VALUE.to_owned(),
+            Value::Mixed => MIXED.to_owned(),
+        };
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(text),
+            );
+        for preset in presets {
+            // The chip says what the user reads, so the value it commits is that
+            // number put back through the spec. Opacity reads `100` and stores
+            // `1.0`; without the round trip the presets would be off by a
+            // hundred.
+            let stored = spec.stored(preset.parse::<f32>().unwrap_or_default());
+            let edit = property.style_edit(stored);
+            let enabled = editable && edit.is_some();
+            let chip = div()
+                .id(SharedString::from(format!(
+                    "preset-{}-{}",
+                    property.slug(),
+                    preset
+                )))
+                .px(px(7.0))
+                .py(px(5.0))
+                .rounded_sm()
+                .bg(rgb(theme::WINDOW))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SOFT))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child(*preset);
+            let chip = if enabled {
+                chip.cursor_pointer()
+                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            } else {
+                chip.cursor_default().opacity(0.55)
+            };
+            row = row.child(chip.on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(edit) = edit {
+                    this.commit_style(edit, cx);
+                }
+            })));
+        }
+        row
+    }
+
+    // ── Paint ───────────────────────────────────────────────────────────────
+
+    /// A paint row with its palette, so the two are one block that opens and
+    /// closes together.
+    fn paint_block(
+        &self,
+        property: StyleProperty,
+        paint: Paint,
+        fallback: u32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.paint_row(property, paint, fallback, cx));
+        if self.palette == Some(property) {
+            block = block.child(self.palette_rows(property, cx));
+        }
+        block
+    }
+
+    /// One paint: whether it is on, and the colour it is on with.
+    ///
+    /// The two are separate controls because they disagree independently: a
+    /// selection can agree on "filled" and disagree on the colour, or agree on
+    /// neither. Reading one from the other is how a panel ends up calling a
+    /// half-filled selection uniform.
+    fn paint_row(
+        &self,
+        property: StyleProperty,
+        paint: Paint,
+        fallback: u32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let color = canvas::Color::from_rgb(paint.swatch(fallback));
+        let selected = match paint.present {
+            Value::Set(true) => Some(0),
+            Value::Set(false) => Some(1),
+            _ => None,
+        };
+        let state = if paint.present.is_mixed() {
+            Some(MIXED)
+        } else {
+            None
+        };
+        // A mixed presence is still editable: switching a paint on or off
+        // applies to the whole selection, which is one operation and the reason
+        // `selection.md` says setting a value applies to all. So no option is
+        // selected and the word `Mixed` says why.
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_SECONDARY))
+                    .child(property.label()),
+            )
+            .child(segmented(
+                &format!("{}-state", property.slug()),
+                &[("On", true), ("Off", true)],
+                selected,
+                state,
+                false,
+                move |index: usize, this: &mut Inspector, cx: &mut Context<Inspector>| {
+                    let color = if index == 0 { Some(color) } else { None };
+                    this.commit_paint(property, color, cx);
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "{}-color-trigger",
+                        property.slug()
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.0))
+                    .py(px(5.0))
+                    .rounded_sm()
+                    .bg(rgb(theme::WINDOW))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_SOFT))
+                    .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.palette = if this.palette == Some(property) {
+                            None
+                        } else {
+                            Some(property)
+                        };
+                        cx.notify();
+                    }))
+                    .child(div().size(px(12.0)).rounded_sm().bg(rgb(color.to_rgb())))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_SECONDARY))
+                            .child(paint.label()),
+                    ),
+            )
+    }
+
+    fn palette_rows(&self, property: StyleProperty, cx: &mut Context<Self>) -> Div {
+        let mut palette = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p(px(7.0))
+            .rounded_md()
+            .bg(rgb(theme::WINDOW))
+            .border_1()
+            .border_color(rgb(theme::BORDER));
+        for chunk in PALETTE.chunks(3) {
+            let mut row = div().flex().gap_1();
+            for (name, value) in chunk {
+                let name = *name;
+                let color = canvas::Color::from_rgb(*value);
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("style-color-{name}")))
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .gap_1()
+                        .px(px(4.0))
+                        .py(px(5.0))
+                        .rounded_sm()
+                        .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.commit_paint(property, Some(color), cx);
+                            this.palette = None;
+                            cx.notify();
+                        }))
+                        .child(div().size(px(10.0)).rounded_sm().bg(rgb(*value)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_SECONDARY))
+                                .child(name),
+                        ),
+                );
+            }
+            palette = palette.child(row);
+        }
+        palette
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared chrome
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A plain vertical stack. The base every section and section body is built on.
+fn column() -> Div {
+    div().flex().flex_col()
+}
+
+/// The body of a section: one column, one gap, one padding.
+///
+/// One function so a section body cannot pick its own spacing. It had three —
+/// `12`, `13`, and a nested `12` inside a `16` — which is the kind of drift that
+/// makes a panel look assembled rather than drawn.
+fn section_body() -> Div {
+    div().flex().flex_col().gap_2().px(px(14.0)).py(px(12.0))
+}
+
+/// Two fields side by side.
+fn field_pair(left: impl IntoElement, right: impl IntoElement) -> Div {
+    div().flex().gap_2().child(left).child(right)
+}
+
+/// The shape every labelled field shares: a label on the left, a value on the
+/// right, one border, one padding, one type size.
+///
+/// One function so a preset row and a scrubbable field cannot drift apart into
+/// two looks for the same thing. `dimmed` is how a field that cannot be used
+/// says so — the value stays readable, which matters, because a mixed selection
+/// still has a value worth reading.
+fn field_chrome(label: SharedString, value: SharedString, border: u32, dimmed: bool) -> Div {
+    let field = div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px(px(8.0))
+        .py(px(8.0))
+        .rounded_md()
+        .bg(rgb(theme::WINDOW))
+        .border_1()
+        .border_color(rgb(border))
+        .text_xs()
+        .child(div().text_color(rgb(theme::TEXT_MUTED)).child(label))
+        .child(div().text_color(rgb(theme::TEXT_SECONDARY)).child(value));
+    if dimmed {
+        field.opacity(0.55)
+    } else {
+        field
+    }
+}
+
+/// A row for a property the document model cannot express.
+///
+/// It states the reason rather than drawing a control. Affinity's rule is that
+/// an action which does not apply is disabled rather than silently absent, and
+/// the same reasoning covers a property that does not exist yet: the useful
+/// information is *that it is missing*, not an inviting rectangle.
+fn unsupported_row(label: &'static str, availability: Availability) -> Div {
+    field_chrome(
+        SharedString::from(label),
+        SharedString::from(availability.reason().unwrap_or(NOT_MODELLED)),
+        theme::BORDER_SOFT,
+        true,
+    )
+}
+
+fn unsupported_pair(left: &'static str, right: &'static str, availability: Availability) -> Div {
+    field_pair(
+        unsupported_row(left, availability),
+        unsupported_row(right, availability),
+    )
+}
+
+/// A section with nothing in it yet.
+///
+/// The same note shape everywhere a section has no controls, so "nothing here
+/// yet" is one visual thing rather than a sentence written four ways.
+fn empty_note(message: &'static str) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .px(px(14.0))
+        .py(px(12.0))
+        .child(message)
+}
+
+/// A run of text above the controls that change it.
+///
+/// Figma stacks a text field above its own typography rows, and the reason
+/// holds: a font size with nothing to set is a control that cannot mean anything.
+fn text_block(content: &str) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px(px(14.0))
+        .py(px(13.0))
+        .border_b_1()
+        .border_color(rgb(theme::BORDER_SOFT))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Text content"),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(theme::TEXT))
+                .child(content.to_owned()),
+        )
+}
+
+/// The header a multi-selection gets instead of a layer name.
+fn multi_header(count: usize) -> Div {
+    section_body()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT))
+                .child(format!("{count} objects selected")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Style changes apply to the entire selection."),
+        )
+}
+
+/// A row of mutually exclusive choices.
+///
+/// `selected` is an `Option` rather than an index because "none of these" is a
+/// state a choice can be in: a selection where some objects are filled and some
+/// are not is not `On` and is not `Off`, and a control that silently selected
+/// neither would look broken rather than mixed. `state` is the word that says so.
+///
+/// `grow` is the one difference between the two shapes it draws — a tab strip
+/// that fills the panel, and a compact pair that does not — and it is a
+/// parameter rather than a second control because the gesture, the states and the
+/// pressed look are the same in both.
+fn segmented(
+    prefix: &str,
+    labels: &[(&'static str, bool)],
+    selected: Option<usize>,
+    state: Option<&'static str>,
+    grow: bool,
+    action: impl Fn(usize, &mut Inspector, &mut Context<Inspector>) + Copy + 'static,
+    cx: &mut Context<Inspector>,
+) -> Div {
+    let mut row = div().flex().items_center().gap_1();
+    if let Some(state) = state {
+        row = row.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(state),
+        );
+    }
+    for (index, (label, offered)) in labels.iter().enumerate() {
+        let pressed = selected == Some(index);
+        let enabled = *offered;
+        // `action` captures nothing but `Copy` state, so the closure is `Copy`
+        // too and each option gets its own without sharing a listener.
+        let action = action;
+        let option = div()
+            .id(SharedString::from(format!("{prefix}-{index}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .py(px(7.0))
+            .px(px(8.0))
+            .rounded_sm()
+            .bg(rgb(if pressed {
+                theme::ACCENT_WASH
+            } else {
+                theme::WINDOW
+            }))
+            .border_1()
+            .border_color(rgb(theme::BORDER_SOFT))
+            .text_xs()
+            .text_color(rgb(if pressed {
+                theme::ACCENT
+            } else {
+                theme::TEXT_SECONDARY
+            }))
+            .child(*label);
+        let option = if grow { option.flex_1() } else { option };
+        let option = if enabled {
+            option
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+        } else {
+            option.cursor_default().opacity(0.55)
+        };
+        row = row.child(option.on_click(cx.listener(
+            move |this: &mut Inspector, _: &gpui::ClickEvent, _, cx: &mut Context<Inspector>| {
+                if enabled {
+                    action(index, this, cx);
+                }
+            },
+        )));
+    }
+    row
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The other two tabs
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn prototype_body() -> AnyElement {
+    column()
+        .gap_3()
+        .p(px(15.0))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT))
+                .child("Prototype connections"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child("Link this frame to another screen to start a flow."),
+        )
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(9.0))
+                .rounded_md()
+                .bg(rgb(theme::WINDOW))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("＋  Add interaction"),
+        )
+        .into_any_element()
+}
+
+fn ai_body() -> AnyElement {
+    column()
+        .gap_3()
+        .p(px(15.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(rgb(theme::ACCENT)).child("✦"))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT))
+                        .child("Design with context"),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_SECONDARY))
+                .child("Spool can work with the selected Hero section and the styles around it."),
+        )
+        .child(crate::shell::agent_suggestion("↗", "Make this responsive"))
+        .child(crate::shell::agent_suggestion(
+            "✳",
+            "Suggest spacing improvements",
+        ))
+        .into_any_element()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, size};
+
+    fn geometry(x: f32, y: f32, width: f32, height: f32) -> canvas::Geometry {
+        canvas::Geometry {
+            position: point(x, y),
+            size: size(width, height),
+        }
+    }
+
+    fn scrub_of(property: Property, before: canvas::Geometry) -> Scrub {
+        let gesture = canvas::GeometryScrub {
+            id: canvas::ObjectId::LANDING,
+            before,
+        };
+        Scrub::begin(property, canvas::ObjectId::LANDING, gesture, 100.0)
+    }
+
+    fn object(
+        fill: Option<u32>,
+        stroke: Option<(u32, f32)>,
+        text_color: Option<u32>,
+        font_size: Option<f32>,
+    ) -> canvas::DesignObject {
+        canvas::DesignObject {
+            id: canvas::ObjectId::LANDING,
+            spool_id: crate::source_document::NodeId::new("test-node").unwrap(),
+            name: "Shape".to_string(),
+            position: point(0.0, 0.0),
+            size: size(20.0, 20.0),
+            object_type: canvas::ObjectType::Rectangle,
+            text_content: None,
+            text_color: text_color.map(canvas::Color::from_rgb),
+            font_size,
+            border_radius: 0.0,
+            opacity: 1.0,
+            fill: fill.map(|color| canvas::Fill {
+                color: canvas::Color::from_rgb(color),
+            }),
+            stroke: stroke.map(|(color, width)| canvas::Stroke {
+                color: canvas::Color::from_rgb(color),
+                width,
+            }),
+        }
+    }
+
+    // ── Sections ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_section_has_its_own_slot_in_range() {
+        // A slot is read and written by a closure baked at render time, so an
+        // out-of-range or shared slot is a bug that only shows up as the wrong
+        // section collapsing. Asserting the slots means adding a section is a
+        // compile-and-test question rather than a launch-and-complain one.
+        let slots = [
+            SectionSlot::POSITION,
+            SectionSlot::LAYOUT,
+            SectionSlot::APPEARANCE,
+            SectionSlot::TYPOGRAPHY,
+            SectionSlot::EFFECTS,
+            SectionSlot::EXPORT,
+        ];
+        assert_eq!(slots.len(), SECTION_COUNT, "every slot is accounted for");
+        for (index, slot) in slots.iter().enumerate() {
+            assert!(
+                slot.index() < SECTION_COUNT,
+                "section {index} is out of range"
+            );
+            assert!(
+                !slots[..index].contains(slot),
+                "section {index} shares a slot, so collapsing one collapses another"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsing_one_section_leaves_its_neighbours_alone() {
+        let mut sections = Sections::new();
+        sections.toggle(SectionSlot::LAYOUT);
+        assert!(sections.is_collapsed(SectionSlot::LAYOUT));
+        for slot in [
+            SectionSlot::POSITION,
+            SectionSlot::APPEARANCE,
+            SectionSlot::TYPOGRAPHY,
+            SectionSlot::EFFECTS,
+            SectionSlot::EXPORT,
+        ] {
+            if slot != SectionSlot::LAYOUT {
+                assert!(
+                    !sections.is_collapsed(slot),
+                    "toggling one section changed another"
+                );
+            }
+        }
+        sections.toggle(SectionSlot::LAYOUT);
+        assert!(!sections.is_collapsed(SectionSlot::LAYOUT));
+    }
+
+    // ── The three states ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_uniform_selection_has_a_value_and_an_unapplied_one_does_not() {
+        assert_eq!(Value::across([Some(4.0), Some(4.0)]), Value::Set(4.0));
+        assert_eq!(
+            Value::<f32>::across([None, None]),
+            Value::Unset,
+            "agreement that nothing is set is still agreement"
+        );
+    }
+
+    #[test]
+    fn a_disagreement_is_mixed_and_stays_mixed() {
+        assert_eq!(Value::across([Some(1.0), Some(2.0)]), Value::Mixed);
+        assert_eq!(
+            Value::across([Some(1.0), None]),
+            Value::Mixed,
+            "one object having a value the other lacks is a disagreement"
+        );
+        // A later agreement cannot make a selection uniform again: the two
+        // objects already differ, so the selection is mixed whatever the rest
+        // say. Folding left to right gets this right without buffering.
+        assert_eq!(
+            Value::across([Some(1.0), Some(2.0), Some(1.0)]),
+            Value::Mixed
+        );
+        assert_eq!(Value::across([Some(1.0), None, Some(1.0)]), Value::Mixed);
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_value_and_does_not_claim_one() {
+        let empty: Vec<Option<f32>> = Vec::new();
+        assert_eq!(Value::across(empty), Value::Unset);
+    }
+
+    #[test]
+    fn a_number_never_reads_as_zero_just_because_nothing_set_it() {
+        // `Unset` and `Mixed` are different claims, and both are claims the
+        // panel has to be able to make out loud.
+        assert!(Value::<f32>::Mixed.is_mixed() && !Value::<f32>::Mixed.is_unset());
+        assert!(Value::<f32>::Unset.is_unset() && !Value::<f32>::Unset.is_mixed());
+        assert_eq!(
+            format_number(0.0, Property::StrokeWidth.spec()),
+            "0",
+            "a width of zero is a width, and has to be readable as one"
+        );
+        assert_ne!(
+            format_number(0.0, Property::StrokeWidth.spec()),
+            NO_VALUE,
+            "the same digits are the mark for a width that does not exist"
+        );
+    }
+
+    // ── Availability ────────────────────────────────────────────────────────
+
+    #[test]
+    fn only_supported_is_editable_and_every_other_state_explains_itself() {
+        assert!(Availability::Supported.is_editable());
+        assert_eq!(Availability::Supported.reason(), None);
+
+        // An unusable control that cannot say why is just a dead rectangle, and
+        // a dead rectangle is worse than an absent one because it looks like a
+        // promise somebody intends to keep.
+        assert!(!Availability::Disabled(NO_STROKE).is_editable());
+        assert_eq!(Availability::Disabled(NO_STROKE).reason(), Some(NO_STROKE));
+        assert!(!Availability::Unsupported(NOT_MODELLED).is_editable());
+        assert_eq!(
+            Availability::Unsupported(NOT_MODELLED).reason(),
+            Some(NOT_MODELLED)
+        );
+    }
+
+    // ── Numbers ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn one_rounding_rule_writes_every_number_in_the_panel() {
+        let pixels = NumberSpec::length(None);
+        assert_eq!(format_number(0.0, pixels), "0");
+        assert_eq!(format_number(100.0, pixels), "100");
+        assert_eq!(format_number(-12.5, pixels), "-12.5");
+        assert_eq!(
+            format_number(12.0, pixels),
+            "12",
+            "a whole number is not a different number from the same one with a decimal"
+        );
+        let percent = NumberSpec::percent();
+        assert_eq!(format_number(1.0, percent), "100%");
+        assert_eq!(format_number(0.5, percent), "50%");
+    }
+
+    #[test]
+    fn a_number_is_clamped_to_its_own_range_in_display_units() {
+        let opacity = Property::Opacity.spec();
+        assert_eq!(opacity.display(0.5), 50.0);
+        assert_eq!(opacity.stored(50.0), 0.5);
+        assert_eq!(
+            format_number(2.0, opacity),
+            "100%",
+            "a value above the maximum reads as the maximum"
+        );
+        let width = Property::Width.spec();
+        assert_eq!(
+            format_number(0.0, width),
+            "1",
+            "a box cannot offer a size it will not accept"
+        );
+        let radius = Property::BorderRadius.spec();
+        assert_eq!(format_number(-4.0, radius), "0");
+    }
+
+    #[test]
+    fn a_scrub_lands_on_a_step_rather_than_between_two_values_that_read_the_same() {
+        let pixels = NumberSpec::length(None);
+        let scrub = scrub_of(Property::X, geometry(10.0, 0.0, 20.0, 20.0));
+        assert_eq!(scrub.value_at(100.0, pixels), 10.0, "no movement");
+        assert_eq!(scrub.value_at(104.0, pixels), 14.0);
+        assert_eq!(
+            scrub.value_at(104.4, pixels),
+            14.0,
+            "a drag settles on a whole pixel, not on wherever the pointer stopped"
+        );
+        assert_eq!(scrub.value_at(96.0, pixels), 6.0);
+    }
+
+    #[test]
+    fn a_scrub_is_a_function_of_where_it_started_and_not_of_how_many_moves_it_saw() {
+        let pixels = NumberSpec::length(None);
+        let scrub = scrub_of(Property::X, geometry(10.0, 0.0, 20.0, 20.0));
+        let straight = scrub.value_at(110.0, pixels);
+        // The same pointer position reached after a detour must read the same.
+        let _detour = [
+            scrub.value_at(103.0, pixels),
+            scrub.value_at(120.0, pixels),
+            scrub.value_at(101.0, pixels),
+        ];
+        assert_eq!(scrub.value_at(110.0, pixels), straight);
+    }
+
+    #[test]
+    fn a_scrub_describes_the_whole_geometry_and_leaves_the_other_axis_alone() {
+        let scrub = scrub_of(Property::X, geometry(10.0, 30.0, 20.0, 40.0));
+        let moved = scrub.geometry_at(120.0);
+        assert_eq!(moved, geometry(30.0, 30.0, 20.0, 40.0));
+        let scrub = scrub_of(Property::Height, geometry(10.0, 30.0, 20.0, 40.0));
+        assert_eq!(scrub.geometry_at(100.0), geometry(10.0, 30.0, 20.0, 40.0));
+    }
+
+    #[test]
+    fn a_size_never_goes_below_the_size_that_can_still_be_hit() {
+        let before = geometry(0.0, 0.0, 20.0, 20.0);
+        assert_eq!(
+            Property::Width.write(before, -5.0).size.width,
+            1.0,
+            "a zero-sized box cannot be clicked again, so shrinking one to nothing makes it unrecoverable"
+        );
+        assert_eq!(
+            Property::Height.write(before, 0.0).size.height,
+            1.0,
+            "the floor holds however the value arrived"
+        );
+        assert_eq!(
+            Property::X.write(before, -5.0).position.x,
+            -5.0,
+            "a position has no floor: a box may sit off the left edge"
+        );
+    }
+
+    #[test]
+    fn a_property_reads_and_writes_the_same_value_back() {
+        let before = geometry(10.0, 20.0, 30.0, 40.0);
+        for property in [Property::X, Property::Y, Property::Width, Property::Height] {
+            let spec = property.spec();
+            let next = property.write(before, spec.stored(99.0));
+            assert_eq!(
+                property.read_geometry(next),
+                99.0,
+                "{property:?} lost the value it was given"
+            );
+        }
+    }
+
+    #[test]
+    fn a_geometry_property_has_no_style_edit_and_a_paint_one_has_no_geometry() {
+        for geometry in [Property::X, Property::Y, Property::Width, Property::Height] {
+            assert_eq!(
+                geometry.style_edit(1.0),
+                None,
+                "{geometry:?} is a property of the box, not of its paint"
+            );
+        }
+        assert_eq!(
+            Property::BorderRadius.style_edit(4.0),
+            Some(canvas::StyleEdit::BorderRadius(4.0))
+        );
+        assert_eq!(
+            Property::Opacity.style_edit(0.5),
+            Some(canvas::StyleEdit::Opacity(0.5))
+        );
+        assert_eq!(
+            Property::FontSize.style_edit(16.0),
+            Some(canvas::StyleEdit::FontSize(16.0))
+        );
+        assert!(Property::X.is_geometry() && !Property::Opacity.is_geometry());
+        assert!(
+            Property::X.is_continuous(),
+            "only geometry has an operation that records when the user lets go"
+        );
+        assert!(!Property::Opacity.is_continuous());
+    }
+
+    #[test]
+    fn control_ids_are_stable_and_do_not_collide() {
+        let x = Property::X.control_id(Some(canvas::ObjectId::LANDING));
+        let y = Property::Y.control_id(Some(canvas::ObjectId::LANDING));
+        let other_object = Property::X.control_id(Some(canvas::ObjectId::EDITOR));
+        let selection = Property::X.control_id(None);
+
+        assert_ne!(x, y, "two properties cannot share one control");
+        assert_ne!(
+            x, other_object,
+            "one property on two objects cannot share one control"
+        );
+        assert_ne!(
+            x, selection,
+            "a per-object field is not the selection's field"
+        );
+        assert_eq!(
+            x,
+            Property::X.control_id(Some(canvas::ObjectId::LANDING)),
+            "an id derived from the name is the same next frame, which is what keeps element state attached to its own field"
+        );
+    }
+
+    // ── Typing ──────────────────────────────────────────────────────────────
+
+    fn focus() -> Focus {
+        Focus {
+            object: Some(canvas::ObjectId::LANDING),
+            property: Property::X,
+        }
+    }
+
+    #[test]
+    fn typing_replaces_the_value_that_was_there() {
+        // The convention, and the whole difference between "type a number" and
+        // "append to the old one": the text arrives selected.
+        let mut edit = NumberEdit::editing(focus(), "120".to_owned());
+        assert_eq!(edit.apply_key("5"), EditEffect::Continue);
+        assert_eq!(edit.buffer(), "5");
+        for key in ["0", ".", "5"] {
+            edit.apply_key(key);
+        }
+        assert_eq!(edit.buffer(), "50.5", "only the first key replaced");
+    }
+
+    #[test]
+    fn enter_commits_the_typed_text() {
+        let mut edit = NumberEdit::editing(focus(), "12".to_owned());
+        // The first keystroke replaces the value that was there, so this commits
+        // a number the user typed rather than one they did not choose.
+        edit.apply_key("6");
+        edit.apply_key("4");
+        assert_eq!(edit.apply_key("enter"), EditEffect::Commit("64".to_owned()));
+        assert!(edit.buffer().is_empty(), "and the buffer is gone");
+    }
+
+    #[test]
+    fn escape_abandons_a_field_without_committing_anything() {
+        let mut edit = NumberEdit::editing(focus(), "12".to_owned());
+        edit.apply_key("9");
+        assert_eq!(edit.buffer(), "9");
+        assert_eq!(edit.apply_key("escape"), EditEffect::Abandon);
+        assert!(edit.buffer().is_empty());
+    }
+
+    #[test]
+    fn backspace_clears_selected_text_and_edits_one_character_otherwise() {
+        let mut edit = NumberEdit::editing(focus(), "120".to_owned());
+        assert_eq!(edit.apply_key("backspace"), EditEffect::Continue);
+        assert_eq!(
+            edit.buffer(),
+            "",
+            "with the value selected, Backspace deletes the selection — the same rule typing follows"
+        );
+        edit.apply_key("7");
+        assert_eq!(edit.buffer(), "7");
+        edit.apply_key("backspace");
+        assert_eq!(
+            edit.buffer(),
+            "",
+            "and once there is no selection it edits one character"
+        );
+    }
+
+    #[test]
+    fn a_modifier_combination_is_swallowed_rather_than_typed_into_the_field() {
+        let mut edit = NumberEdit::editing(focus(), String::new());
+        for key in ["cmd-d", "cmd-shift-z", "left", "tab"] {
+            assert_eq!(edit.apply_key(key), EditEffect::Continue);
+        }
+        assert_eq!(edit.buffer(), "", "no shortcut leaked into the value");
+    }
+
+    #[test]
+    fn nudging_a_typed_value_moves_it_and_leaves_the_field_open() {
+        let mut edit = NumberEdit::editing(focus(), "10".to_owned());
+        assert!(edit.nudge(1.0));
+        assert_eq!(edit.buffer(), "11");
+        assert!(edit.nudge(-10.0));
+        assert_eq!(edit.buffer(), "1");
+    }
+
+    #[test]
+    fn nudging_refuses_to_invent_a_value_from_text_that_is_not_one_yet() {
+        // An arrow pressed in the middle of typing `-` or `1e` must not silently
+        // drop the digits the user entered.
+        for buffer in ["-", "1e", ""] {
+            let mut edit = NumberEdit::editing(focus(), buffer.to_owned());
+            assert!(
+                !edit.nudge(1.0),
+                "nudging {buffer:?} invented a value out of nothing"
+            );
+            assert_eq!(edit.buffer(), buffer, "and it left the text alone");
+        }
+    }
+
+    #[test]
+    fn a_nudge_stays_inside_the_property_s_range() {
+        let mut edit = NumberEdit::editing(
+            Focus {
+                object: None,
+                property: Property::Opacity,
+            },
+            "100".to_owned(),
+        );
+        assert!(edit.nudge(10.0));
+        assert_eq!(
+            edit.buffer(),
+            "100",
+            "a proportion cannot be nudged past its maximum"
+        );
+        assert_eq!(
+            edit.buffer().parse::<f32>(),
+            Ok(100.0),
+            "and the buffer stays a bare number, because that is what it has to parse as"
+        );
+        assert_eq!(
+            format_number(1.0, Property::Opacity.spec()),
+            "100%",
+            "the unit belongs to the field, not to the text being typed into it"
+        );
+    }
+
+    // ── Paint ───────────────────────────────────────────────────────────────
+
+    fn fill_of(object: &canvas::DesignObject) -> Option<canvas::Color> {
+        object.fill.map(|fill| fill.color)
+    }
+
+    #[test]
+    fn a_paint_reports_whether_and_which_independently() {
+        // Uniform: both agree.
+        let uniform = vec![
+            object(Some(theme::PAPER), None, None, None),
+            object(Some(theme::PAPER), None, None, None),
+        ];
+        let paint = Paint::read(&uniform, fill_of);
+        assert_eq!(paint.present, Value::Set(true));
+        assert_eq!(
+            paint.color,
+            Value::Set(canvas::Color::from_rgb(theme::PAPER))
+        );
+        assert_eq!(
+            paint.label(),
+            color_hex(canvas::Color::from_rgb(theme::PAPER))
+        );
+
+        // Absent everywhere: agreement that it is off.
+        let absent = vec![
+            object(None, None, None, None),
+            object(None, None, None, None),
+        ];
+        let paint = Paint::read(&absent, fill_of);
+        assert_eq!(paint.present, Value::Set(false));
+        assert_eq!(paint.color, Value::Unset);
+        assert_eq!(paint.label(), UNSET);
+    }
+
+    #[test]
+    fn a_half_filled_selection_is_mixed_in_both_readings_but_still_has_a_colour_to_offer() {
+        let selected = [
+            object(Some(theme::PAPER), None, None, None),
+            object(None, None, None, None),
+        ];
+        let paint = Paint::read(&selected, fill_of);
+        assert_eq!(paint.present, Value::Mixed);
+        assert_eq!(paint.color, Value::Mixed);
+        assert_eq!(paint.label(), MIXED);
+        assert_eq!(
+            paint.representative,
+            Some(canvas::Color::from_rgb(theme::PAPER)),
+            "switching the paint on needs a colour, and this is the only one the selection has"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_agrees_on_being_filled_can_still_disagree_about_the_colour() {
+        // Reading the colour's state off whether the paint is on would call this
+        // uniform, which is exactly the mistake the three states exist to stop.
+        let selected = [
+            object(Some(theme::PAPER), None, None, None),
+            object(Some(theme::INK), None, None, None),
+        ];
+        let paint = Paint::read(&selected, fill_of);
+        assert_eq!(paint.present, Value::Set(true));
+        assert_eq!(paint.color, Value::Mixed);
+        assert_eq!(
+            paint.representative,
+            Some(canvas::Color::from_rgb(theme::PAPER)),
+            "and the toggle offers one of them to fill with"
+        );
+    }
+
+    #[test]
+    fn stroke_width_and_width_are_read_from_the_stroke_not_guessed() {
+        let selected = [
+            object(Some(theme::PAPER), Some((theme::INK, 1.0)), None, None),
+            object(None, Some((theme::INK, 4.0)), None, None),
+        ];
+        assert_eq!(
+            selected_value(&selected, Property::StrokeWidth),
+            Value::Mixed,
+            "two widths are a disagreement"
+        );
+        assert_eq!(
+            selected_value(&[object(None, None, None, None)], Property::StrokeWidth),
+            Value::Unset,
+            "a width with no stroke is not a width of zero"
+        );
+        let uniform = [
+            object(Some(theme::PAPER), Some((theme::INK, 2.0)), None, None),
+            object(Some(theme::PAPER), Some((theme::INK, 2.0)), None, None),
+        ];
+        assert_eq!(
+            selected_value(&uniform, Property::StrokeWidth),
+            Value::Set(2.0)
+        );
+        assert_eq!(
+            selected_value(&uniform, Property::BorderRadius),
+            Value::Set(0.0),
+            "a property with a value on every object is never unset"
+        );
+    }
+
+    #[test]
+    fn an_unauthored_font_size_stays_distinguishable_from_a_zero_one() {
+        let selected = [
+            object(None, None, None, None),
+            object(None, None, None, Some(16.0)),
+        ];
+        assert_eq!(selected_value(&selected, Property::FontSize), Value::Mixed);
+        assert_eq!(
+            selected_value(&[object(None, None, None, None)], Property::FontSize),
+            Value::Unset
+        );
+    }
+
+    // ── The layer name ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_rename_opens_with_the_old_name_selected_so_the_first_key_replaces_it() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        assert_eq!(session.apply_key("H"), RenameEffect::Continue);
+        assert_eq!(session.buffer, "H", "the old name is replaced, not kept");
+        for key in ["e", "a", "d"] {
+            assert_eq!(session.apply_key(key), RenameEffect::Continue);
+        }
+        assert_eq!(session.buffer, "Head");
+        assert_eq!(
+            session.apply_key("enter"),
+            RenameEffect::Commit("Head".into())
+        );
+    }
+
+    #[test]
+    fn typing_after_the_first_character_appends() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("H");
+        session.apply_key("i");
+        assert_eq!(session.buffer, "Hi", "only the first key replaced");
+    }
+
+    #[test]
+    fn escape_abandons_a_rename_without_committing_anything() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("X");
+        assert_eq!(session.buffer, "X");
+        assert_eq!(
+            session.apply_key("escape"),
+            RenameEffect::Abandon,
+            "nothing reaches the document, so the name is untouched"
+        );
+        assert!(session.buffer.is_empty(), "and the buffer is gone");
+    }
+
+    #[test]
+    fn enter_commits_even_an_empty_name_because_trimming_is_the_callers_job() {
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, "Headline".into());
+        session.apply_key("backspace");
+        assert_eq!(
+            session.apply_key("enter"),
+            RenameEffect::Commit(String::new()),
+            "the caller decides an empty name is not a rename"
+        );
+    }
+
+    #[test]
+    fn a_modifier_combination_is_swallowed_rather_than_typed_into_the_name() {
+        // Typing `f` must not also switch to the frame tool, and `cmd-d` must not
+        // land in a layer name as the letters "cmd-d".
+        let mut session = RenameSession::replacing(canvas::ObjectId::LANDING, String::new());
+        for key in ["cmd-d", "cmd-shift-z", "left", "tab"] {
+            assert_eq!(session.apply_key(key), RenameEffect::Continue);
+        }
+        assert_eq!(session.buffer, "", "no shortcut leaked into the name");
+    }
+
+    #[test]
+    fn a_name_opened_by_clicking_starts_empty_but_still_replaces_first() {
+        let mut session = RenameSession::opening(canvas::ObjectId::LANDING);
+        assert_eq!(session.buffer, "");
+        session.apply_key("B");
+        session.apply_key("o");
+        assert_eq!(session.buffer, "Bo");
+    }
+}
