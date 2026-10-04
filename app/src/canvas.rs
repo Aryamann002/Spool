@@ -5,7 +5,12 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PinchEvent, Pixels,
     Point, Render, ScrollWheelEvent, SharedString, Size, Style, TextRun, UTF16Selection, Window,
 };
-use std::{cell::Cell, collections::BTreeMap, ops::Range, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    rc::Rc,
+};
 
 gpui::actions!(
     spool_text,
@@ -1580,7 +1585,9 @@ impl MoveGesture {
         if self.duplicates.is_empty() {
             return geometry;
         }
-        SemanticOperation::Compound(vec![
+        // Through the constructor rather than the variant, so there is one way to
+        // build a compound and flattening is not something a caller can forget.
+        SemanticOperation::compound(vec![
             SemanticOperation::Runtime(DocumentCommand::insert(self.placements.clone())),
             geometry,
         ])
@@ -2463,8 +2470,11 @@ impl CanvasView {
     /// limitation of this milestone, not a silent success.
     ///
     /// Returns the outcome, including what could not be written.
+    ///
+    /// Takes `&mut self` because writing the source changes the baseline the
+    /// next write is measured from. See the snapshot refresh at the end.
     pub fn save_project(
-        &self,
+        &mut self,
     ) -> Result<crate::project_save::SaveOutcome, crate::project_bundle::BundleError> {
         let mut outcome = crate::project_save::SaveOutcome::default();
         let Some(root) = self.project_root.as_deref() else {
@@ -2580,6 +2590,29 @@ impl CanvasView {
         }
         let mut written = crate::project_save::save_project(root, &self.session.document, &edits)?;
         written.unsupported.append(&mut outcome.unsupported);
+
+        // The snapshot answers "what does the authored source say?", and the
+        // source was just rewritten, so the baseline moves with it.
+        //
+        // Without this the comparison above stays pinned to the state the project
+        // was *opened* in, which is right for the first save and wrong for every
+        // one after it: undo puts an object back where it was authored, live then
+        // matches the opening snapshot, so save concludes nothing changed and
+        // writes nothing — leaving the file still describing the move the user
+        // just undid. The undo would hold until the next edit and a reopen would
+        // bring it back.
+        //
+        // A node the save *refused* keeps its old baseline on purpose. Nothing
+        // was written for it, so advancing its snapshot would retire the edit
+        // silently instead of letting the next save try again and report the same
+        // conflict.
+        let unwritten: BTreeSet<&NodeId> =
+            written.unsupported.iter().map(|edit| &edit.node).collect();
+        self.source_snapshot = self
+            .opened_state()
+            .into_iter()
+            .filter(|(node, _)| !unwritten.contains(node))
+            .collect();
         Ok(written)
     }
 
@@ -2615,6 +2648,41 @@ impl CanvasView {
     /// decide which rung is on top from state before anything is cancelled.
     pub fn is_manipulating(&self) -> bool {
         self.interaction.is_active() || self.marquee.is_some() || self.pan.is_some()
+    }
+
+    /// Whether a pointer gesture currently owns the input.
+    ///
+    /// One predicate, because "the drag owns the input" has to have the same
+    /// answer for every reader of it. Pointer capture asks it — a drag that lost
+    /// capture mid-flight would strand the gesture — and the camera asks it too,
+    /// for a reason that is arithmetic rather than cosmetic.
+    ///
+    /// A gesture measures its movement from a world point captured when the
+    /// button went down, and re-projects the pointer through the *current*
+    /// camera on every move. A zoom that lands between those two therefore
+    /// silently rewrites the distance the user has dragged: pinch from 100% to
+    /// 200% halfway through a drag and the object jumps back toward where the
+    /// drag began, by half the distance already travelled. Nothing errors and
+    /// the committed result looks like a drag the user did not make.
+    ///
+    /// Freezing the camera for the duration of a gesture is the same rule the
+    /// corpus applies to a text buffer — see the scope argument in
+    /// [`crate::commands`] — and it is the cheap half of the fix: re-anchoring
+    /// every gesture against a camera that may move under it would mean the
+    /// gesture's meaning depended on two inputs at once.
+    ///
+    /// Wider than [`CanvasView::is_manipulating`], which is the Escape ladder's
+    /// question. That one deliberately excludes a text-buffer drag: Escape while
+    /// drag-selecting text should leave the text session, not just drop the
+    /// selection and report that nothing was in flight.
+    fn pointer_gesture_active(&self) -> bool {
+        self.pan.is_some()
+            || self.interaction.is_active()
+            || self.marquee.is_some()
+            || self
+                .text_edit
+                .as_ref()
+                .is_some_and(|edit| edit.pointer_anchor.is_some())
     }
 
     /// The object under a world point that has text a user would expect to
@@ -3028,11 +3096,83 @@ impl CanvasView {
 
     pub fn set_tool(&mut self, tool: Tool) {
         self.commit_text_edit();
-        self.interaction.restore(&mut self.session.runtime);
+        self.abandon_interaction();
         self.tool = tool;
-        self.interaction = Interaction::None;
         self.marquee = None;
         self.clear_gesture_feedback();
+    }
+
+    /// Put the document and the selection back the way they were before the
+    /// in-flight gesture, and record nothing.
+    ///
+    /// Abandoning a gesture is one policy, so it lives here once rather than
+    /// open-coded at each caller. Restoring the geometry is not the whole of it:
+    /// an `⌥`-drag *created* objects, so the copies have to go back out — and the
+    /// selection, which the drag handed over to those copies, has to notice they
+    /// are gone. A caller that restored the geometry and forgot the rest left
+    /// the panel holding ids that named nothing: invisible, but still counted as
+    /// "a selection" by the Escape ladder, so the next Escape offered to clear a
+    /// selection the user could not see.
+    ///
+    /// Returns whether there was anything in flight. A marquee or a pan is not a
+    /// gesture in this sense and is left alone: neither changed the document, so
+    /// there is nothing to put back.
+    fn abandon_interaction(&mut self) -> bool {
+        if !self.interaction.is_active() {
+            return false;
+        }
+        self.interaction.restore(&mut self.session.runtime);
+        self.interaction = Interaction::None;
+        self.retain_existing_selection();
+        true
+    }
+
+    /// Record whatever the in-flight gesture has already done to the document.
+    ///
+    /// A history key arrives from the keyboard with no pointer position, so a
+    /// live gesture cannot be re-derived from one — and it does not have to be.
+    /// A drag writes to the runtime as it goes, so the document already holds
+    /// where the user actually got to; the only thing missing is the entry.
+    ///
+    /// This exists because the alternative made one keystroke do two unrelated
+    /// things. Discarding the gesture instead of recording it threw away the
+    /// edit in flight with no way back, *and then* reverted whatever came before
+    /// it. Finishing the gesture first means the key that follows reverts the
+    /// thing the user just did, which is the only reading in which it means one
+    /// thing — and it is the same operation a pointer-up records, reached
+    /// without a pointer.
+    ///
+    /// Redo takes the same route. Committing clears the redo branch, so a redo
+    /// key pressed mid-drag finishes the drag and then finds nothing to redo.
+    /// That is the conservative answer: the alternative applies a redo on top of
+    /// an edit the user is still in the middle of making.
+    fn commit_in_flight_interaction(&mut self) -> bool {
+        let interaction = std::mem::replace(&mut self.interaction, Interaction::None);
+        let committed = match interaction {
+            Interaction::Moving(gesture) => {
+                let geometry = geometry_command(&self.session.runtime, &gesture.objects);
+                self.commit_operation(gesture.operation(geometry))
+            }
+            Interaction::Resizing(gesture) => {
+                let command = geometry_command(&self.session.runtime, &gesture.members);
+                self.commit(command)
+            }
+            Interaction::Creating(gesture) => {
+                let geometry =
+                    creation_geometry(gesture.pointer_start_world, gesture.current_world);
+                self.commit_creation(gesture.object_type, geometry.position, geometry.size);
+                true
+            }
+            // Nothing has moved yet, so there is nothing to record. Reporting
+            // `false` matters: a gesture that never crossed the drag threshold
+            // must not become a step the user has to undo twice.
+            Interaction::None
+            | Interaction::PotentialMove(_)
+            | Interaction::PotentialResize(_)
+            | Interaction::PotentialCreate(_) => false,
+        };
+        self.clear_gesture_feedback();
+        committed
     }
 
     /// Undo the last committed semantic operation.
@@ -3043,10 +3183,7 @@ impl CanvasView {
     /// notification.
     fn undo_history(&mut self) -> bool {
         self.commit_text_edit();
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.session.runtime);
-            self.interaction = Interaction::None;
-        }
+        self.commit_in_flight_interaction();
         let changed = self.session.undo().unwrap_or(false);
         if changed {
             self.retain_existing_selection();
@@ -3058,10 +3195,7 @@ impl CanvasView {
     /// Redo the last undone operation. See [`CanvasView::undo_history`].
     fn redo_history(&mut self) -> bool {
         self.commit_text_edit();
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.session.runtime);
-            self.interaction = Interaction::None;
-        }
+        self.commit_in_flight_interaction();
         let changed = self.session.redo().unwrap_or(false);
         if changed {
             self.retain_existing_selection();
@@ -4319,10 +4453,7 @@ impl CanvasView {
 
     fn delete_selected_objects(&mut self) -> bool {
         self.commit_text_edit();
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.session.runtime);
-            self.interaction = Interaction::None;
-        }
+        self.abandon_interaction();
         let ids = self.selection.ids().to_vec();
         let deleted = self.session.runtime.remove_objects(&ids);
         if deleted.is_empty() {
@@ -4346,10 +4477,7 @@ impl CanvasView {
 
     fn duplicate_selected_objects(&mut self) -> bool {
         self.commit_text_edit();
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.session.runtime);
-            self.interaction = Interaction::None;
-        }
+        self.abandon_interaction();
         let ids = self.selection.ids().to_vec();
         let duplicates = self.session.runtime.duplicate_objects(&ids);
         if duplicates.is_empty() {
@@ -4379,11 +4507,9 @@ impl CanvasView {
     }
 
     fn cancel_interaction(&mut self) -> bool {
-        if !self.interaction.is_active() {
+        if !self.abandon_interaction() {
             return false;
         }
-        self.interaction.restore(&mut self.session.runtime);
-        self.interaction = Interaction::None;
         self.clear_gesture_feedback();
         true
     }
@@ -4551,7 +4677,11 @@ impl Render for CanvasView {
             .on_action(cx.listener(Self::text_copy))
             .on_action(cx.listener(Self::text_cut))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                if this.workload_controls_input() {
+                if this.workload_controls_input() || this.pointer_gesture_active() {
+                    // A gesture in flight measures itself against the camera it
+                    // started with, so moving the camera now would move the
+                    // object instead of the view. See
+                    // `CanvasView::pointer_gesture_active`.
                     return;
                 }
                 let cursor = this.cursor_in_viewport(event.position);
@@ -4586,7 +4716,10 @@ impl Render for CanvasView {
                 cx.notify();
             }))
             .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
-                if this.workload_controls_input() {
+                if this.workload_controls_input() || this.pointer_gesture_active() {
+                    // A trackpad pinch is the easy way to zoom without noticing
+                    // you did it mid-drag, so this is the case that matters:
+                    // see `CanvasView::pointer_gesture_active`.
                     return;
                 }
                 let cursor = this.cursor_in_viewport(event.position);
@@ -4616,13 +4749,7 @@ impl Render for CanvasView {
                     move |bounds, hitbox, window, cx| {
                         let view_state = entity_for_paint.read(cx);
                         if !view_state.workload_controls_input()
-                            && (view_state.pan.is_some()
-                                || view_state.interaction.is_active()
-                                || view_state.marquee.is_some()
-                                || view_state
-                                    .text_edit
-                                    .as_ref()
-                                    .is_some_and(|edit| edit.pointer_anchor.is_some()))
+                            && view_state.pointer_gesture_active()
                         {
                             window.capture_pointer(hitbox.id);
                         }
@@ -11681,31 +11808,88 @@ mod tests {
     }
 
     #[test]
-    fn an_undo_after_save_does_not_rewrite_a_file_that_still_matches() {
-        // Save writes the disk; undo changes only the editor. Nothing here says
-        // an undo must be persisted, and nothing here should quietly write the
-        // undone state either.
+    fn a_second_save_measures_from_the_first_save_not_from_the_project_opening() {
+        // The regression this covers: save expresses a move as a *change* from a
+        // baseline, and the write layer adds that change to whatever offset the
+        // bytes already carry. So the baseline has to be what the source
+        // currently says, not what it said when the project was opened.
+        //
+        // With the opening state as the baseline, moving an object twice and
+        // saving twice wrote an offset of 40, then wrote 70 again on top of the
+        // 40 already on disk — so the file described 110 while the editor showed
+        // 70. The editor and its own source drifted apart by more with every
+        // save, and a reopen put the object somewhere the user had never put it.
         let root = project_scratch("landing");
         let mut view = project_view(&root);
-        let cta = object_with_node(&view, "spool-cta-primary");
-        view.selection.replace(vec![cta.id]);
-        view.apply_selected_style(StyleEdit::Opacity(0.25));
+        let cta = id_of(&view, "spool-cta-primary");
+        let authored = view.session.runtime.geometry(cta).unwrap().position;
+
+        // 40 down, saved.
+        view.selection.replace(vec![cta]);
+        begin_live_move_with_snap(&mut view, &[cta], true);
+        drag_to(&mut view, point(0.0, 40.0));
+        view.save_project().expect("first save succeeds");
+
+        // 30 more, saved. The second save's change is 30, not 70: it is measured
+        // from what the first save left on disk.
+        begin_live_move_with_snap(&mut view, &[cta], true);
+        drag_to(&mut view, point(0.0, 30.0));
+        let live = view.session.runtime.geometry(cta).unwrap().position;
+        assert!(
+            (live.y - authored.y - 70.0).abs() < 0.01,
+            "two drags of 40 and 30 leave the editor at 70, not 30"
+        );
+        view.save_project().expect("second save succeeds");
+
+        let reopened = project_view(&root);
+        let back = reopened.session.runtime.geometry(cta).unwrap().position;
+        assert!(
+            (back.y - live.y).abs() < 0.01,
+            "the reopened offset is {} but the editor had {}: the second save \
+             measured from the project opening instead of from the first save",
+            back.y - authored.y,
+            live.y - authored.y
+        );
+    }
+
+    #[test]
+    fn an_undo_after_save_is_carried_by_the_next_save() {
+        // Save writes the disk and undo changes only the editor, so immediately
+        // after an undo the two genuinely disagree. The next save is what
+        // resolves that, and it is the only thing that can: the file's bytes are
+        // the editor's own past output.
+        //
+        // This used to assert the opposite — that the second save wrote nothing —
+        // on the reasoning that an undo had put the object back where the project
+        // was opened, so there was nothing to write. That was agreement about the
+        // wrong thing. The bytes still said `translate(0px, 40px)`, so a reopen
+        // resurrected the exact move the user had just undone, and the undo held
+        // only until something else was edited.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = id_of(&view, "spool-cta-primary");
+        let authored = view.session.runtime.geometry(cta).unwrap().position;
+
+        view.selection.replace(vec![cta]);
+        begin_live_move_with_snap(&mut view, &[cta], true);
+        drag_to(&mut view, point(0.0, 40.0));
         view.save_project().expect("save succeeds");
-        let after_save = std::fs::read_to_string(root.join("index.html")).expect("read html");
 
         assert!(view.undo_history());
-        let outcome = view.save_project().expect("save succeeds");
         assert!(
-            !outcome
-                .written
-                .iter()
-                .any(|path| path.ends_with("index.html")),
-            "an undone edit that matches the file on disk writes nothing: {:?}",
-            outcome.written
+            (view.session.runtime.geometry(cta).unwrap().position.y - authored.y).abs() < 0.01,
+            "undo put the object back where it was authored"
         );
-        assert_eq!(
-            std::fs::read_to_string(root.join("index.html")).expect("read html"),
-            after_save
+
+        view.save_project().expect("second save succeeds");
+
+        let reopened = project_view(&root);
+        let back = reopened.session.runtime.geometry(cta).unwrap().position;
+        assert!(
+            (back.y - authored.y).abs() < 0.01,
+            "the reopened offset is {} but the editor was back at the authored 0: \
+             an undo that the next save drops is not an undo",
+            back.y - authored.y
         );
     }
 
@@ -11721,7 +11905,7 @@ mod tests {
             })
             .collect();
 
-        let view = project_view(&root);
+        let mut view = project_view(&root);
         let outcome = view.save_project().expect("save succeeds");
 
         assert!(
@@ -12319,6 +12503,1048 @@ mod tests {
             canvas.selection.ids(),
             &[ObjectId::LANDING, ObjectId::FEATURES, ObjectId::MOBILE],
             "three roots: Landing keeps its place even though it has a child"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The interaction workflow, end to end
+    //
+    // Every test above proves one system against itself: a move is measured
+    // against a move, a resize against a resize, a layer row against a layer
+    // row. That is how each of them was able to be correct on its own while the
+    // product loop a user actually walks stayed broken.
+    //
+    // These tests walk the loop instead. Each one starts from a selection and
+    // runs the real production path — the same `Interaction` variants the
+    // pointer drives, the same `commit`, the same history — and asserts the
+    // claim at the seam rather than inside a subsystem. The letter names the
+    // step in the product loop so a failure says which part of the walk broke.
+    // ---------------------------------------------------------------------
+
+    /// The same `two_box_selection` the transform tests use, selected the way a
+    /// user selects it: click the first, add the second.
+    fn select_two_boxes(canvas: &mut CanvasView) -> (ObjectId, ObjectId) {
+        let ids = two_box_selection(canvas);
+        canvas.selection.click_flat(Some(ids.0), false);
+        canvas.selection.click_flat(Some(ids.1), true);
+        ids
+    }
+
+    fn geometries(canvas: &CanvasView, ids: &[ObjectId]) -> Vec<ObjectGeometry> {
+        ids.iter().map(|id| geometry_of(canvas, *id)).collect()
+    }
+
+    /// A: select, move, undo, redo.
+    ///
+    /// The floor the whole loop stands on. If this is wrong, every other
+    /// workflow test is measuring noise.
+    #[test]
+    fn workflow_a_select_move_undo_redo() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let before = geometry_of(&canvas, id);
+
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(40.0, 25.0));
+
+        let moved = geometry_of(&canvas, id);
+        assert_eq!(moved.position, point(40.0, 49.0), "moved by the drag");
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "the whole move is one step, whatever the pointer did on the way"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(geometry_of(&canvas, id), before);
+        assert!(canvas.redo_history());
+        assert_eq!(geometry_of(&canvas, id), moved);
+    }
+
+    /// B: multi-select, move, undo.
+    ///
+    /// The claim under test is not "both moved" — it is "both moved *together*".
+    /// A per-object move implementation passes the first assertion and destroys
+    /// the arrangement the user built, and only undo reveals it.
+    #[test]
+    fn workflow_b_multi_select_move_undo_keeps_the_arrangement() {
+        let mut canvas = CanvasView::new();
+        let ids = select_two_boxes(&mut canvas);
+        let before = geometries(&canvas, &[ids.0, ids.1]);
+        let gap_before = (
+            before[1].position.x - before[0].position.x,
+            before[1].position.y - before[0].position.y,
+        );
+
+        // Snapping suspended: this is about the mapping, and a magnet would move
+        // the expected result rather than the behaviour under test.
+        begin_live_move_with_snap(&mut canvas, &[ids.0, ids.1], true);
+        drag_to(&mut canvas, point(30.0, 20.0));
+
+        let after = geometries(&canvas, &[ids.0, ids.1]);
+        assert_eq!(
+            (after[0].position.x, after[0].position.y),
+            (30.0, 20.0),
+            "the first member moved by the whole delta"
+        );
+        assert_eq!(
+            (after[1].position.x, after[1].position.y),
+            (230.0, 120.0),
+            "and so did the second, by the same delta"
+        );
+        assert_eq!(
+            (
+                after[1].position.x - after[0].position.x,
+                after[1].position.y - after[0].position.y
+            ),
+            gap_before,
+            "a selection moves as a unit, so the gap between its members is invariant"
+        );
+        assert_eq!(
+            after[0].size, before[0].size,
+            "a move never resizes anything"
+        );
+
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "two objects, one gesture, one entry"
+        );
+        assert!(canvas.undo_history());
+        assert_eq!(
+            geometries(&canvas, &[ids.0, ids.1]),
+            before,
+            "undo restores the whole arrangement, not one object"
+        );
+    }
+
+    /// C: multi-select, resize, undo.
+    ///
+    /// The cross-feature claim here is that a resize over a union box is
+    /// *proportional*: the members keep their arrangement inside the new box
+    /// rather than being pinned to their old coordinates.
+    #[test]
+    fn workflow_c_multi_select_resize_undo_scales_the_arrangement() {
+        let mut canvas = CanvasView::new();
+        let ids = select_two_boxes(&mut canvas);
+        let before = geometries(&canvas, &[ids.0, ids.1]);
+        // `two_box_selection` is built so this is arithmetic, not a second
+        // implementation of the rule: union is (0,0) 300x150.
+        assert_eq!(
+            transform_bounds(&snapshots(&canvas.session.runtime, &[ids.0, ids.1])),
+            Some(ObjectGeometry {
+                position: point(0.0, 0.0),
+                size: size(300.0, 150.0)
+            }),
+            "the two boxes have the union box the resize is measured against"
+        );
+
+        // A bottom-right handle *adds* to the far edges, so this halves the
+        // union box: 300x150 becomes 150x75, a scale of exactly 0.5.
+        drag_two_box_resize(
+            &mut canvas,
+            ids,
+            ResizeHandle::BottomRight,
+            point(-150.0, -75.0),
+            false,
+            false,
+        );
+
+        let after = geometries(&canvas, &[ids.0, ids.1]);
+        assert_eq!(
+            after[0].size,
+            size(50.0, 25.0),
+            "a member is scaled by the union box's scale factor, not left alone"
+        );
+        assert_eq!(
+            after[1].position,
+            point(100.0, 50.0),
+            "and its offset inside the box is scaled with it"
+        );
+        assert_eq!(
+            (
+                after[1].position.x - after[0].position.x,
+                after[1].position.y - after[0].position.y
+            ),
+            (100.0, 50.0),
+            "the arrangement survives as a scaled copy of itself: the gap between \
+             the members is the old gap times the same 0.5 the sizes went through"
+        );
+
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "a multi-selection resize is one step"
+        );
+        assert!(canvas.undo_history());
+        assert_eq!(geometries(&canvas, &[ids.0, ids.1]), before);
+        assert!(canvas.redo_history());
+        assert_eq!(geometries(&canvas, &[ids.0, ids.1]), after);
+    }
+
+    /// D: move, snap, commit, undo.
+    ///
+    /// Two systems meet here. The snap engine corrects the delta during the drag;
+    /// the history records the *corrected* result on release. If the recorded
+    /// `before` were the pre-snap proposal, undo would leave the object on the
+    /// guide rather than where it started.
+    #[test]
+    fn workflow_d_snap_then_commit_then_undo_returns_to_the_authored_place() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let before = geometry_of(&canvas, id);
+
+        begin_live_move(&mut canvas, &[id]);
+        // Editor's left edge sits at 454; this puts Landing's at 456, which is
+        // inside the 8px threshold at 100% and so must click into line.
+        canvas.update_interaction(point(456.0, 0.0));
+
+        assert_eq!(
+            geometry_of(&canvas, id).position.x,
+            454.0,
+            "the magnet moved the object onto the line"
+        );
+        assert_eq!(
+            canvas.snap_guides().len(),
+            1,
+            "and left the guide that explains why"
+        );
+
+        canvas.finish_interaction(point(456.0, 0.0));
+
+        assert!(
+            canvas.snap_guides().is_empty(),
+            "a committed gesture does not leave its guides on the canvas"
+        );
+        assert_eq!(
+            geometry_of(&canvas, id).position.x,
+            454.0,
+            "what history records is what the user saw, not what they aimed at"
+        );
+
+        assert_eq!(canvas.session.history.undo_len(), 1);
+        assert!(canvas.undo_history());
+        assert_eq!(
+            geometry_of(&canvas, id),
+            before,
+            "undo returns to the authored position, not to the unsnapped proposal"
+        );
+    }
+
+    /// E: move, Escape, nothing changed.
+    ///
+    /// Escape is the one key that crosses every subsystem at once: the shell's
+    /// ladder, the canvas's gesture state, the operation layer's history. It has
+    /// to leave the document and the history *both* untouched, and it has to do
+    /// so for a gesture that had already moved things on screen.
+    #[test]
+    fn workflow_e_escape_mid_drag_changes_neither_document_nor_history() {
+        let mut canvas = CanvasView::new();
+        let ids = select_two_boxes(&mut canvas);
+        let before = geometries(&canvas, &[ids.0, ids.1]);
+
+        begin_live_move_with_snap(&mut canvas, &[ids.0, ids.1], true);
+        canvas.update_interaction(point(90.0, 70.0));
+        assert_ne!(
+            geometries(&canvas, &[ids.0, ids.1]),
+            before,
+            "the drag really did move things before the cancel"
+        );
+        assert!(
+            canvas.snap_guides().is_empty(),
+            "snapping was suspended, so there is nothing to explain"
+        );
+
+        assert!(
+            canvas.cancel_interaction(),
+            "a live gesture is something Escape can cancel"
+        );
+
+        assert_eq!(
+            geometries(&canvas, &[ids.0, ids.1]),
+            before,
+            "the document is back where it started"
+        );
+        assert!(
+            !canvas.session.history.can_undo(),
+            "and nothing was recorded"
+        );
+        assert!(
+            !canvas.session.history.can_redo(),
+            "nor was the redo branch disturbed"
+        );
+        assert!(
+            canvas.snap_guides().is_empty(),
+            "cancelling drops the guides too"
+        );
+    }
+
+    /// F: select in Layers, move on the canvas, Layers agrees afterwards.
+    ///
+    /// The panel holds a projection of the canvas selection rather than a second
+    /// copy of it, so "Layers reflects the result" has to be checked in both
+    /// directions: the row the panel selected is the object the canvas moved,
+    /// and the panel still reports that row as selected afterwards. A panel that
+    /// drifted here would show the user editing one object while moving another.
+    #[test]
+    fn workflow_f_a_layers_selection_is_the_object_the_canvas_moves() {
+        let mut canvas = CanvasView::new();
+        let mut layers = RetainedLayers::default();
+        let ids = two_box_selection(&mut canvas);
+        assert!(
+            !layers.synchronize(&canvas).is_empty(),
+            "the panel has rows to select from"
+        );
+
+        // What a row click does: the panel asks the canvas to select.
+        canvas.selection.click_flat(Some(ids.1), false);
+        layers.synchronize(&canvas);
+        assert_eq!(
+            layers.selected(),
+            &[ids.1],
+            "the panel reports the row it just selected"
+        );
+
+        let before = geometry_of(&canvas, ids.1);
+        let untouched = geometry_of(&canvas, ids.0);
+        begin_live_move_with_snap(&mut canvas, &[ids.1], true);
+        drag_to(&mut canvas, point(25.0, 15.0));
+
+        assert_ne!(
+            geometry_of(&canvas, ids.1),
+            before,
+            "the object the panel selected is the object that moved"
+        );
+        assert_eq!(geometry_of(&canvas, ids.0), untouched, "and only that one");
+
+        layers.synchronize(&canvas);
+        assert_eq!(
+            layers.selected(),
+            &[ids.1],
+            "the selection survives the move, so the panel still agrees"
+        );
+        assert!(
+            layers
+                .presentation_updates()
+                .iter()
+                .all(|(id, selected)| *id != ids.1 || *selected),
+            "a move does not present the selected row as newly selected"
+        );
+
+        // And undo, driven from the keyboard, is seen by the panel too.
+        assert!(canvas.undo_history());
+        assert_eq!(geometry_of(&canvas, ids.1), before);
+        layers.synchronize(&canvas);
+        assert_eq!(layers.selected(), &[ids.1]);
+    }
+
+    /// G: duplicate, move, undo.
+    ///
+    /// Duplicating hands the selection over to the copies, so the move that
+    /// follows acts on objects that did not exist when the history entry for the
+    /// duplication was recorded. Two entries, and undo must take them in the
+    /// reverse order that leaves a valid document at every step.
+    #[test]
+    fn workflow_g_duplicate_then_move_undoes_the_move_first() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let original = geometry_of(&canvas, id);
+
+        assert!(canvas.duplicate_selected_objects());
+        let duplicates: Vec<ObjectId> = canvas.selection.ids().to_vec();
+        assert_eq!(duplicates.len(), 1, "one copy, and it is selected");
+        assert!(
+            !duplicates.contains(&id),
+            "the copy has its own identity, so undo can name it"
+        );
+        let copied = geometry_of(&canvas, duplicates[0]);
+
+        begin_live_move_with_snap(&mut canvas, &duplicates, true);
+        drag_to(&mut canvas, point(60.0, 0.0));
+        let moved_copy = geometry_of(&canvas, duplicates[0]);
+        assert_ne!(moved_copy, copied);
+
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            2,
+            "the duplication and the move are separate steps"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(
+            geometry_of(&canvas, duplicates[0]),
+            copied,
+            "undo takes back the move"
+        );
+        assert_eq!(
+            geometry_of(&canvas, id),
+            original,
+            "and leaves the object that was duplicated where it was"
+        );
+
+        assert!(canvas.undo_history());
+        assert!(
+            canvas.session.runtime.object(duplicates[0]).is_none(),
+            "the second undo removes the copy rather than leaving an orphan"
+        );
+        assert_eq!(geometry_of(&canvas, id), original);
+    }
+
+    /// H: rename, undo, redo.
+    ///
+    /// Rename is the one edit that goes through the document's structural
+    /// operation rather than the runtime's geometry commands, so it is the only
+    /// one where undo has to restore something the runtime never held.
+    #[test]
+    fn workflow_h_rename_undo_redo() {
+        // A rename goes through the document's structural operation, so it needs
+        // a document that has structure to rename. `CanvasView::new()` is an
+        // empty `lamine` with runtime objects over it, which is exactly the state
+        // a rename must refuse — so this walks a canvas that was loaded.
+        let mut canvas = nested_canvas();
+        let id = ObjectId::LANDING;
+        let node = canvas.session.runtime.object(id).unwrap().spool_id.clone();
+        let original = canvas
+            .session
+            .document
+            .structure
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .unwrap()
+            .name
+            .clone();
+
+        assert!(
+            canvas.rename_object(id, "Hero".into()),
+            "the rename is accepted"
+        );
+        assert_eq!(
+            canvas
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .unwrap()
+                .name,
+            "Hero"
+        );
+        assert_eq!(
+            canvas.session.runtime.object(id).unwrap().name,
+            "Hero",
+            "and the runtime mirrors the document's name"
+        );
+
+        assert!(canvas.undo_history());
+        assert_eq!(
+            canvas
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .unwrap()
+                .name,
+            original,
+            "undo restored the authored name"
+        );
+        assert_eq!(
+            canvas.session.runtime.object(id).unwrap().name,
+            original,
+            "in the runtime too, or the panel would show a stale name"
+        );
+
+        assert!(canvas.redo_history());
+        assert_eq!(
+            canvas
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .unwrap()
+                .name,
+            "Hero"
+        );
+
+        // Renaming to the name it already has is not an edit, so it must not
+        // become a step the user has to undo twice.
+        let depth = canvas.session.history.undo_len();
+        assert!(!canvas.rename_object(id, "Hero".into()));
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            depth,
+            "a no-op rename records nothing"
+        );
+    }
+
+    /// I: zoom, snap, move, undo.
+    ///
+    /// Navigation and editing share one canvas and one undo stack, so the claim
+    /// is that the camera is not a document edit: zooming must not consume an
+    /// undo step, must survive the undo of the move that followed it, and must
+    /// not change *how far* a snap reaches — the threshold is a distance on
+    /// screen, so the same gesture has to snap at 50% and at 200%.
+    #[test]
+    fn workflow_i_zoom_then_snap_then_move_undo_leaves_the_camera_alone() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        let resting = geometry_of(&canvas, id);
+        let zoom_resting = canvas.camera.zoom;
+
+        // Two zooms, in opposite directions. The anchor is the selection's own
+        // centre, which is what the wheel and the `+`/`-` keys both use.
+        canvas.selection.click_flat(Some(id), false);
+        canvas.zoom_in();
+        let zoomed_in = canvas.camera.zoom;
+        assert_ne!(zoomed_in, zoom_resting, "the camera really moved");
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            0,
+            "the camera is not a document edit, so it costs no undo step"
+        );
+
+        canvas.zoom_out();
+        assert_eq!(canvas.camera.zoom, zoom_resting, "and the view came back");
+        assert_eq!(canvas.session.history.undo_len(), 0);
+
+        // The snap threshold is a distance *on screen*, so the world-space window it
+        // covers has to grow as the view pulls back. Landing's left edge aimed at
+        // world 474 sits 20 world px from Editor's left edge at 454: at 100% that
+        // is 20 screen px and outside an 8px threshold, and at 25% it is 5 screen
+        // px and inside one. Same gesture, same target, different zoom, different
+        // answer — which is the only way to tell a screen-space threshold from a
+        // world-space one. `update_interaction` speaks screen coordinates, so
+        // the aim point has to be projected rather than reused.
+        canvas.camera.set_zoom_at_center(1.0);
+        begin_live_move(&mut canvas, &[id]);
+        canvas.update_interaction(canvas.camera.world_to_screen(point(474.0, 0.0)));
+        assert_eq!(
+            geometry_of(&canvas, id).position.x,
+            474.0,
+            "at 100% a 20px error is well outside an 8px threshold, so nothing snaps"
+        );
+        canvas.cancel_interaction();
+
+        canvas.camera.set_zoom_at_center(0.25);
+        begin_live_move(&mut canvas, &[id]);
+        canvas.update_interaction(canvas.camera.world_to_screen(point(474.0, 0.0)));
+        assert_eq!(
+            geometry_of(&canvas, id).position.x,
+            454.0,
+            "at 25% the same 20px error is 5 screen px, inside the same 8px threshold"
+        );
+        assert!(
+            canvas.snap_guides().iter().any(|guide| guide.at == 454.0),
+            "and a guide on Editor's edge is there to explain it, whatever else \
+             the same drag happened to line up"
+        );
+        canvas.cancel_interaction();
+        assert_eq!(geometry_of(&canvas, id), resting);
+
+        // And the committed move undoes without disturbing the zoom.
+        let zoom_before_move = canvas.camera.zoom;
+        let aim = canvas.camera.world_to_screen(point(456.0, 0.0));
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, aim);
+        let committed = geometry_of(&canvas, id);
+        assert_ne!(committed, resting);
+        assert_eq!(canvas.session.history.undo_len(), 1);
+
+        assert!(canvas.undo_history());
+        assert_eq!(geometry_of(&canvas, id), resting);
+        assert_eq!(
+            canvas.camera.zoom, zoom_before_move,
+            "undo restores the document, not the view"
+        );
+    }
+
+    /// J: save, reopen, and the edited document is what comes back.
+    ///
+    /// The loop's last step, and the one that crosses the boundary the whole
+    /// editor is built around: what the gesture layer produced has to survive a
+    /// round trip through authored HTML/CSS, and come back as the same editable
+    /// objects rather than as pixels that merely look right.
+    #[test]
+    fn workflow_j_save_reopen_reproduces_the_edited_document() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let ids: Vec<ObjectId> = view.document_objects().iter().map(|o| o.id).collect();
+        let resting: Vec<ObjectGeometry> = ids
+            .iter()
+            .map(|id| view.session.runtime.geometry(*id).unwrap())
+            .collect();
+        let cta = object_with_node(&view, "spool-cta-primary");
+
+        // Move one object, then resize another, so the round trip has to carry
+        // both a position and a size back out of authored CSS.
+        let mover = ids[0];
+        view.selection.replace(vec![mover]);
+        begin_live_move_with_snap(&mut view, &[mover], true);
+        drag_to(&mut view, point(70.0, 40.0));
+        assert_ne!(
+            view.session.runtime.geometry(mover).unwrap().position,
+            resting[0].position,
+            "the move really happened before the save"
+        );
+
+        let cta_id = view
+            .document_objects()
+            .iter()
+            .find(|o| o.spool_id.as_str() == "spool-cta-primary")
+            .unwrap()
+            .id;
+        view.selection.replace(vec![cta_id]);
+        begin_live_resize(
+            &mut view,
+            cta_id,
+            ResizeHandle::BottomRight,
+            point(0.0, 0.0),
+            true,
+        );
+        view.update_interaction_with(point(24.0, 12.0), false, false);
+        view.finish_interaction(point(24.0, 12.0));
+
+        let moved_to = view.session.runtime.geometry(mover).unwrap().position;
+        let resized_to = view.session.runtime.geometry(cta_id).unwrap();
+        assert_ne!(resized_to.size, cta.size);
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(
+            outcome.unsupported.is_empty(),
+            "a move and a resize of authored objects are both writable: {:?}",
+            outcome.unsupported
+        );
+
+        let reopened = project_view(&root);
+        assert_eq!(
+            reopened.session.runtime.geometry(mover).unwrap().position,
+            moved_to,
+            "the move came back from the authored source"
+        );
+        assert_eq!(
+            reopened.session.runtime.geometry(cta_id).unwrap().size,
+            resized_to.size,
+            "and so did the resize"
+        );
+        assert_eq!(
+            reopened
+                .session
+                .runtime
+                .object(cta_id)
+                .unwrap()
+                .text_content,
+            cta.text_content,
+            "authored content the editor never touched is byte-for-byte intact"
+        );
+
+        // The reopened document is still editable, which is the part a rendered
+        // screenshot could not tell us.
+        let mut reopened = reopened;
+        reopened.selection.replace(vec![mover]);
+        let before = reopened.session.runtime.geometry(mover).unwrap();
+        begin_live_move_with_snap(&mut reopened, &[mover], true);
+        drag_to(&mut reopened, point(10.0, 0.0));
+        assert_ne!(
+            reopened.session.runtime.geometry(mover).unwrap(),
+            before,
+            "the reopened document accepts another gesture"
+        );
+        assert!(reopened.undo_history());
+        assert_eq!(
+            reopened.session.runtime.geometry(mover).unwrap(),
+            before,
+            "and that gesture is undoable like any other"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The seams: a keyboard command arriving while the pointer is busy
+    //
+    // The pointer and the keyboard are two readers of one editor, and until now
+    // every test above drove one or the other and never both. These three walk
+    // the steps where they collide, because that is where the systems that are
+    // each individually correct stop agreeing with each other.
+    // ---------------------------------------------------------------------
+
+    /// An `⌥`-drag that is cancelled has to take its copies with it, and the
+    /// selection has to notice.
+    ///
+    /// The gesture handed the selection over to the copies when the drag went
+    /// live, and the cancel removes those copies from the document. Nothing
+    /// reconciles the two, so without this the panel is left holding ids that no
+    /// longer name anything: invisible, but still counted as "a selection" by
+    /// the Escape ladder, so the next Escape offers to clear a selection the
+    /// user cannot see.
+    #[test]
+    fn workflow_k_cancelling_a_duplicate_drag_leaves_no_dead_selection() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let original = geometry_of(&canvas, id);
+
+        begin_live_move_with_modifiers(&mut canvas, &[id], true, true);
+        canvas.update_interaction(point(60.0, 40.0));
+        let copies: Vec<ObjectId> = canvas.selection.ids().to_vec();
+        assert_eq!(copies.len(), 1, "the drag handed the selection to the copy");
+        assert_ne!(copies[0], id);
+
+        assert!(canvas.cancel_interaction());
+
+        assert!(
+            canvas.session.runtime.object(copies[0]).is_none(),
+            "the cancel took the copy out of the document"
+        );
+        assert_eq!(geometry_of(&canvas, id), original, "and left the original");
+        assert!(
+            canvas.selection.is_empty(),
+            "the selection must not go on naming objects the cancel deleted"
+        );
+        assert!(
+            !canvas.session.history.can_undo(),
+            "and a cancelled gesture is still not an edit"
+        );
+
+        // The panel agrees, rather than reporting a selection that is not there.
+        let mut layers = RetainedLayers::default();
+        layers.synchronize(&canvas);
+        assert!(layers.selected().is_empty());
+    }
+
+    /// Undo arriving mid-drag has to take back the drag.
+    ///
+    /// The competing readings are both wrong in different ways: committing the
+    /// drag and *then* undoing makes one keystroke do two visible things, and
+    /// discarding the drag without recording it throws away work the user can
+    /// neither see nor undo. Undoing the drag is the only answer in which the
+    /// keystroke means one thing — the last thing the user did.
+    #[test]
+    fn workflow_l_undo_mid_drag_reverts_the_drag_rather_than_dropping_it() {
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+
+        // One committed edit, so there is something older for undo to reach if
+        // it looks in the wrong place.
+        begin_live_move(&mut canvas, &[id]);
+        drag_to(&mut canvas, point(10.0, 0.0));
+        let first = geometry_of(&canvas, id);
+        assert_eq!(canvas.session.history.undo_len(), 1);
+
+        // A second drag, still in flight when the undo key arrives.
+        begin_live_move(&mut canvas, &[id]);
+        canvas.update_interaction(point(80.0, 0.0));
+        assert_ne!(geometry_of(&canvas, id), first);
+
+        assert!(canvas.undo_history());
+        assert_eq!(
+            geometry_of(&canvas, id),
+            first,
+            "undo must revert the drag in flight, not discard it and revert the \
+             earlier move instead"
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "the drag became an entry and was then undone, so the stack is the \
+             same depth it was before the key"
+        );
+        assert!(
+            !canvas.interaction.is_active(),
+            "and the gesture is no longer holding the pointer"
+        );
+    }
+
+    /// Moving one child of a frame, on its own, has to round-trip through source.
+    ///
+    /// A child's box is authored relative to the element that contains it, so a
+    /// child moved by itself is the case where writing world coordinates as
+    /// `left` would quietly displace it by the frame's own offset. The frame's
+    /// bytes are the other half of the claim: nothing the editor did to one
+    /// child may rewrite its siblings or its parent.
+    #[test]
+    fn workflow_m_moving_one_child_leaves_the_rest_of_the_authored_source_alone() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let html_before = std::fs::read_to_string(root.join("index.html")).unwrap();
+        let css_before = std::fs::read_to_string(root.join("styles.css")).unwrap();
+
+        let frame_before = view
+            .session
+            .runtime
+            .geometry(id_of(&view, "spool-frame-root"))
+            .unwrap();
+        let sibling_before = view
+            .session
+            .runtime
+            .geometry(id_of(&view, "spool-cta-primary"))
+            .unwrap();
+        let child = id_of(&view, "spool-text-headline");
+        let child_before = view.session.runtime.geometry(child).unwrap();
+
+        // Only the child is selected: a frame and its child can never both be in
+        // a selection, so this is the only way a user can move a child alone.
+        view.selection.replace(vec![child]);
+        begin_live_move_with_snap(&mut view, &[child], true);
+        drag_to(&mut view, point(30.0, 18.0));
+        let moved = view.session.runtime.geometry(child).unwrap();
+        assert_ne!(moved, child_before, "the child really moved");
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        // The frame's own box is authored in flow, so what must not change is
+        // that the save did not rewrite the siblings to compensate.
+        assert_eq!(
+            std::fs::read_to_string(root.join("styles.css")).unwrap(),
+            css_before,
+            "the stylesheet had no reason to be rewritten"
+        );
+
+        let reopened = project_view(&root);
+        assert_eq!(
+            reopened.session.runtime.geometry(child).unwrap(),
+            moved,
+            "the child's own edit survived the round trip"
+        );
+        assert_eq!(
+            reopened
+                .session
+                .runtime
+                .geometry(id_of(&reopened, "spool-cta-primary"))
+                .unwrap(),
+            sibling_before,
+            "and its untouched sibling is exactly where it was"
+        );
+        let frame_after = reopened
+            .session
+            .runtime
+            .geometry(id_of(&reopened, "spool-frame-root"))
+            .unwrap();
+        assert_eq!(
+            frame_after.size, frame_before.size,
+            "the containing frame did not resize because a child moved"
+        );
+
+        // The edit landed in the child's own rule, so the bytes outside that one
+        // declaration are still the ones that were loaded.
+        let html_after = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert_ne!(
+            html_after, html_before,
+            "the child's authored position was written back"
+        );
+        assert!(
+            html_after.contains("spool-cta-primary"),
+            "the sibling's markup is still there"
+        );
+        assert!(html_after.contains("spool-text-headline"));
+    }
+
+    fn id_of(view: &CanvasView, node: &str) -> ObjectId {
+        view.document_objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == node)
+            .unwrap_or_else(|| panic!("{node} is projected"))
+            .id
+    }
+
+    /// The camera belongs to navigation, so it must not move under a gesture.
+    ///
+    /// Two halves. The first is the behaviour: with a drag in flight the camera
+    /// is the pointer's to use, not the wheel's. The second is the arithmetic
+    /// that makes the rule necessary, pinned so the guard is not "simplified"
+    /// away by someone who decides to compensate inside the gesture instead.
+    #[test]
+    fn workflow_n_a_gesture_in_flight_owns_the_camera() {
+        let mut canvas = CanvasView::new();
+        assert!(
+            !canvas.pointer_gesture_active(),
+            "an idle canvas gives the wheel the camera"
+        );
+
+        // Every kind of pointer gesture takes the camera away.
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        begin_live_move(&mut canvas, &[id]);
+        assert!(canvas.pointer_gesture_active(), "a move owns it");
+        canvas.cancel_interaction();
+
+        begin_live_resize(
+            &mut canvas,
+            id,
+            ResizeHandle::BottomRight,
+            point(0.0, 0.0),
+            true,
+        );
+        assert!(canvas.pointer_gesture_active(), "a resize owns it");
+        canvas.cancel_interaction();
+
+        canvas.marquee = Some(MarqueeGesture {
+            start: point(0.0, 0.0),
+            current: point(10.0, 10.0),
+            additive: false,
+            initial_selection: Vec::new(),
+        });
+        assert!(canvas.pointer_gesture_active(), "a marquee owns it");
+        canvas.marquee = None;
+
+        canvas.pan = Some(PanGesture {
+            button: MouseButton::Middle,
+            pointer_start: point(0.0, 0.0),
+            offset_start: point(0.0, 0.0),
+        });
+        assert!(canvas.pointer_gesture_active(), "a pan owns it");
+        canvas.pan = None;
+
+        assert!(!canvas.pointer_gesture_active());
+
+        // The Escape ladder asks a narrower question on purpose: a drag inside a
+        // text buffer should leave the text session, not be reported as a
+        // gesture that nothing owns.
+        canvas.text_edit = Some(TextEditState {
+            id,
+            original_text: "hello".into(),
+            editing_text: "hello".into(),
+            selected_range: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            pointer_anchor: Some(0),
+        });
+        assert!(
+            canvas.pointer_gesture_active(),
+            "a text-buffer drag still owns the camera"
+        );
+        assert!(
+            !canvas.is_manipulating(),
+            "but it is not a gesture as far as the Escape ladder is concerned"
+        );
+    }
+
+    #[test]
+    fn workflow_o_a_zoom_mid_drag_rewrites_the_distance_dragged() {
+        // Why `pointer_gesture_active` gates the wheel and the pinch, stated as
+        // arithmetic so it cannot be forgotten.
+        //
+        // A gesture stores where the pointer was in *world* units when the
+        // button went down, and re-projects the pointer through the *current*
+        // camera on every move. Change the camera between those two and the
+        // delta is no longer the distance the pointer travelled.
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.camera.resize(size(800.0, 600.0));
+        let resting = geometry_of(&canvas, id);
+
+        // `begin_live_move` presses at world (0,0) and screen (0,0), which at the
+        // default camera are the same point.
+        begin_live_move(&mut canvas, &[id]);
+        let target = canvas.camera.world_to_screen(point(150.0, 100.0));
+        canvas.update_interaction(target);
+        let dragged = geometry_of(&canvas, id);
+        assert_eq!(
+            dragged.position.x - resting.position.x,
+            150.0,
+            "screen 150 is world 150 at 100%, and the press was world 0"
+        );
+
+        // Now the pinch that must not reach the camera. The pointer has not
+        // moved on screen, so the object must not move in the world.
+        //
+        // Pinching to 200% about screen (100,100) pins world (100,100) there,
+        // which moves the origin out to screen (100,100)/2 = world 50. So the
+        // pointer's screen 150 now reads as world 125, and a drag that had gone
+        // 150 now reads as 125 — the object slides back toward where the drag
+        // began, with no error and no way for the user to tell why.
+        canvas
+            .camera
+            .zoom_at(2.0, canvas.camera.world_to_screen(point(100.0, 100.0)));
+        canvas.update_interaction(target);
+        let after_zoom = geometry_of(&canvas, id);
+        assert_eq!(
+            after_zoom.position.x - resting.position.x,
+            125.0,
+            "the same pointer position now reads as a shorter drag"
+        );
+
+        // Which is why the camera is frozen rather than the gesture compensated:
+        // compensating would make the committed result depend on the zoom the
+        // user happened to pinch at, which is not a quantity they chose on
+        // purpose.
+        canvas.cancel_interaction();
+    }
+
+    /// Undo has to survive a save, or it is not an undo.
+    ///
+    /// Save answers "what does the document say now?" by comparing the live
+    /// objects against what the source currently says. That baseline has to
+    /// advance when the source is written: pinned to the state the project was
+    /// *opened* in, it says "nothing changed" for any document the user has
+    /// already saved once, and writes nothing — leaving the file describing an
+    /// edit that has since been undone.
+    #[test]
+    fn workflow_p_undo_then_save_puts_the_authored_bytes_back() {
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        let cta = id_of(&view, "spool-cta-primary");
+        let authored = view.session.runtime.geometry(cta).unwrap();
+        let html_authored = std::fs::read_to_string(root.join("index.html")).unwrap();
+        let css_authored = std::fs::read_to_string(root.join("styles.css")).unwrap();
+
+        // Move it and save: the edit reaches the authored source.
+        view.selection.replace(vec![cta]);
+        begin_live_move_with_snap(&mut view, &[cta], true);
+        drag_to(&mut view, point(0.0, 40.0));
+        view.save_project().expect("first save succeeds");
+        assert_ne!(
+            std::fs::read_to_string(root.join("index.html")).unwrap(),
+            html_authored,
+            "the move was written into the source"
+        );
+
+        // Undo, and the editor is back to the authored geometry.
+        assert!(view.undo_history());
+        assert_eq!(
+            view.session.runtime.geometry(cta).unwrap(),
+            authored,
+            "undo restored the object in the editor"
+        );
+
+        // Saving again has to take the source with it.
+        let outcome = view.save_project().expect("second save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+        // Not a byte comparison with the authored file: the editor cannot know
+        // the author "meant" no offset, only that the object is where it started.
+        // The honest form of that is a zero offset written against what is on
+        // disk, so what has to hold is that a reopen agrees with the editor.
+        let reopened = project_view(&root);
+        assert_eq!(
+            reopened.session.runtime.geometry(cta).unwrap(),
+            authored,
+            "the undo reached the authored source, not just the editor"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("styles.css")).unwrap(),
+            css_authored,
+            "and the stylesheet is untouched, since the move was an inline offset"
+        );
+
+        // And the save is now a fixed point: a third save has nothing left to
+        // say, so the editor and its source have stopped disagreeing.
+        let settled = std::fs::read_to_string(root.join("index.html")).unwrap();
+        let outcome = view.save_project().expect("third save succeeds");
+        assert!(
+            outcome.written.is_empty(),
+            "saving an unchanged document writes nothing: {:?}",
+            outcome.written
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).unwrap(),
+            settled,
+            "so the bytes stop moving"
         );
     }
 }

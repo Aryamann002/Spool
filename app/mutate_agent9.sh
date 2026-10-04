@@ -247,18 +247,20 @@ source = source.replace(old, new, 1)' \
 # 14. Cancelling a gesture puts the geometry back and records nothing. The
 #     shell's *ordering* of the Escape ladder needs a window to test, so this
 #     mutation covers the rung it calls rather than the ladder around it.
+#     Anchored on `abandon_interaction`, which is where the restore lives for
+#     every caller that gives up an in-flight gesture.
 run_mutation "a cancelled drag keeps the moved geometry" \
   src/canvas.rs \
-  'old = """    fn cancel_interaction(&mut self) -> bool {
+  'old = """    fn abandon_interaction(&mut self) -> bool {
         if !self.interaction.is_active() {
             return false;
         }
         self.interaction.restore(&mut self.session.runtime);"""
-new = """    fn cancel_interaction(&mut self) -> bool {
+new = """    fn abandon_interaction(&mut self) -> bool {
         if !self.interaction.is_active() {
             return false;
         }"""
-assert old in source, "cancel_interaction not found"
+assert old in source, "abandon_interaction not found"
 source = source.replace(old, new, 1)' \
   "live_gesture_cancel_restores_geometry_and_records_nothing"
 
@@ -307,6 +309,66 @@ new = """                let _ = node;
 assert old in source, "snap target filter not found"
 source = source.replace(old, new, 1)' \
   "an_object_does_not_snap_to_its_own_child"
+
+# 19. Abandoning a gesture has to reconcile the selection as well as the
+#     geometry. An `⌥`-drag created the copies and handed the selection to
+#     them, so restoring the geometry and stopping there leaves the panel
+#     holding ids the document no longer has.
+run_mutation "a cancelled duplicate drag leaves a dead selection" \
+  src/canvas.rs \
+  'old = """        self.interaction = Interaction::None;
+        self.retain_existing_selection();
+        true
+    }"""
+new = """        self.interaction = Interaction::None;
+        true
+    }"""
+assert old in source, "abandon_interaction selection reconcile not found"
+source = source.replace(old, new, 1)' \
+  "workflow_k_cancelling_a_duplicate_drag_leaves_no_dead_selection"
+
+# 20. A history key arriving mid-drag must finish the gesture, not throw it
+#     away. Discarding it makes one keystroke destroy the edit in flight with
+#     no record *and* revert whatever came before it.
+run_mutation "undo mid-drag drops the drag instead of finishing it" \
+  src/canvas.rs \
+  'old = """    fn undo_history(&mut self) -> bool {
+        self.commit_text_edit();
+        self.commit_in_flight_interaction();"""
+new = """    fn undo_history(&mut self) -> bool {
+        self.commit_text_edit();
+        self.abandon_interaction();"""
+assert old in source, "undo_history in-flight handling not found"
+source = source.replace(old, new, 1)' \
+  "workflow_l_undo_mid_drag_reverts_the_drag_rather_than_dropping_it"
+
+# 21. The camera is frozen while a gesture owns the pointer. Without that, a
+#     pinch landing mid-drag re-projects the pointer through a camera that
+#     moved and the object jumps back toward where the drag began.
+run_mutation "the camera moves under a gesture in flight" \
+  src/canvas.rs \
+  'old = """    fn pointer_gesture_active(&self) -> bool {
+        self.pan.is_some()"""
+new = """    fn pointer_gesture_active(&self) -> bool {
+        false && self.pan.is_some()"""
+assert old in source, "pointer_gesture_active not found"
+source = source.replace(old, new, 1)' \
+  "workflow_n_a_gesture_in_flight_owns_the_camera"
+
+# 22. Save measures a change from what the source currently says, so the
+#     baseline has to advance when the source is written. Pinned to the opening
+#     state it re-applies every delta on top of the last one.
+run_mutation "save keeps measuring from the project opening" \
+  src/canvas.rs \
+  'old = """        self.source_snapshot = self
+            .opened_state()
+            .into_iter()
+            .filter(|(node, _)| !unwritten.contains(node))
+            .collect();"""
+new = """        let _ = unwritten;"""
+assert old in source, "save snapshot refresh not found"
+source = source.replace(old, new, 1)' \
+  "workflow_p_undo_then_save_puts_the_authored_bytes_back"
 
 if [ "$failures" -eq 0 ]; then
   echo

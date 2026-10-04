@@ -15,11 +15,18 @@
 //! every selection change here is expressed as `CanvasView::select_object`. A
 //! range is not a second selection: it is the smallest set of additively
 //! applied ids that leaves the canvas holding "what was selected, plus this
-//! run". Nothing in this module stores a copy of what is selected.
+//! run". Nothing here decides what is selected.
 //!
-//! The two pieces of state the panel *does* keep are presentation, and both are
+//! The panel does hold three pieces of state, and all three are presentation —
 //! discarded on reload like every other runtime view state:
 //!
+//! - `selected`: the last selection the canvas reported, kept so the panel can
+//!   answer "is this row selected" and tell whether the presentation actually
+//!   changed. It is rewritten from the canvas on every `synchronize` and is
+//!   never read to decide a mutation, so it is a cache of the answer rather than
+//!   a second copy of the question. That it is a cache is why
+//!   [`LayersView::synchronize`] has to be called at all: the canvas pulls, it
+//!   does not push.
 //! - `collapsed`: which subtrees the user folded away.
 //! - `cursor`: the row keyboard navigation is standing on, which doubles as the
 //!   anchor a `⇧`-range measures from. It is a list affordance in the shape of a

@@ -127,12 +127,9 @@
 //! is [`SemanticOperation`], [`SemanticHistory`], [`Origin`], [`EditSession`],
 //! [`OperationTarget::Full`], and [`apply`].
 //!
-//! Two pieces of the surface are deliberately retained without a production
-//! caller, and each says so where it is declared: [`Origin`]'s non-`User`
-//! variants, which is where attribution would go, and [`SemanticOperation::Compound`],
-//! which is what makes "one gesture is one history entry" expressible for a
-//! gesture that is more than one command.
-//!
+//! One piece of the surface is deliberately retained without a production
+//! caller, and says so where it is declared: [`Origin`]'s non-`User` variants,
+//! which is where attribution would go.
 //!
 //! # MUTATION HARNESS
 //!
@@ -224,18 +221,14 @@ pub enum SemanticOperation {
     ///
     /// Undo replays members in reverse order; redo replays them in order.
     /// A compound is validated in full before any member is applied.
-    // Retained, not dead: this is the mechanism that makes "one gesture is one
-    // history entry" expressible for a gesture that is more than one command —
-    // a modifier-drag duplicate, where copies are created at press time and then
-    // follow the pointer. It is a variant of the one operation model rather than
-    // a second mutation path: it introduces no new primitive, and `apply`
+    //
+    // The `⌥`-drag builds one: the copies are created and then moved, which is
+    // two commands, and "one gesture is one history entry" is only expressible
+    // if they travel together. It is a variant of the one operation model rather
+    // than a second mutation path — it introduces no new primitive, and `apply`
     // replays members through the same validate-then-apply path as any single
-    // operation. No production gesture needs it yet, because no gesture is
-    // structural today.
-    #[allow(
-        dead_code,
-        reason = "composition point for the one operation model; no structural gesture exists yet"
-    )]
+    // operation. Build it through [`SemanticOperation::compound`], which is also
+    // what flattens a nested one.
     Compound(Vec<SemanticOperation>),
 }
 
@@ -263,12 +256,6 @@ impl SemanticOperation {
     /// property of one flat list rather than of every nesting depth. An empty
     /// input yields a compound with no members, which `is_noop` reports as a
     /// no-op, so it records nothing.
-    // Paired with the retained `Compound` variant: the composition point is the
-    // constructor, so retaining one without the other would be incoherent.
-    #[allow(
-        dead_code,
-        reason = "constructor for the retained Compound variant; no structural gesture builds one yet"
-    )]
     pub fn compound(operations: Vec<SemanticOperation>) -> Self {
         let mut flattened = Vec::with_capacity(operations.len());
         for operation in operations {
