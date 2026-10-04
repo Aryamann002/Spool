@@ -749,6 +749,11 @@ impl Document {
     /// `Document::default()` is the canvas starter scene, which is populated
     /// with four demonstration frames. Anything that needs a blank document —
     /// a test, or a runtime built purely from a projection — wants this.
+    // Test-only: `Document::from_design_objects` is how a runtime built purely
+    // from a projection gets its object list, and nothing in the editor needs a
+    // blank starter scene. Compiled out of the binary rather than silenced, so
+    // "unused" cannot quietly become "shipped".
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             objects: Vec::new(),
@@ -905,34 +910,6 @@ impl Document {
         format!("{} {number}", object_type.label())
     }
 
-    /// Capture the current geometry of the given objects.
-    ///
-    /// Used to open a gesture and to build the `before` half of a geometry
-    /// command. This is a handful of small values per gesture, not a copy of
-    /// the document.
-    pub fn snapshot_objects(&self, ids: &[ObjectId]) -> Vec<ObjectSnapshot> {
-        ids.iter()
-            .filter_map(|id| {
-                self.object(*id).map(|object| ObjectSnapshot {
-                    id: *id,
-                    geometry: object.geometry(),
-                })
-            })
-            .collect()
-    }
-
-    /// The current geometry of one object.
-    pub fn geometry_of(&self, id: ObjectId) -> Option<Geometry> {
-        self.object(id).map(|object| object.geometry())
-    }
-
-    /// Restore previously captured geometry, undoing a cancelled gesture.
-    pub fn restore_snapshots(&mut self, snapshots: &[ObjectSnapshot]) {
-        for snapshot in snapshots {
-            self.set_geometry(snapshot.id, snapshot.geometry);
-        }
-    }
-
     pub fn create_object(
         &mut self,
         object_type: ObjectType,
@@ -1025,6 +1002,11 @@ impl Document {
         duplicates
     }
 
+    // Test-only reading of an object's paint, used to assert that a replayed
+    // style entry restores exactly what it recorded. Production style edits go
+    // through `DocumentCommand::style` -> `set_appearance`, which is the single
+    // write path, so there is deliberately no second read path to keep in step.
+    #[cfg(test)]
     fn style(&self, id: ObjectId) -> Option<ObjectStyle> {
         self.appearance(id).map(|appearance| appearance.style)
     }
@@ -1043,6 +1025,10 @@ impl Document {
         })
     }
 
+    // Test-only convenience over `set_appearance`, for the tests that set paint
+    // without a history entry behind it. Production writes style only by
+    // replaying `DocumentCommand::style`.
+    #[cfg(test)]
     pub fn set_style(&mut self, id: ObjectId, style: ObjectStyle) -> bool {
         let Some(current) = self.appearance(id) else {
             return false;
@@ -2401,6 +2387,12 @@ impl CanvasView {
     ///
     /// Exposed so a project can be checked against what the editor actually
     /// holds, rather than against a separate copy.
+    // Test-only today: the open-path tests use it to assert that a loaded
+    // project is really hittable and that an unsupported kind is really absent.
+    // The editor reads `document_objects` instead. Compiled out of the binary
+    // rather than silenced, so it cannot drift into being a second accessor the
+    // editor depends on.
+    #[cfg(test)]
     pub fn runtime_document(&self) -> &Document {
         &self.session.runtime
     }
@@ -2522,6 +2514,7 @@ impl CanvasView {
     /// than around it: one call is one undo step, undo restores the exact
     /// previous run of text, and redo re-applies this one. Used by the runtime
     /// probe and by anything that needs to set text without a caret.
+    #[cfg(any(test, debug_assertions))]
     pub fn set_object_text(&mut self, id: ObjectId, text: String) -> bool {
         self.commit_text_edit();
         let Some(before) = self.session.runtime.text_content(id).map(str::to_owned) else {
@@ -2908,6 +2901,7 @@ impl CanvasView {
     }
 
     /// The alignment lines currently holding, for the renderer.
+    #[cfg(any(test, debug_assertions))]
     pub fn snap_guides(&self) -> &[snap::Guide] {
         &self.snap_guides
     }
@@ -3241,6 +3235,7 @@ impl CanvasView {
     }
 
     /// What the pointer is currently over, for the status bar.
+    #[cfg(any(test, debug_assertions))]
     pub fn hovered(&self) -> Option<ObjectId> {
         self.hovered
     }
@@ -3257,6 +3252,7 @@ impl CanvasView {
         })
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn update_interaction(&mut self, screen: Point<f32>) -> bool {
         self.update_interaction_with(screen, false)
     }

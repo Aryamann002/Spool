@@ -67,6 +67,7 @@
 //!   bind against the source it is writing, so it cannot leave a project that
 //!   no longer opens.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,7 @@ pub struct SaveOutcome {
 /// metadata is encoded — all before the first write. A failure anywhere in that
 /// work leaves the project exactly as it was, which is what "parse/patch errors
 /// make no partial changes" has to mean once several files are involved.
+#[derive(Default)]
 struct SavePlan {
     /// Markup file -> the elements in it that need splicing. Keyed by node so
     /// a text edit and a style edit to one element merge into a single
@@ -172,16 +174,6 @@ struct SavePlan {
     /// Stylesheet -> the declaration value spans to replace.
     css: BTreeMap<String, Vec<CssWrite>>,
     unsupported: Vec<UnsupportedEdit>,
-}
-
-impl Default for SavePlan {
-    fn default() -> Self {
-        Self {
-            html: BTreeMap::new(),
-            css: BTreeMap::new(),
-            unsupported: Vec::new(),
-        }
-    }
 }
 
 /// One element's planned writes, resolved against the bytes they land in.
@@ -875,7 +867,7 @@ impl<'a> AuthoredFiles<'a> {
 
         for name in &self.sheet_names {
             let Some(sheet) = self.sheets.get(name) else {
-                return Err(unreadable(&name, property));
+                return Err(unreadable(name, property));
             };
             let Some((range, spelling)) = winning_declaration(sheet, &tag, &classes, property)
             else {
@@ -887,11 +879,7 @@ impl<'a> AuthoredFiles<'a> {
                 .and_then(|contents| contents.get(range.clone()))
                 .unwrap_or("")
                 .to_owned();
-            if let Err(reason) =
-                self.check_rewritable(name, &range, &spelling, &authored, ownership)
-            {
-                return Err(reason);
-            }
+            self.check_rewritable(name, &range, &spelling, &authored, ownership)?;
             return Ok(StyleTarget::Declaration {
                 file: name.clone(),
                 range,
@@ -1469,7 +1457,7 @@ where
         .into_iter()
         .map(|((start, end), value)| (start..end, value))
         .collect();
-    ordered.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    ordered.sort_by_key(|(span, _)| Reverse(span.start));
 
     let mut out = original.to_owned();
     let mut lowest_applied: Option<usize> = None;
@@ -1478,10 +1466,8 @@ where
             continue;
         }
         // An insertion is empty, so it can never overlap anything.
-        if !range.is_empty() {
-            if lowest_applied.is_some_and(|end| range.end > end) {
-                continue;
-            }
+        if !range.is_empty() && lowest_applied.is_some_and(|end| range.end > end) {
+            continue;
         }
         out.replace_range(range.clone(), &value);
         if !range.is_empty() {
@@ -2163,7 +2149,7 @@ mod tests {
             "version: 1\nnodes:\n{}",
             node_yaml("spool-text-headline", None, "")
         );
-        let root = project_named("odd-inline", &html, None, &yaml);
+        let root = project_named("odd-inline", html, None, &yaml);
         let loaded = open_project(&root).expect("opens");
 
         save_project(
@@ -2308,9 +2294,7 @@ mod tests {
         let home = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <h1 data-spool-id=\"spool-home-title\">Home</h1>\n</body>\n</html>\n";
         let about = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <h1 data-spool-id=\"spool-about-title\">About</h1>\n</body>\n</html>\n";
         let css = "h1 { color: #101010; }\n";
-        let yaml = format!(
-            "version: 1\nnodes:\n  - id: \"spool-home-title\"\n    name: \"Home\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/home.html\"\n    selector: \"[data-spool-id=\\\"spool-home-title\\\"]\"\n    children: []\n  - id: \"spool-about-title\"\n    name: \"About\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/about.html\"\n    selector: \"[data-spool-id=\\\"spool-about-title\\\"]\"\n    children: []\n"
-        );
+        let yaml = "version: 1\nnodes:\n  - id: \"spool-home-title\"\n    name: \"Home\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/home.html\"\n    selector: \"[data-spool-id=\\\"spool-home-title\\\"]\"\n    children: []\n  - id: \"spool-about-title\"\n    name: \"About\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/about.html\"\n    selector: \"[data-spool-id=\\\"spool-about-title\\\"]\"\n    children: []\n".to_owned();
         let root = project_files(
             "two-pages",
             &[
@@ -2371,9 +2355,7 @@ mod tests {
         let css = ".title { color: #101010; }\n";
         let home = page.replace("{n}", "home").replace("{t}", "Home");
         let about = page.replace("{n}", "about").replace("{t}", "About");
-        let yaml = format!(
-            "version: 1\nnodes:\n  - id: \"spool-title-home\"\n    name: \"Home\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/home.html\"\n    selector: \"[data-spool-id=\\\"spool-title-home\\\"]\"\n    children: []\n  - id: \"spool-title-about\"\n    name: \"About\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/about.html\"\n    selector: \"[data-spool-id=\\\"spool-title-about\\\"]\"\n    children: []\n"
-        );
+        let yaml = "version: 1\nnodes:\n  - id: \"spool-title-home\"\n    name: \"Home\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/home.html\"\n    selector: \"[data-spool-id=\\\"spool-title-home\\\"]\"\n    children: []\n  - id: \"spool-title-about\"\n    name: \"About\"\n    kind: \"text\"\n    parent: null\n    file: \"pages/about.html\"\n    selector: \"[data-spool-id=\\\"spool-title-about\\\"]\"\n    children: []\n".to_owned();
         let root = project_files(
             "cross-page",
             &[

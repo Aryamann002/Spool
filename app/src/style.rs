@@ -723,13 +723,11 @@ a { background-color: #ffffff; padding: 4px; }
             "the tag and the class together match"
         );
         assert!(
-            resolved_map(source, "button", &["cta"])
-                .get("color")
-                .is_none(),
+            !resolved_map(source, "button", &["cta"]).contains_key("color"),
             "the tag still has to match"
         );
         assert!(
-            resolved_map(source, "a", &[]).get("color").is_none(),
+            !resolved_map(source, "a", &[]).contains_key("color"),
             "and so does the class"
         );
     }
@@ -744,7 +742,7 @@ a { background-color: #ffffff; padding: 4px; }
             Some("#ff0000")
         );
         assert!(
-            resolved_map(source, "div", &["a"]).get("color").is_none(),
+            !resolved_map(source, "div", &["a"]).contains_key("color"),
             "one of the two is not enough, and the rule must not half-apply"
         );
     }

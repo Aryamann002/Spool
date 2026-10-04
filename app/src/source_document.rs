@@ -240,8 +240,7 @@ impl HtmlSource {
         }
         let marker = format!("data-spool-id=\"{}\"", node.id.as_str());
         let single_quoted = format!("data-spool-id='{}'", node.id.as_str());
-        self.contents.matches(&marker).count()
-            + self.contents.matches(&single_quoted).count()
+        self.contents.matches(&marker).count() + self.contents.matches(&single_quoted).count()
     }
 }
 
@@ -437,15 +436,16 @@ mod tests {
             before: before.into(),
             after: after.into(),
         };
-        let commit = |history: &mut SemanticHistory, document: &mut PersistentDocument, op: RenameNode| {
-            assert!(history.record(SemanticOperation::Rename(op.clone())));
-            apply(
-                &SemanticOperation::Rename(op),
-                &mut OperationTarget::Document(document),
-                crate::canvas::ReplayDirection::Redo,
-            )
-            .expect("the rename applies")
-        };
+        let commit =
+            |history: &mut SemanticHistory, document: &mut PersistentDocument, op: RenameNode| {
+                assert!(history.record(SemanticOperation::Rename(op.clone())));
+                apply(
+                    &SemanticOperation::Rename(op),
+                    &mut OperationTarget::Document(document),
+                    crate::canvas::ReplayDirection::Redo,
+                )
+                .expect("the rename applies")
+            };
 
         commit(&mut history, &mut document, rename("Title", "Hero"));
         assert_eq!(document.structure.nodes[1].name, "Hero");

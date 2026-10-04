@@ -204,6 +204,28 @@ pub struct RuntimeProjection {
     bindings: BTreeMap<NodeId, (String, String)>,
 }
 
+// `from_document_with_visuals` is the production entry point: it is what
+// `project_open` calls, because interpreting source is not optional. The four
+// members below have no production caller and are retained deliberately:
+//
+// - `from_document` is the same projection with no visual model, i.e. the
+//   placeholder-geometry form. It is the shape a caller wants when it is
+//   testing identity or hierarchy rather than paint.
+// - `rebuild` is the key-preserving form. Runtime keys are derived from
+//   document order, so a rebuild is the only thing that can keep a surviving
+//   node's `ObjectId` — and therefore a selection or a hover — valid across a
+//   document change. `from_document`'s `previous` parameter exists for it.
+// - `object_of` and `binding_of` are the two reverse lookups. The module's
+//   whole reason for existing is that `NodeId` and `ObjectId` are different
+//   identities, and a bridge that can only go one way cannot enforce that; a
+//   save that needs "which node is this runtime object" has no other route.
+//
+// `project_open::LoadedProject::projection` is retained on the same reasoning,
+// and is where an editor that saves from a runtime object would read them from.
+#[allow(
+    dead_code,
+    reason = "disposable-projection identity lookups; no production caller consumes a RuntimeProjection after it yields canvas objects"
+)]
 impl RuntimeProjection {
     /// Project a persistent document into disposable runtime state.
     ///

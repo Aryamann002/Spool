@@ -69,15 +69,25 @@
 //! [`SemanticOperation::Runtime`] holding one geometry command covering every
 //! moved object, not N commands.
 //!
-//! Gestures mutate transiently and only reach `execute` on success:
+//! # Gestures are the canvas's, not this module's
+//!
+//! A gesture mutates transiently and reaches `execute` once, on success:
 //!
 //! ```text
-//! begin_gesture  -> transient mutation (no history)
-//! commit_gesture -> execute(..)  one entry
-//! cancel_gesture -> restore, zero entries
+//! canvas mutates the runtime -> nothing recorded
+//! mouse up                 -> commit(..) -> execute(..) -> one entry
+//! escape / cancel          -> runtime restored, zero entries
 //! ```
 //!
-//! A cancelled gesture is indistinguishable from one that never started.
+//! That is `CanvasView`'s own `MoveGesture` and `GeometryScrub`, which capture
+//! `ObjectSnapshot`s inline and write the single `DocumentCommand` on commit.
+//! It is deliberately *not* mirrored here. This module used to carry a second,
+//! parallel gesture system (`EditSession::begin_gesture` and friends, with its
+//! own `InFlight` snapshot log) that no caller ever invoked: two
+//! implementations of "do not record until commit" is two places for the
+//! cancellation guarantee to be wrong, and only the canvas one runs. A gesture
+//! is a property of the surface that owns the pointer, not of the operation
+//! boundary.
 //!
 //! # Undo/redo mechanism
 //!
@@ -86,10 +96,10 @@
 //! mirror image. Committing a new operation clears `redo`, exactly as before.
 //! No-op operations are dropped before they reach a stack.
 //!
-//! An operation is applied against an [`OperationTarget`], which is either a
-//! bare canvas `Document` or a whole [`EditSession`]. That indirection is what
-//! lets one stack hold operations targeting different state: a rename needs
-//! metadata, a move needs the canvas document.
+//! An operation is applied against an [`OperationTarget`], which says which
+//! state the replay may reach: [`OperationTarget::Full`] for the editor, and
+//! [`OperationTarget::Document`] for a bundle-level caller that holds metadata
+//! and no canvas runtime.
 //!
 //! # What this deliberately does not do
 //!
@@ -99,6 +109,10 @@
 //! - No snapshot of the whole document per pointer event. Undo replays the
 //!   `before` values a command already carries, so a drag costs one small
 //!   geometry change per object, not a full copy of the document.
+//! - No operation constructors. There is no `move_nodes` or `create_nodes`
+//!   beside [`DocumentCommand`]: that command is the one vocabulary, and a
+//!   free-standing constructor that mutates the runtime *outside* the boundary
+//!   before handing back an operation is a second way in, not a convenience.
 //! - No AI, plugin, import, or automation caller. The boundary is reachable by
 //!   them because [`EditSession::execute`] is the only mutation entry point,
 //!   and [`Origin`] exists so an entry can say which of them produced it. None
@@ -109,21 +123,16 @@
 //! # Who is on the live path
 //!
 //! `canvas::CanvasView` owns an [`EditSession`] and funnels every mutation
-//! through [`EditSession::execute`]. So the live set is [`SemanticOperation`],
-//! [`SemanticHistory`], [`Origin`], [`EditSession`], [`OperationTarget::Full`],
-//! and [`apply`].
+//! through [`EditSession::execute`] via its private `commit`. So the live set
+//! is [`SemanticOperation`], [`SemanticHistory`], [`Origin`], [`EditSession`],
+//! [`OperationTarget::Full`], and [`apply`].
 //!
-//! What `cargo check` still reports as unused is the *wider* surface that no
-//! caller has yet: [`OperationTarget::Runtime`] and
-//! [`OperationTarget::Document`] (a bundle-level caller holding only a
-//! [`PersistentDocument`]), the gesture helpers
-//! ([`EditSession::begin_gesture`] and friends), and the free-standing
-//! constructors ([`create_nodes`], [`move_nodes`], and siblings) that build an
-//! operation without an [`EditSession`] in hand.
+//! Two pieces of the surface are deliberately retained without a production
+//! caller, and each says so where it is declared: [`Origin`]'s non-`User`
+//! variants, which is where attribution would go, and [`SemanticOperation::Compound`],
+//! which is what makes "one gesture is one history entry" expressible for a
+//! gesture that is more than one command.
 //!
-//! Those warnings are the remaining-work list. Do not silence them with a
-//! blanket `#![allow(dead_code)]`, which would hide exactly the gap they
-//! describe.
 //!
 //! # MUTATION HARNESS
 //!
@@ -134,12 +143,7 @@
 //! untested invariant is the finding. The script refuses to run unless it sees
 //! this marker, so it cannot be pointed at an unrelated file.
 
-use gpui::{Point, Size};
-
-use crate::canvas::{
-    Document, DocumentCommand, Geometry, GeometryChange, ObjectId, ObjectPlacement, ObjectSnapshot,
-    ReplayDirection,
-};
+use crate::canvas::{Document, DocumentCommand, ObjectId, ReplayDirection};
 use crate::source_document::{NodeId, PersistentDocument, RenameNode};
 
 /// Who asked for an operation.
@@ -160,12 +164,34 @@ pub enum Origin {
     #[default]
     User,
     /// A future agent caller. Not implemented.
+    // Retained, not dead: `Origin` is the attribution half of a committed
+    // `HistoryEntry`, so it is meaningless unless more than one author can be
+    // named. AGENTS.md forbids building the agent runtime, not naming it; a
+    // stack that grew a second provenance mechanism when an agent did arrive
+    // would be the real cost. `User` is the only variant that can be constructed
+    // outside a test today.
+    #[allow(
+        dead_code,
+        reason = "reserved attribution variant; constructed only by the attribution tests"
+    )]
     Agent,
     /// A future plugin or extension caller. Not implemented.
+    #[allow(
+        dead_code,
+        reason = "reserved attribution variant; no plugin host exists in this repository"
+    )]
     Plugin,
     /// A future importer. Not implemented.
+    #[allow(
+        dead_code,
+        reason = "reserved attribution variant; no importer exists in this repository"
+    )]
     Import,
     /// A future automation or script caller. Not implemented.
+    #[allow(
+        dead_code,
+        reason = "reserved attribution variant; no automation runner exists in this repository"
+    )]
     Automation,
 }
 
@@ -198,6 +224,18 @@ pub enum SemanticOperation {
     ///
     /// Undo replays members in reverse order; redo replays them in order.
     /// A compound is validated in full before any member is applied.
+    // Retained, not dead: this is the mechanism that makes "one gesture is one
+    // history entry" expressible for a gesture that is more than one command —
+    // a modifier-drag duplicate, where copies are created at press time and then
+    // follow the pointer. It is a variant of the one operation model rather than
+    // a second mutation path: it introduces no new primitive, and `apply`
+    // replays members through the same validate-then-apply path as any single
+    // operation. No production gesture needs it yet, because no gesture is
+    // structural today.
+    #[allow(
+        dead_code,
+        reason = "composition point for the one operation model; no structural gesture exists yet"
+    )]
     Compound(Vec<SemanticOperation>),
 }
 
@@ -225,6 +263,12 @@ impl SemanticOperation {
     /// property of one flat list rather than of every nesting depth. An empty
     /// input yields a compound with no members, which `is_noop` reports as a
     /// no-op, so it records nothing.
+    // Paired with the retained `Compound` variant: the composition point is the
+    // constructor, so retaining one without the other would be incoherent.
+    #[allow(
+        dead_code,
+        reason = "constructor for the retained Compound variant; no structural gesture builds one yet"
+    )]
     pub fn compound(operations: Vec<SemanticOperation>) -> Self {
         let mut flattened = Vec::with_capacity(operations.len());
         for operation in operations {
@@ -318,23 +362,37 @@ impl OperationError {
 /// Where an operation is applied.
 ///
 /// Unifying two histories means one stack holds operations that touch
-/// different state. Rather than force both into one type, the target is
-/// chosen at replay time.
+/// different state. Rather than force both into one type, the target says which
+/// state the replay is allowed to reach.
 pub enum OperationTarget<'a> {
     /// Only canvas document state is available.
     ///
-    /// This is what the live canvas entity has: it owns a `Document` and no
-    /// persistent metadata.
+    /// Not a mutation path: a rename is refused against this target, so it can
+    /// never become a way to change metadata without a document. It exists so a
+    /// caller that holds a bare runtime can replay a canvas command without
+    /// minting a `PersistentDocument` it does not own — and the canvas's own
+    /// replay tests are exactly that caller, asserting that an insert, delete,
+    /// geometry, style, or text entry restores the document it was recorded
+    /// against. The live editor does not use it: `CanvasView` owns an
+    /// `EditSession`, so it always reaches [`OperationTarget::Full`].
+    #[allow(
+        dead_code,
+        reason = "runtime-only replay target; constructed by the canvas replay tests, not by the editor"
+    )]
     Runtime(&'a mut Document),
-    /// Only persistent metadata state is available.
-    ///
-    /// A bundle-level caller such as a save/reload cycle has a
-    /// [`PersistentDocument`] and no canvas runtime. Without this variant a
-    /// rename could only be replayed by also constructing a throwaway
-    /// `Document` to satisfy [`OperationTarget::Full`], which would be a lie
-    /// about what the caller owns.
+    // Retained, not dead: `ProjectBundle` owns a `PersistentDocument` and no
+    // canvas runtime, and `project_bundle`'s save/undo/reload round trip is the
+    // caller that needs this. Together with `Runtime` it is what lets one stack
+    // hold entries that target different state: a rename needs metadata, a move
+    // needs the canvas document.
+    #[allow(
+        dead_code,
+        reason = "bundle seam; constructed only by the project_bundle round-trip test today"
+    )]
     Document(&'a mut PersistentDocument),
     /// Both metadata and canvas state are available.
+    ///
+    /// The only variant production uses: [`EditSession`] always owns both.
     Full {
         document: &'a mut PersistentDocument,
         runtime: &'a mut Document,
@@ -352,6 +410,19 @@ pub struct SemanticHistory {
     redo: Vec<HistoryEntry>,
 }
 
+// The read side of the stack plus `record` have no production caller, because
+// `EditSession` is the sole owner of a `SemanticHistory` in the editor and it
+// reaches them through `execute_from`/`record_from`. They are retained rather
+// than compiled out because they are the query surface of the very stack
+// production writes — an undo affordance asks `can_undo`, and a labelled undo
+// step asks `peek_undo_entry` — and every one of them is exercised from the
+// editor's own tests. Removing them would delete the ability to inspect history
+// at the moment the editor has no reason to inspect it, which is the same
+// "hide the gap" move the module doc warns against.
+#[allow(
+    dead_code,
+    reason = "history read/commit surface; EditSession is the sole production owner of a SemanticHistory"
+)]
 impl SemanticHistory {
     /// Commit an operation as a human action: drop it if it changes nothing,
     /// otherwise push it and clear redo.
@@ -477,7 +548,7 @@ pub fn apply(
     // depth.
     let members = operation.members();
     let ordered = match direction {
-        ReplayDirection::Redo => members.iter().copied().collect::<Vec<_>>(),
+        ReplayDirection::Redo => members.to_vec(),
         ReplayDirection::Undo => members.iter().rev().copied().collect::<Vec<_>>(),
     };
     for member in ordered {
@@ -494,6 +565,8 @@ fn apply_one(
 ) -> Result<(), OperationError> {
     match operation {
         SemanticOperation::Rename(rename) => match target {
+            // A bare runtime holds no names, so there is nothing to rename.
+            OperationTarget::Runtime(_) => Err(OperationError::WrongTarget("a node rename")),
             OperationTarget::Full { document, .. } | OperationTarget::Document(document) => {
                 // Undo replays the inverse, which restores the previous name.
                 // Replaying the operation itself would be a no-op at best and
@@ -506,11 +579,10 @@ fn apply_one(
                     .apply(document)
                     .map_err(|error| OperationError::from_rename(rename, error))
             }
-            OperationTarget::Runtime(_) => Err(OperationError::WrongTarget("a node rename")),
         },
         SemanticOperation::Runtime(command) => {
             let runtime = match target {
-                OperationTarget::Runtime(document) => document,
+                OperationTarget::Runtime(runtime) => runtime,
                 OperationTarget::Full { runtime, .. } => runtime,
                 OperationTarget::Document(_) => {
                     return Err(OperationError::WrongTarget("a canvas command"))
@@ -541,24 +613,6 @@ pub struct EditSession {
     pub document: PersistentDocument,
     pub runtime: Document,
     pub history: SemanticHistory,
-    /// The in-flight gesture, if any.
-    in_flight: Option<InFlight>,
-}
-
-/// What a gesture must remember so that cancelling it is indistinguishable
-/// from never having started it.
-///
-/// Geometry snapshots alone are not enough. A gesture that creates objects —
-/// a modifier-drag duplicate — has inserted rows into the runtime that a
-/// geometry restore cannot take back, because a snapshot records a position,
-/// not an existence. So the gesture also accumulates the operations it applied
-/// and replays them in reverse on cancel.
-struct InFlight {
-    /// Geometry captured when the gesture began.
-    geometry: Vec<ObjectSnapshot>,
-    /// Operations applied while the gesture was in flight, in application
-    /// order. Replayed in reverse by [`EditSession::cancel_gesture`].
-    applied: Vec<SemanticOperation>,
 }
 
 impl EditSession {
@@ -567,7 +621,6 @@ impl EditSession {
             document,
             runtime,
             history: SemanticHistory::default(),
-            in_flight: None,
         }
     }
 
@@ -634,115 +687,6 @@ impl EditSession {
         } = self;
         history.redo(&mut OperationTarget::Full { document, runtime })
     }
-
-    /// Start a gesture, capturing the geometry it may change.
-    ///
-    /// Nothing is recorded here, and nothing is recorded by mutating the
-    /// runtime document while a gesture is in flight. A second call replaces
-    /// any gesture already in flight, which mirrors the canvas dropping a
-    /// superseded interaction.
-    pub fn begin_gesture(&mut self, ids: &[ObjectId]) {
-        let geometry = self.runtime.snapshot_objects(ids);
-        self.in_flight = Some(InFlight {
-            geometry,
-            applied: Vec::new(),
-        });
-    }
-
-    /// Run one operation as part of the in-flight gesture.
-    ///
-    /// This is the entry point for a gesture that mutates structurally rather
-    /// than only moving things — a modifier-drag duplicate inserts objects.
-    /// The operation is validated and applied, and remembered, but **not**
-    /// recorded: nothing a gesture does becomes undoable until the gesture
-    /// commits. That is what keeps "one gesture is one history entry" true
-    /// when the gesture is not a single geometry change.
-    ///
-    /// On commit these operations become part of the one entry, so the
-    /// structure and the drag it belongs to undo together. On cancel they are
-    /// reversed and nothing is left behind. Outside a gesture this is exactly
-    /// [`EditSession::execute`].
-    pub fn gesture_execute(
-        &mut self,
-        operation: SemanticOperation,
-    ) -> Result<bool, OperationError> {
-        if !self.gesture_in_flight() {
-            return self.execute(operation);
-        }
-        validate(&operation, &self.document, &self.runtime)?;
-        if operation.is_noop() {
-            return Ok(false);
-        }
-        let Self {
-            document,
-            runtime,
-            in_flight,
-            ..
-        } = self;
-        apply(
-            &operation,
-            &mut OperationTarget::Full { document, runtime },
-            ReplayDirection::Redo,
-        )?;
-        if let Some(in_flight) = in_flight {
-            in_flight.applied.push(operation);
-        }
-        Ok(true)
-    }
-
-    /// Commit the in-flight gesture as exactly one history entry.
-    ///
-    /// The entry is the gesture's structural operations composed with the
-    /// geometry it produced, so a gesture that duplicated and dragged commits
-    /// as one undoable action rather than two.
-    ///
-    /// Returns false, recording nothing, when there is no gesture or when it
-    /// changed nothing at all.
-    pub fn commit_gesture(&mut self) -> Result<bool, OperationError> {
-        let Some(in_flight) = self.in_flight.take() else {
-            return Ok(false);
-        };
-        let mut members = in_flight.applied;
-        let command = geometry_command(&self.runtime, &in_flight.geometry);
-        if !command.is_noop() {
-            members.push(SemanticOperation::Runtime(command));
-        }
-        if members.is_empty() {
-            return Ok(false);
-        }
-        self.execute(SemanticOperation::compound(members))
-    }
-
-    /// Abandon the in-flight gesture.
-    ///
-    /// Geometry returns to its pre-gesture value, anything the gesture
-    /// inserted or otherwise changed is taken back, and **no history entry is
-    /// created**. A cancelled gesture is indistinguishable from one that never
-    /// started, which is the property the project's own research identifies as
-    /// the opposite of tldraw's destructive bail.
-    pub fn cancel_gesture(&mut self) {
-        let Some(in_flight) = self.in_flight.take() else {
-            return;
-        };
-        self.runtime.restore_snapshots(&in_flight.geometry);
-        // Reverse order, matching how the operations were applied.
-        for operation in in_flight.applied.iter().rev() {
-            let Self {
-                document, runtime, ..
-            } = self;
-            apply(
-                operation,
-                &mut OperationTarget::Full { document, runtime },
-                ReplayDirection::Undo,
-            )
-            .expect("a gesture operation that applied once reverses cleanly");
-        }
-    }
-
-    /// Whether a gesture is currently in flight.
-    pub fn gesture_in_flight(&self) -> bool {
-        self.in_flight.is_some()
-    }
 }
 
 /// Check that an operation can apply, before any state changes.
@@ -802,24 +746,6 @@ fn validate(
 }
 
 // -- Operation constructors -------------------------------------------------
-//
-// Each builds one operation from intent, so callers never hand-assemble
-// before/after pairs and cannot record a malformed one.
-//
-// # Why these mutate as they build
-//
-// The constructors apply eagerly, and `execute` then replays forward. That
-// double application is deliberate — it keeps Spool's established eager
-// direction instead of inventing a pending-operation stage — and it is safe
-// only because every replay is idempotent:
-//
-// - `set_geometry` / `set_style` assign the same `after` value twice.
-// - `insert_object` refuses an id that is already present.
-// - `remove_objects` on absent ids removes nothing.
-//
-// That idempotence is a load-bearing invariant, not an accident. A future
-// constructor that mutates non-idempotently would apply twice per user action.
-// `eagerly_built_operations_do_not_double_apply` pins the behaviour.
 
 /// Rename a node, reading the current name from the document.
 ///
@@ -843,172 +769,14 @@ pub fn rename_node_in(
     }))
 }
 
-/// Move runtime objects by a delta. One operation regardless of object count.
-///
-/// Geometry is temporary prototype state.
-///
-/// Applies eagerly; see [`plan_move_nodes`] for the form that does not, which
-/// is what a compound needs so that a refused compound leaves no partial state
-/// behind.
-pub fn move_nodes(runtime: &mut Document, ids: &[ObjectId], dx: f32, dy: f32) -> SemanticOperation {
-    let operation = plan_move_nodes(runtime, ids, dx, dy);
-    apply_planned_moves(runtime, &operation);
-    operation
-}
-
-/// Describe a move by a delta without applying it.
-///
-/// The constructors that mutate as they build cannot be composed into an
-/// all-or-nothing compound, because by the time the compound is validated each
-/// member has already changed the runtime. This one only reads, so the whole
-/// compound can be refused with nothing applied.
-///
-/// Prefer this when building a compound, and
-/// [`EditSession::execute`] applies it.
-pub fn plan_move_nodes(
-    runtime: &Document,
-    ids: &[ObjectId],
-    dx: f32,
-    dy: f32,
-) -> SemanticOperation {
-    let changes: Vec<GeometryChange> = runtime
-        .snapshot_objects(ids)
-        .iter()
-        .filter_map(|snapshot| {
-            let after = Geometry {
-                position: Point {
-                    x: snapshot.geometry.position.x + dx,
-                    y: snapshot.geometry.position.y + dy,
-                },
-                size: snapshot.geometry.size,
-            };
-            (after != snapshot.geometry).then_some(GeometryChange {
-                id: snapshot.id,
-                before: snapshot.geometry,
-                after,
-            })
-        })
-        .collect();
-    SemanticOperation::Runtime(DocumentCommand::geometry(changes))
-}
-
-/// Apply a geometry operation built by [`plan_move_nodes`].
-fn apply_planned_moves(runtime: &mut Document, operation: &SemanticOperation) {
-    if let SemanticOperation::Runtime(command) = operation {
-        command.replay(runtime, ReplayDirection::Redo);
-    }
-}
-
-/// Resize one runtime object. Geometry is temporary prototype state.
-pub fn resize_node(runtime: &mut Document, id: ObjectId, geometry: Geometry) -> SemanticOperation {
-    let snapshots = runtime.snapshot_objects(&[id]);
-    runtime.set_geometry(id, geometry);
-    SemanticOperation::Runtime(geometry_command(runtime, &snapshots))
-}
-
-/// Create runtime objects from a tool, as one operation.
-pub fn create_nodes(
-    runtime: &mut Document,
-    kind: crate::canvas::ObjectType,
-    position: Point<f32>,
-    object_size: Size<f32>,
-) -> SemanticOperation {
-    let object = runtime.create_object(kind, position, object_size, None);
-    let placement = ObjectPlacement {
-        index: runtime.objects().len().saturating_sub(1),
-        object,
-    };
-    SemanticOperation::Runtime(DocumentCommand::insert(vec![placement]))
-}
-
-/// Delete runtime objects, as one operation.
-pub fn delete_nodes(runtime: &mut Document, ids: &[ObjectId]) -> SemanticOperation {
-    let placements = runtime.remove_objects(ids);
-    SemanticOperation::Runtime(DocumentCommand::delete(placements))
-}
-
-/// Duplicate runtime objects, as one operation.
-pub fn duplicate_nodes(runtime: &mut Document, ids: &[ObjectId]) -> SemanticOperation {
-    let placements = runtime.duplicate_objects(ids);
-    SemanticOperation::Runtime(DocumentCommand::insert(placements))
-}
-
-/// The offset `Document::duplicate_objects` applies to every copy it mints.
-///
-/// Exposed so a caller positioning copies by its own rule can cancel the nudge
-/// out rather than rediscover it.
-pub const DUPLICATE_NUDGE: f32 = 16.0;
-
-/// Create copies and place them by a delta, as **one** history entry.
-///
-/// This is the shape a modifier-drag duplicate needs, and the reason
-/// [`SemanticOperation::Compound`] exists. The copies are inserted at the
-/// position [`duplicate_nodes`] gives them — the original's position plus
-/// [`DUPLICATE_NUDGE`] — and then translated by `delta`. Expressing that as two
-/// entries would make one gesture cost two undos, and undoing the movement
-/// first would leave the copies sitting where they were dropped before the
-/// second undo removed them.
-///
-/// The copies start at the nudged position, so the *net* placement of each copy
-/// is `original + DUPLICATE_NUDGE + delta`. A caller that wants a copy to land
-/// exactly at the pointer should pass `delta - DUPLICATE_NUDGE` on each axis.
-/// That is stated rather than hidden because the nudge belongs to
-/// `Document::duplicate_objects`, not to this operation.
-///
-/// The originals are untouched: this moves the copies, never the sources.
-/// Duplicating `ids` that do not exist yields an empty compound, which
-/// [`SemanticOperation::is_noop`] reports as a no-op, so it records nothing.
-pub fn duplicate_and_move_nodes(
-    runtime: &mut Document,
-    ids: &[ObjectId],
-    delta: Point<f32>,
-) -> SemanticOperation {
-    // The insert half has to mutate: a copy's identity and name can only be
-    // minted by the allocator. The move half is planned from a shared read, so
-    // it is described rather than applied.
-    let placements = runtime.duplicate_objects(ids);
-    let copy_ids: Vec<ObjectId> = placements
-        .iter()
-        .map(|placement| placement.object.id)
-        .collect();
-    let moved = plan_move_nodes(runtime, &copy_ids, delta.x, delta.y);
-    apply_planned_moves(runtime, &moved);
-    SemanticOperation::compound(vec![
-        SemanticOperation::Runtime(DocumentCommand::insert(placements)),
-        moved,
-    ])
-}
-
-/// Build the geometry command describing what a gesture changed.
-///
-/// Objects that did not actually move are dropped. That is not only tidiness:
-/// without the filter, a multi-object gesture in which one object was pinned
-/// would carry a `before == after` entry for it, so the command's `is_noop`
-/// would be decided by whether *any* object moved while the entry still
-/// described all of them.
-fn geometry_command(runtime: &Document, snapshots: &[ObjectSnapshot]) -> DocumentCommand {
-    let changes: Vec<GeometryChange> = snapshots
-        .iter()
-        .filter_map(|snapshot| {
-            let after = runtime.geometry_of(snapshot.id)?;
-            (after != snapshot.geometry).then_some(GeometryChange {
-                id: snapshot.id,
-                before: snapshot.geometry,
-                after,
-            })
-        })
-        .collect();
-    DocumentCommand::geometry(changes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::{Geometry, ObjectType};
+    use crate::canvas::{Geometry, GeometryChange, ObjectPlacement, ObjectType};
     use crate::source_document::{
         EditorRuntimeState, LamineStructure, SourceBinding, StructuralNode,
     };
-    use gpui::{point, size};
+    use gpui::{point, size, Point};
 
     fn node(id: &str, name: &str, kind: &str, parent: Option<&str>) -> StructuralNode {
         StructuralNode {
@@ -1047,26 +815,98 @@ mod tests {
     fn geometry_of(session: &EditSession, id: ObjectId) -> Geometry {
         session
             .runtime
-            .geometry_of(id)
+            .geometry(id)
             .expect("object exists in runtime")
     }
 
-    fn seed_rect(session: &mut EditSession) -> ObjectId {
-        let operation = create_nodes(
-            &mut session.runtime,
+    /// Mint a rectangle in the runtime and describe the creation, without
+    /// committing it.
+    ///
+    /// The two halves are separate on purpose because that is how the canvas
+    /// does it: `CanvasView::create_object` mints, and `CanvasView::commit`
+    /// hands the placement to `execute`. There is no free-standing constructor
+    /// that does both, so these tests exercise the same two calls production
+    /// makes rather than a shortcut that no caller uses.
+    fn plan_create_rect(session: &mut EditSession) -> (ObjectId, SemanticOperation) {
+        let object = session.runtime.create_object(
             ObjectType::Rectangle,
             point(0.0, 0.0),
             size(10.0, 10.0),
+            None,
         );
+        let placement = ObjectPlacement {
+            index: session.runtime.objects().len() - 1,
+            object: object.clone(),
+        };
+        (
+            object.id,
+            SemanticOperation::Runtime(DocumentCommand::insert(vec![placement])),
+        )
+    }
+
+    fn seed_rect(session: &mut EditSession) -> ObjectId {
+        let (id, operation) = plan_create_rect(session);
         // Record the creation so later geometry has something to move.
         session.execute(operation).expect("create applies");
-        let ids: Vec<ObjectId> = session
-            .runtime
-            .objects()
+        id
+    }
+
+    /// Describe a move by a delta, reading `before` from the runtime and
+    /// writing only the description. This is the production shape: a drag
+    /// mutates the runtime, and pointer-up hands `execute` one
+    /// `DocumentCommand::geometry` covering every object that moved.
+    fn plan_move(session: &EditSession, ids: &[ObjectId], dx: f32, dy: f32) -> SemanticOperation {
+        let changes: Vec<GeometryChange> = ids
             .iter()
-            .map(|object| object.id)
+            .filter_map(|id| {
+                let before = session.runtime.geometry(*id)?;
+                let after = Geometry {
+                    position: point(before.position.x + dx, before.position.y + dy),
+                    size: before.size,
+                };
+                (after != before).then_some(GeometryChange {
+                    id: *id,
+                    before,
+                    after,
+                })
+            })
             .collect();
-        ids[0]
+        SemanticOperation::Runtime(DocumentCommand::geometry(changes))
+    }
+
+    fn move_by(session: &mut EditSession, ids: &[ObjectId], dx: f32, dy: f32) -> bool {
+        let operation = plan_move(session, ids, dx, dy);
+        session.execute(operation).expect("move applies")
+    }
+
+    fn delete(session: &mut EditSession, ids: &[ObjectId]) -> bool {
+        let operation = SemanticOperation::Runtime(DocumentCommand::delete(
+            session.runtime.remove_objects(ids),
+        ));
+        session.execute(operation).expect("delete applies")
+    }
+
+    /// Copy `ids`, then move only the copies, as one history entry.
+    ///
+    /// The shape a modifier-drag duplicate needs, and the reason
+    /// `SemanticOperation::Compound` exists. The copies are already in the
+    /// runtime at their nudged starting position, so the move is measured from
+    /// there: the originals are never moved by this operation.
+    fn plan_duplicate_and_move(
+        session: &mut EditSession,
+        ids: &[ObjectId],
+        delta: Point<f32>,
+    ) -> SemanticOperation {
+        let placements = session.runtime.duplicate_objects(ids);
+        let copy_ids: Vec<ObjectId> = placements
+            .iter()
+            .map(|placement| placement.object.id)
+            .collect();
+        let moved = plan_move(session, &copy_ids, delta.x, delta.y);
+        SemanticOperation::compound(vec![
+            SemanticOperation::Runtime(DocumentCommand::insert(placements)),
+            moved,
+        ])
     }
 
     // -- Rename.
@@ -1101,8 +941,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let start = geometry_of(&session, id);
 
-        let operation = move_nodes(&mut session.runtime, &[id], 30.0, 40.0);
-        session.execute(operation).unwrap();
+        move_by(&mut session, &[id], 30.0, 40.0);
         let moved = geometry_of(&session, id);
         assert_ne!(moved, start);
 
@@ -1124,7 +963,12 @@ mod tests {
             size: size(80.0, 60.0),
         };
 
-        let operation = resize_node(&mut session.runtime, id, resized);
+        let operation =
+            SemanticOperation::Runtime(DocumentCommand::geometry(vec![GeometryChange {
+                id,
+                before: start,
+                after: resized,
+            }]));
         session.execute(operation).unwrap();
         assert_eq!(geometry_of(&session, id), resized);
 
@@ -1141,12 +985,7 @@ mod tests {
         let mut session = session();
         let empty = session.runtime.objects().len();
 
-        let operation = create_nodes(
-            &mut session.runtime,
-            ObjectType::Rectangle,
-            point(0.0, 0.0),
-            size(20.0, 20.0),
-        );
+        let (_, operation) = plan_create_rect(&mut session);
         session.execute(operation).unwrap();
         assert_eq!(session.runtime.objects().len(), empty + 1);
         let created = session.runtime.objects()[0].id;
@@ -1169,8 +1008,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let populated = session.runtime.objects().len();
 
-        let operation = delete_nodes(&mut session.runtime, &[id]);
-        session.execute(operation).unwrap();
+        assert!(delete(&mut session, &[id]));
         assert!(session.runtime.object(id).is_none());
 
         assert!(session.undo().unwrap());
@@ -1191,7 +1029,9 @@ mod tests {
         let id = seed_rect(&mut session);
         let original = session.runtime.objects().len();
 
-        let operation = duplicate_nodes(&mut session.runtime, &[id]);
+        let operation = SemanticOperation::Runtime(DocumentCommand::insert(
+            session.runtime.duplicate_objects(&[id]),
+        ));
         session.execute(operation).unwrap();
         assert_eq!(session.runtime.objects().len(), original + 1);
         let duplicate_id = session
@@ -1213,62 +1053,49 @@ mod tests {
     // -- Cancellation.
 
     #[test]
-    fn cancelled_move_creates_no_committed_operation() {
+    fn a_transient_runtime_mutation_records_nothing() {
+        // A drag mutates the runtime directly and only reaches `execute` on
+        // pointer-up. What protects that is not a gesture API on this side but
+        // the fact that the runtime is not history: nothing here is recorded, so
+        // Escape — which restores the pre-gesture geometry — leaves no entry.
         let mut session = session();
         let id = seed_rect(&mut session);
         let start = geometry_of(&session, id);
         let depth = session.history.undo_len();
 
-        session.begin_gesture(&[id]);
-        // Mutate transiently, as a drag does.
         session.runtime.set_geometry(
             id,
             Geometry {
                 position: point(500.0, 500.0),
-                size: start.size,
-            },
-        );
-        assert!(session.gesture_in_flight());
-
-        session.cancel_gesture();
-        assert!(!session.gesture_in_flight());
-        assert_eq!(geometry_of(&session, id), start, "geometry restored");
-        assert_eq!(session.history.undo_len(), depth, "no entry was created");
-    }
-
-    #[test]
-    fn cancelled_resize_creates_no_committed_operation() {
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let start = geometry_of(&session, id);
-        let depth = session.history.undo_len();
-
-        session.begin_gesture(&[id]);
-        session.runtime.set_geometry(
-            id,
-            Geometry {
-                position: start.position,
                 size: size(999.0, 999.0),
             },
         );
-        session.cancel_gesture();
+        assert_eq!(
+            session.history.undo_len(),
+            depth,
+            "mutating the runtime is not a commit"
+        );
+        assert!(!session.history.can_undo() || session.history.undo_len() == depth);
 
+        // Restoring the pre-gesture value is therefore indistinguishable from
+        // never having moved.
+        session.runtime.set_geometry(id, start);
         assert_eq!(geometry_of(&session, id), start);
         assert_eq!(session.history.undo_len(), depth, "no entry was created");
-    }
 
-    // -- Transaction granularity.
+        // And the move that *is* committed undoes back to where it began.
+        assert!(move_by(&mut session, &[id], 40.0, 0.0));
+        assert_eq!(session.history.undo_len(), depth + 1);
+        assert!(session.undo().unwrap());
+        assert_eq!(geometry_of(&session, id), start);
+        assert_eq!(session.history.undo_len(), depth);
+    }
 
     #[test]
     fn multi_node_move_is_one_history_transaction() {
         let mut session = session();
         let first = seed_rect(&mut session);
-        let operation = create_nodes(
-            &mut session.runtime,
-            ObjectType::Rectangle,
-            point(0.0, 0.0),
-            size(10.0, 10.0),
-        );
+        let (_, operation) = plan_create_rect(&mut session);
         session.execute(operation).unwrap();
         let second = session
             .runtime
@@ -1279,8 +1106,7 @@ mod tests {
             .id;
 
         let depth = session.history.undo_len();
-        let operation = move_nodes(&mut session.runtime, &[first, second], 25.0, 0.0);
-        session.execute(operation).unwrap();
+        move_by(&mut session, &[first, second], 25.0, 0.0);
 
         // One entry for two objects.
         assert_eq!(session.history.undo_len(), depth + 1);
@@ -1289,33 +1115,6 @@ mod tests {
         assert_eq!(session.history.undo_len(), depth);
         assert_eq!(geometry_of(&session, first).position.x, 0.0);
         assert_eq!(geometry_of(&session, second).position.x, 0.0);
-    }
-
-    #[test]
-    fn gesture_commit_is_one_entry_and_no_op_gesture_is_none() {
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let start = geometry_of(&session, id);
-        let depth = session.history.undo_len();
-
-        // A gesture that moves nothing commits nothing.
-        session.begin_gesture(&[id]);
-        session.commit_gesture().unwrap();
-        assert_eq!(session.history.undo_len(), depth);
-
-        // A gesture that moves something commits exactly one entry.
-        session.begin_gesture(&[id]);
-        session.runtime.set_geometry(
-            id,
-            Geometry {
-                position: point(12.0, 0.0),
-                size: start.size,
-            },
-        );
-        assert!(session.commit_gesture().unwrap());
-        assert_eq!(session.history.undo_len(), depth + 1);
-        assert!(session.undo().unwrap());
-        assert_eq!(geometry_of(&session, id), start);
     }
 
     // -- Refusals: an operation that cannot apply must not panic, record, or
@@ -1356,8 +1155,7 @@ mod tests {
         // state nor history. The redo branch is history.
         let mut session = session();
         let id = seed_rect(&mut session);
-        let operation = move_nodes(&mut session.runtime, &[id], 5.0, 0.0);
-        session.execute(operation).unwrap();
+        move_by(&mut session, &[id], 5.0, 0.0);
         session.undo().unwrap();
         assert!(session.history.can_redo());
 
@@ -1452,7 +1250,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let depth = session.history.undo_len();
 
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(40.0, 25.0));
+        let operation = plan_duplicate_and_move(&mut session, &[id], point(40.0, 25.0));
         assert!(session.execute(operation).unwrap());
 
         assert_eq!(
@@ -1475,7 +1273,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let original_position = geometry_of(&session, id).position;
 
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(40.0, 25.0));
+        let operation = plan_duplicate_and_move(&mut session, &[id], point(40.0, 25.0));
         session.execute(operation).unwrap();
 
         let copy = session
@@ -1540,7 +1338,7 @@ mod tests {
             }),
         ]);
 
-        let mut target = |document: &mut PersistentDocument, direction| {
+        let target = |document: &mut PersistentDocument, direction| {
             apply(
                 &compound,
                 &mut OperationTarget::Document(document),
@@ -1600,98 +1398,51 @@ mod tests {
     }
 
     #[test]
-    fn the_gesture_command_describes_only_the_objects_that_moved() {
-        // `DocumentCommand`'s payload is private to `canvas.rs`, so the entry is
-        // inspected through its `Debug` rendering rather than by matching on
-        // variants. It is the only observation available from this module, and
-        // without this test the filter in `geometry_command` could be deleted
-        // with nothing failing.
-        let mut session = session();
-        let first = seed_rect(&mut session);
-        let created = create_nodes(
-            &mut session.runtime,
-            ObjectType::Rectangle,
-            point(500.0, 500.0),
-            size(10.0, 10.0),
-        );
-        session.execute(created).unwrap();
-        let second = session
-            .runtime
-            .objects()
-            .iter()
-            .map(|object| object.id)
-            .find(|candidate| *candidate != first)
-            .expect("a second object");
-
-        let snapshots = session.runtime.snapshot_objects(&[first, second]);
-        let moved = geometry_of(&session, first);
-        // Only the first object moves, as a drag of a partly-pinned selection
-        // would.
-        session.runtime.set_geometry(
-            first,
-            Geometry {
-                position: point(30.0, 40.0),
-                size: moved.size,
-            },
-        );
-
-        let command = geometry_command(&session.runtime, &snapshots);
-        assert!(!command.is_noop());
-        let rendered = format!("{command:?}");
-        assert_eq!(
-            rendered.matches("GeometryChange").count(),
-            1,
-            "only the object that moved is described: {rendered}"
-        );
-
-        // And a gesture that has already settled describes nothing, because
-        // fresh snapshots match the state they are compared against.
-        let settled_snapshots = session.runtime.snapshot_objects(&[first, second]);
-        let settled = geometry_command(&session.runtime, &settled_snapshots);
-        assert!(settled.is_noop(), "a still gesture changes nothing");
-        assert_eq!(format!("{settled:?}").matches("GeometryChange").count(), 0);
-    }
-
-    #[test]
     fn a_planned_move_is_relative_to_where_the_object_actually_is() {
         // Pinned with a non-zero origin on purpose. At the origin, "position
         // plus delta" and "the delta alone" are the same number, so a planner
         // that ignored the object's position would still pass every other test
         // in this module. This is the only assertion that separates them.
         let mut session = session();
-        let created = create_nodes(
-            &mut session.runtime,
+        let object = session.runtime.create_object(
             ObjectType::Rectangle,
             point(100.0, 200.0),
             size(10.0, 10.0),
+            None,
         );
+        let created = SemanticOperation::Runtime(DocumentCommand::insert(vec![ObjectPlacement {
+            index: session.runtime.objects().len() - 1,
+            object: object.clone(),
+        }]));
         session.execute(created).unwrap();
-        let id = session.runtime.objects()[0].id;
+        let id = object.id;
         let start = geometry_of(&session, id);
         assert_eq!(start.position, point(100.0, 200.0));
 
-        let planned = plan_move_nodes(&session.runtime, &[id], 5.0, -3.0);
+        let planned = plan_move(&session, &[id], 5.0, -3.0);
         assert_eq!(geometry_of(&session, id), start, "planning moved nothing");
 
-        session.execute(planned).unwrap();
+        let replanned = plan_move(&session, &[id], 5.0, -3.0);
+        assert_eq!(replanned, planned, "planning reads, it does not mutate");
+        session.execute(replanned).unwrap();
         assert_eq!(
             geometry_of(&session, id).position,
             point(105.0, 197.0),
             "the delta is applied to the object's real position"
         );
 
-        // And the eager constructor agrees, so the two forms differ only in
-        // when they mutate.
+        // Planning leaves the runtime exactly where it was, so undoing the
+        // committed plan and planning again describes the same edit. That is
+        // what makes a compound composable: a refused member has changed
+        // nothing for its siblings to trip over.
         session.undo().unwrap();
-        let eager = move_nodes(&mut session.runtime, &[id], 5.0, -3.0);
-        session.execute(eager).unwrap();
-        assert_eq!(geometry_of(&session, id).position, point(105.0, 197.0));
+        assert_eq!(geometry_of(&session, id), start);
     }
 
     #[test]
     fn two_planned_moves_of_one_object_do_not_accumulate() {
         // Worth pinning because it is a real constraint on building compounds,
-        // not an accident. `plan_move_nodes` measures from the state it reads,
+        // not an accident. A planned move measures from the state it reads,
         // so two planned moves of the same object both start from the same
         // place and the second wins. Composition across objects works; stacking
         // deltas on one object needs the deltas summed by the caller.
@@ -1699,8 +1450,8 @@ mod tests {
         let id = seed_rect(&mut session);
         let start = geometry_of(&session, id);
 
-        let first = plan_move_nodes(&session.runtime, &[id], 10.0, 0.0);
-        let second = plan_move_nodes(&session.runtime, &[id], 0.0, 20.0);
+        let first = plan_move(&session, &[id], 10.0, 0.0);
+        let second = plan_move(&session, &[id], 0.0, 20.0);
         assert_ne!(first, second, "the two plans differ");
 
         session
@@ -1724,12 +1475,7 @@ mod tests {
         // planned against the state it read.
         let mut session = session();
         let first = seed_rect(&mut session);
-        let created = create_nodes(
-            &mut session.runtime,
-            ObjectType::Rectangle,
-            point(0.0, 0.0),
-            size(10.0, 10.0),
-        );
+        let (_, created) = plan_create_rect(&mut session);
         session.execute(created).unwrap();
         let second = session
             .runtime
@@ -1741,8 +1487,8 @@ mod tests {
         let depth = session.history.undo_len();
 
         let operation = SemanticOperation::compound(vec![
-            plan_move_nodes(&session.runtime, &[first], 10.0, 0.0),
-            plan_move_nodes(&session.runtime, &[second], 0.0, 20.0),
+            plan_move(&session, &[first], 10.0, 0.0),
+            plan_move(&session, &[second], 0.0, 20.0),
         ]);
         assert!(session.execute(operation).unwrap());
         assert_eq!(session.history.undo_len(), depth + 1);
@@ -1763,18 +1509,13 @@ mod tests {
         let id = seed_rect(&mut session);
         let original_position = geometry_of(&session, id).position;
 
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(33.0, 44.0));
+        let operation = plan_duplicate_and_move(&mut session, &[id], point(33.0, 44.0));
         session.execute(operation).unwrap();
         let committed: Vec<(ObjectId, Geometry)> = session
             .runtime
             .objects()
             .iter()
-            .filter_map(|object| {
-                session
-                    .runtime
-                    .geometry_of(object.id)
-                    .map(|g| (object.id, g))
-            })
+            .filter_map(|object| session.runtime.geometry(object.id).map(|g| (object.id, g)))
             .collect();
 
         for _ in 0..5 {
@@ -1787,12 +1528,7 @@ mod tests {
                 .runtime
                 .objects()
                 .iter()
-                .filter_map(|object| {
-                    session
-                        .runtime
-                        .geometry_of(object.id)
-                        .map(|g| (object.id, g))
-                })
+                .filter_map(|object| session.runtime.geometry(object.id).map(|g| (object.id, g)))
                 .collect();
             assert_eq!(
                 replayed, committed,
@@ -1815,8 +1551,8 @@ mod tests {
         // `plan_move_nodes` only reads, so the member has not moved yet when
         // validation runs. An eager `move_nodes` here would have already moved
         // it, which is exactly the leak this test exists to rule out.
-        let good = plan_move_nodes(&session.runtime, &[id], 100.0, 100.0);
-        let also_good = plan_move_nodes(&session.runtime, &[id], 0.0, 100.0);
+        let good = plan_move(&session, &[id], 100.0, 100.0);
+        let also_good = plan_move(&session, &[id], 0.0, 100.0);
         let bad = SemanticOperation::Rename(RenameNode {
             id: NodeId::new("spool-a").unwrap(),
             before: "Alpha".into(),
@@ -1847,13 +1583,10 @@ mod tests {
         let start = geometry_of(&session, id);
 
         let inner = SemanticOperation::compound(vec![
-            plan_move_nodes(&session.runtime, &[id], 5.0, 0.0),
-            plan_move_nodes(&session.runtime, &[id], 0.0, 5.0),
+            plan_move(&session, &[id], 5.0, 0.0),
+            plan_move(&session, &[id], 0.0, 5.0),
         ]);
-        let outer = SemanticOperation::compound(vec![
-            inner,
-            plan_move_nodes(&session.runtime, &[id], 7.0, 0.0),
-        ]);
+        let outer = SemanticOperation::compound(vec![inner, plan_move(&session, &[id], 7.0, 0.0)]);
 
         // Flattened to three members, not a nested tree.
         let SemanticOperation::Compound(members) = &outer else {
@@ -1873,14 +1606,14 @@ mod tests {
         let id = seed_rect(&mut session);
         let position = geometry_of(&session, id);
 
-        let idle = plan_move_nodes(&session.runtime, &[id], 0.0, 0.0);
+        let idle = plan_move(&session, &[id], 0.0, 0.0);
         assert!(SemanticOperation::compound(vec![idle.clone()]).is_noop());
         assert!(
             SemanticOperation::compound(vec![]).is_noop(),
             "an empty compound changes nothing"
         );
 
-        let real = plan_move_nodes(&session.runtime, &[id], 12.0, 0.0);
+        let real = plan_move(&session, &[id], 12.0, 0.0);
         assert!(!SemanticOperation::compound(vec![idle, real]).is_noop());
         assert_eq!(
             geometry_of(&session, id),
@@ -1890,7 +1623,7 @@ mod tests {
 
         // And a no-op compound records nothing.
         let depth = session.history.undo_len();
-        let idle = plan_move_nodes(&session.runtime, &[id], 0.0, 0.0);
+        let idle = plan_move(&session, &[id], 0.0, 0.0);
         assert!(!session
             .execute(SemanticOperation::compound(vec![idle]))
             .unwrap());
@@ -1902,13 +1635,12 @@ mod tests {
     fn a_new_operation_after_a_compound_undo_invalidates_the_whole_branch() {
         let mut session = session();
         let id = seed_rect(&mut session);
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(10.0, 10.0));
+        let operation = plan_duplicate_and_move(&mut session, &[id], point(10.0, 10.0));
         session.execute(operation).unwrap();
         session.undo().unwrap();
         assert!(session.history.can_redo());
 
-        let operation = move_nodes(&mut session.runtime, &[id], 3.0, 0.0);
-        session.execute(operation).unwrap();
+        move_by(&mut session, &[id], 3.0, 0.0);
         assert!(
             !session.history.can_redo(),
             "redo branch is dropped, not truncated"
@@ -1931,7 +1663,7 @@ mod tests {
             "Alpha 2".into(),
         )
         .unwrap();
-        let move_op = move_nodes(&mut session.runtime, &[id], 15.0, 15.0);
+        let move_op = plan_move(&session, &[id], 15.0, 15.0);
         assert!(session
             .execute(SemanticOperation::compound(vec![rename, move_op]))
             .unwrap());
@@ -1956,125 +1688,13 @@ mod tests {
     fn a_duplicate_and_move_of_nothing_records_nothing() {
         let mut session = session();
         let depth = session.history.undo_len();
-        let operation =
-            duplicate_and_move_nodes(&mut session.runtime, &[ObjectId(9_999)], point(5.0, 5.0));
+        let operation = plan_duplicate_and_move(&mut session, &[ObjectId(9_999)], point(5.0, 5.0));
         assert!(SemanticOperation::compound(vec![operation.clone()]).is_noop());
         assert!(!session.execute(operation).unwrap());
         assert_eq!(session.history.undo_len(), depth);
     }
 
     // -- Cancellation of a gesture that inserted objects.
-
-    #[test]
-    fn cancelling_a_gesture_removes_what_it_inserted() {
-        // The debt a geometry-only cancel could not pay: a modifier-drag
-        // duplicate adds rows to the runtime, and restoring positions cannot
-        // un-add them. A cancelled gesture must be indistinguishable from one
-        // that never started.
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let start = geometry_of(&session, id);
-        let depth = session.history.undo_len();
-
-        session.begin_gesture(&[id]);
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(60.0, 60.0));
-        session.gesture_execute(operation).unwrap();
-        assert_eq!(
-            session.runtime.objects().len(),
-            2,
-            "the copy exists mid-gesture"
-        );
-
-        session.cancel_gesture();
-
-        assert_eq!(session.runtime.objects().len(), 1, "the copy is gone");
-        assert_eq!(geometry_of(&session, id), start, "geometry restored");
-        assert_eq!(
-            session.history.undo_len(),
-            depth,
-            "the gesture recorded nothing"
-        );
-        assert!(!session.gesture_in_flight());
-
-        // And the discarded gesture left nothing undoable to replay.
-        assert!(!session.history.can_undo() || session.history.undo_len() == depth);
-    }
-
-    #[test]
-    fn cancelling_a_gesture_reverses_every_operation_it_applied() {
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let start = geometry_of(&session, id);
-        let depth = session.history.undo_len();
-
-        session.begin_gesture(&[id]);
-        // Two structural operations in one gesture: copy, then rename.
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(20.0, 0.0));
-        session.gesture_execute(operation).unwrap();
-        let rename = rename_node_in(
-            &session.document,
-            NodeId::new("spool-a").unwrap(),
-            "Renamed".into(),
-        )
-        .unwrap();
-        session.gesture_execute(rename).unwrap();
-        assert_eq!(session.document.structure.nodes[0].name, "Renamed");
-
-        session.cancel_gesture();
-
-        assert_eq!(
-            session.document.structure.nodes[0].name, "Alpha",
-            "metadata restored"
-        );
-        assert_eq!(session.runtime.objects().len(), 1, "copy removed");
-        assert_eq!(geometry_of(&session, id), start);
-        assert_eq!(session.history.undo_len(), depth, "nothing recorded");
-    }
-
-    #[test]
-    fn committing_a_gesture_that_inserted_keeps_the_copy_and_records_one_entry() {
-        // The counterpart: a gesture that both duplicates and drags commits the
-        // whole thing, not just the geometry.
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let start = geometry_of(&session, id);
-        let depth = session.history.undo_len();
-
-        session.begin_gesture(&[id]);
-        let operation = duplicate_and_move_nodes(&mut session.runtime, &[id], point(30.0, 0.0));
-        session.gesture_execute(operation).unwrap();
-
-        // The original never moved, so the geometry command alone would have
-        // been a no-op. The gesture still commits, because the copy it created
-        // is real work and belongs to the same undo step as the drag.
-        assert!(session.commit_gesture().unwrap());
-        assert_eq!(session.history.undo_len(), depth + 1, "one entry, not two");
-        assert_eq!(
-            session.runtime.objects().len(),
-            2,
-            "the copy survives a commit"
-        );
-
-        // One undo takes back both the copy and its placement.
-        assert!(session.undo().unwrap());
-        assert_eq!(session.runtime.objects().len(), 1);
-        assert_eq!(
-            geometry_of(&session, id).position,
-            start.position,
-            "the original stayed put"
-        );
-    }
-
-    #[test]
-    fn gesture_execute_outside_a_gesture_is_just_execute() {
-        let mut session = session();
-        let id = seed_rect(&mut session);
-        let depth = session.history.undo_len();
-        let operation = move_nodes(&mut session.runtime, &[id], 8.0, 0.0);
-        assert!(session.gesture_execute(operation).unwrap());
-        assert_eq!(session.history.undo_len(), depth + 1);
-        assert!(session.undo().unwrap());
-    }
 
     // -- Provenance.
 
@@ -2084,13 +1704,13 @@ mod tests {
         let id = seed_rect(&mut session);
 
         // No origin given: a human action.
-        let operation = move_nodes(&mut session.runtime, &[id], 1.0, 0.0);
+        let operation = plan_move(&session, &[id], 1.0, 0.0);
         session.execute(operation).unwrap();
         assert_eq!(session.history.peek_undo_origin(), Some(Origin::User));
 
         // An attributed caller. Same object, so this is about attribution
         // rather than about geometry.
-        let operation = plan_move_nodes(&session.runtime, &[id], 0.0, 1.0);
+        let operation = plan_move(&session, &[id], 0.0, 1.0);
         session.execute_from(Origin::Agent, operation).unwrap();
         assert_eq!(session.history.peek_undo_origin(), Some(Origin::Agent));
 
@@ -2120,7 +1740,7 @@ mod tests {
         let mut session = session();
         let id = seed_rect(&mut session);
         let start = geometry_of(&session, id);
-        let operation = move_nodes(&mut session.runtime, &[id], 4.0, 4.0);
+        let operation = plan_move(&session, &[id], 4.0, 4.0);
 
         session.execute_from(Origin::Import, operation).unwrap();
         assert_ne!(geometry_of(&session, id), start);
@@ -2165,7 +1785,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let spool_id = session.runtime.object(id).expect("object").spool_id.clone();
 
-        let operation = move_nodes(&mut session.runtime, &[id], 10.0, 10.0);
+        let operation = plan_move(&session, &[id], 10.0, 10.0);
         session.execute(operation).unwrap();
         assert!(session.undo().unwrap());
         assert!(session.redo().unwrap());
@@ -2200,7 +1820,7 @@ mod tests {
 
         let id = seed_rect(&mut session);
         let depth = session.history.undo_len();
-        let operation = move_nodes(&mut session.runtime, &[id], 5.0, 5.0);
+        let operation = plan_move(&session, &[id], 5.0, 5.0);
         session.execute(operation).unwrap();
         assert!(session.undo().unwrap());
         assert!(session.redo().unwrap());
@@ -2239,18 +1859,17 @@ mod tests {
         let mut session = session();
         let id = seed_rect(&mut session);
 
-        let operation = move_nodes(&mut session.runtime, &[id], 3.0, 0.0);
-        session.execute(operation).unwrap();
+        move_by(&mut session, &[id], 3.0, 0.0);
         session.undo().unwrap();
         assert!(session.history.can_redo());
 
         // A no-op must not destroy the redo branch.
-        let noop = move_nodes(&mut session.runtime, &[id], 0.0, 0.0);
+        let noop = plan_move(&session, &[id], 0.0, 0.0);
         assert!(!session.execute(noop).unwrap(), "a no-op records nothing");
         assert!(session.history.can_redo(), "redo survives a no-op");
 
         // A real operation clears it.
-        let operation = move_nodes(&mut session.runtime, &[id], 1.0, 0.0);
+        let operation = plan_move(&session, &[id], 1.0, 0.0);
         session.execute(operation).unwrap();
         assert!(!session.history.can_redo());
     }
@@ -2310,7 +1929,7 @@ mod tests {
         let id = seed_rect(&mut session);
         let baseline = session.history.undo_len();
 
-        let first = move_nodes(&mut session.runtime, &[id], 12.0, 0.0);
+        let first = plan_move(&session, &[id], 12.0, 0.0);
         session.execute(first).unwrap();
         session
             .execute(
@@ -2322,7 +1941,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let second = move_nodes(&mut session.runtime, &[id], 0.0, 7.0);
+        let second = plan_move(&session, &[id], 0.0, 7.0);
         session.execute(second).unwrap();
         assert_eq!(session.history.undo_len(), baseline + 3);
 
@@ -2358,55 +1977,6 @@ mod tests {
     }
 
     #[test]
-    fn eagerly_built_operations_do_not_double_apply() {
-        // Constructors apply eagerly and `execute` replays forward. If any
-        // replay were non-idempotent this would show up here.
-        let mut session = session();
-
-        // Insert: the create already added the object, so replaying forward
-        // must not add a second one with the same id.
-        let created = create_nodes(
-            &mut session.runtime,
-            ObjectType::Rectangle,
-            point(0.0, 0.0),
-            size(10.0, 10.0),
-        );
-        let after_build = session.runtime.objects().len();
-        session.execute(created).unwrap();
-        assert_eq!(
-            session.runtime.objects().len(),
-            after_build,
-            "create replayed twice"
-        );
-        assert!(session.undo().unwrap());
-        assert!(
-            session.runtime.objects().is_empty(),
-            "undo removed the created object"
-        );
-        assert!(session.redo().unwrap());
-        assert_eq!(
-            session.runtime.objects().len(),
-            after_build,
-            "redo restored exactly one"
-        );
-
-        // Delete: removing an absent id twice removes nothing.
-        let id = session.runtime.objects()[0].id;
-        let deleted = delete_nodes(&mut session.runtime, &[id]);
-        assert!(session.execute(deleted).unwrap());
-        assert!(
-            session.runtime.objects().is_empty(),
-            "delete applied twice is stable"
-        );
-        assert!(session.undo().unwrap());
-        assert_eq!(
-            session.runtime.objects().len(),
-            1,
-            "undo restored exactly one"
-        );
-    }
-
-    #[test]
     fn every_operation_kind_leaves_the_caller_owned_runtime_state_alone() {
         let mut session = session();
         let id = seed_rect(&mut session);
@@ -2421,17 +1991,20 @@ mod tests {
             active_tool: "select".into(),
         };
 
+        let before = geometry_of(&session, id);
         let operations = [
-            move_nodes(&mut session.runtime, &[id], 5.0, 5.0),
-            resize_node(
-                &mut session.runtime,
+            plan_move(&session, &[id], 5.0, 5.0),
+            SemanticOperation::Runtime(DocumentCommand::geometry(vec![GeometryChange {
                 id,
-                Geometry {
+                before,
+                after: Geometry {
                     position: point(1.0, 1.0),
                     size: size(20.0, 20.0),
                 },
-            ),
-            duplicate_nodes(&mut session.runtime, &[id]),
+            }])),
+            SemanticOperation::Runtime(DocumentCommand::insert(
+                session.runtime.duplicate_objects(&[id]),
+            )),
             {
                 let duplicated = session
                     .runtime
@@ -2439,7 +2012,9 @@ mod tests {
                     .last()
                     .expect("duplicate exists")
                     .id;
-                delete_nodes(&mut session.runtime, &[duplicated])
+                SemanticOperation::Runtime(DocumentCommand::delete(
+                    session.runtime.remove_objects(&[duplicated]),
+                ))
             },
         ];
         for operation in operations {

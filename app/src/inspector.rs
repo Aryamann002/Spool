@@ -194,11 +194,20 @@ impl<T: PartialEq> Value<T> {
         }
     }
 
-    pub fn is_mixed(self) -> bool {
+    /// Whether the selection disagrees about this property.
+    ///
+    /// Taken by reference because `is_*` is a question about the value, not a
+    /// consuming transform of it. `Value` is `Copy`, so the borrow costs nothing and
+    /// the name stays the clearest one at the call site.
+    pub fn is_mixed(&self) -> bool {
         matches!(self, Self::Mixed)
     }
 
-    pub fn is_unset(self) -> bool {
+    /// Whether the selection agrees the property is off or was never authored.
+    ///
+    /// Taken by reference because `is_*` is a question about the value, not a
+    /// consuming transform of it.
+    pub fn is_unset(&self) -> bool {
         matches!(self, Self::Unset)
     }
 }
@@ -2239,9 +2248,8 @@ fn segmented(
     for (index, (label, offered)) in labels.iter().enumerate() {
         let pressed = selected == Some(index);
         let enabled = *offered;
-        // `action` captures nothing but `Copy` state, so the closure is `Copy`
-        // too and each option gets its own without sharing a listener.
-        let action = action;
+        // `action` is `Copy` and captures nothing, so every option below can
+        // move its own copy into its own listener without sharing one.
         let option = div()
             .id(SharedString::from(format!("{prefix}-{index}")))
             .flex()

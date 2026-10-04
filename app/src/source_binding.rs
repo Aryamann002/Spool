@@ -1452,13 +1452,9 @@ mod tests {
         // html, head, title, body, main, h1, a — and not the commented-out div,
         // and not a bare text run.
         assert_eq!(census.len(), 7, "{census:?}");
-        assert!(census
-            .iter()
-            .any(|slice| *slice == "<title>Landing</title>"));
+        assert!(census.contains(&"<title>Landing</title>"));
         assert!(
-            census
-                .iter()
-                .any(|slice| *slice == r##"<a class="cta" href="#start">Start</a>"##),
+            census.contains(&r##"<a class="cta" href="#start">Start</a>"##),
             "an element no identity claims is still an element: {census:?}"
         );
         // Checked against each element's own start tag: the comment is inside
@@ -1492,7 +1488,7 @@ mod tests {
             .expect("body is an element");
         let range_at = |at: usize| index.element_ranges()[at].clone();
         assert!(
-            main < range_at(body).start / 1 && body < main,
+            main < range_at(body).start && body < main,
             "census is in document order"
         );
         assert!(

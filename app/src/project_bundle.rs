@@ -461,9 +461,8 @@ fn resolve_document_reference(
             },
             Component::CurDir => {}
             Component::ParentDir => {
-                if parts.pop().is_none() {
-                    return None;
-                }
+                // Climbing above an empty stack would escape the root.
+                parts.pop()?;
             }
             Component::RootDir | Component::Prefix(_) => return None,
         }

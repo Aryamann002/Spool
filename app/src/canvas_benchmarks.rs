@@ -21,24 +21,26 @@ fn core_workload_baseline() {
     println!("microseconds/operation; debug profile; 1000 iterations; 10 warmups");
     for count in [100, 1_000, 10_000] {
         // Build outside timed regions, without exercising quadratic insertion.
-        let mut document = Document::default();
-        document.objects = (0..count)
-            .map(|index| DesignObject {
-                id: ObjectId(index as u64 + 5),
-                spool_id: node_id(format!("spool-bench-{index:016x}")),
-                name: format!("Text {index}"),
-                position: point((index % 100) as f32 * 40.0, (index / 100) as f32 * 40.0),
-                size: size(30.0, 30.0),
-                object_type: ObjectType::Text,
-                text_content: Some("Representative text content".repeat(4)),
-                text_color: None,
-                font_size: None,
-                border_radius: 0.0,
-                opacity: 1.0,
-                fill: default_style(ObjectType::Text).fill,
-                stroke: None,
-            })
-            .collect();
+        let mut document = Document {
+            objects: (0..count)
+                .map(|index| DesignObject {
+                    id: ObjectId(index as u64 + 5),
+                    spool_id: node_id(format!("spool-bench-{index:016x}")),
+                    name: format!("Text {index}"),
+                    position: point((index % 100) as f32 * 40.0, (index / 100) as f32 * 40.0),
+                    size: size(30.0, 30.0),
+                    object_type: ObjectType::Text,
+                    text_content: Some("Representative text content".repeat(4)),
+                    text_color: None,
+                    font_size: None,
+                    border_radius: 0.0,
+                    opacity: 1.0,
+                    fill: default_style(ObjectType::Text).fill,
+                    stroke: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
         let clone = measure(
             || {
                 black_box(black_box(&document).clone());
