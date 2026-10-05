@@ -3,7 +3,7 @@
 **A local-first design tool that makes graphics design, UI/UX and branding easier and quicker to prototype on your devices—even without an internet connection.**
 
 
-Spool is a student-built, open-source design tool from Google Developer Groups
+Spool is a student-built, open-source design tool from [Google Developer Groups](https://www.instagram.com/gdg.tiet/)
 at Thapar Institute of Engineering and Technology. Open an existing interface,
 inspect its structure, select elements on a native canvas, make supported
 visual edits, and save those changes back into the project's authored source.
@@ -59,8 +59,16 @@ Install a current stable Rust toolchain and use a platform supported by GPUI.
 From the repository root:
 
 ```sh
+# for debug mode
 cd app
 cargo run
+```
+
+```sh
+# for release build
+cd app
+cargo build --release --locked
+./target/release/Spool
 ```
 
 To open the included source-backed example:
