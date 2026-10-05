@@ -53,6 +53,29 @@ examples. On startup, Spool reports whether the project opened successfully;
 if it fails, the reason is printed and the editor falls back to the starter
 scene.
 
+## Package a macOS app bundle
+
+`cargo run` is for development. To produce the distributable macOS artifact,
+run the packaging script from the repository root:
+
+```sh
+app/scripts/package-macos.sh
+```
+
+It builds with `cargo build --release`, assembles `dist/Spool.app`, and writes
+`dist/Spool-macos-arm64.zip`. `Spool.app` runs on its own: it needs no Cargo,
+Rust toolchain, or development environment, only a copy of the project the user
+opens.
+
+The script uses only tools that ship with macOS. Application identity comes
+from `app/resources/Info.plist.in`, and the version comes from the `[package]`
+version in `app/Cargo.toml`, so there is one source of truth. The icon is
+generated at package time from `app/resources/icon-1024.png`.
+
+The bundle is signed ad-hoc, which seals it for local use. It is not signed
+with a Developer ID certificate and is not notarized, so macOS Gatekeeper will
+still warn on first launch when it is opened from another machine.
+
 ## Run the website
 
 The website requires Bun 1.4.2, specified by `packageManager` in

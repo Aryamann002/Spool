@@ -1,4 +1,5 @@
 /app/target
+/dist
 /website/.agents
 /website/.visual-check
 /.freebuff
