@@ -124,6 +124,8 @@ impl PrototypeGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeObjectType {
     Frame,
+    Rectangle,
+    Ellipse,
     Text,
     /// The metadata declares a kind this runtime does not render yet. The
     /// node still exists in the projection so identity is preserved; it simply
@@ -136,6 +138,13 @@ impl RuntimeObjectType {
         match kind {
             "frame" | "group" | "component" => Self::Frame,
             "text" => Self::Text,
+            // The other two tools the canvas offers. They are here because a
+            // created rectangle is authored as `rectangle`, and a kind the
+            // projection could not read would come back from a save as an object
+            // that exists in the document and draws as nothing — persisted, but
+            // invisible, which is the failure this milestone exists to remove.
+            "rectangle" => Self::Rectangle,
+            "ellipse" => Self::Ellipse,
             _ => Self::Unsupported,
         }
     }
@@ -147,6 +156,8 @@ impl RuntimeObjectType {
     fn canvas_type(self) -> Option<ObjectType> {
         match self {
             Self::Frame => Some(ObjectType::Frame),
+            Self::Rectangle => Some(ObjectType::Rectangle),
+            Self::Ellipse => Some(ObjectType::Ellipse),
             Self::Text => Some(ObjectType::Text),
             Self::Unsupported => None,
         }

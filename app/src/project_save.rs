@@ -76,6 +76,14 @@ use crate::source_binding::{self, is_markup, ByteRange, SourceIndex};
 use crate::source_document::{NodeId, PersistentDocument, StructuralNode};
 use crate::style::Stylesheet;
 
+// # MUTATION HARNESS
+//
+// `app/mutate_created_objects.sh` breaks one rule at a time in this file — the
+// authored element, the identity attribute, the source-order splice, the removal
+// splice — and requires the suite to notice. A rule that can be broken without a
+// test failing is reported as `SURVIVED`, because an untested invariant is the
+// finding. The script refuses to run unless it sees this marker.
+
 /// One change to write back to source.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceEdit {
@@ -103,6 +111,46 @@ pub enum SourceEdit {
         property: String,
         value: String,
     },
+    /// Author an element for a node that has none yet.
+    ///
+    /// This is what makes a created object survive a reopen. The node is already
+    /// in the persistent document — it got there through a structural operation,
+    /// not through here — so all this edit carries is the authored half: the
+    /// element itself, its identity attribute, and the appearance the editor
+    /// cannot express any other way for an element that was not authored with a
+    /// class to own.
+    Create { node: NodeId, element: NewElement },
+    /// Take an element back out of the source, for a node leaving the document.
+    ///
+    /// The inverse of [`SourceEdit::Create`], and deliberately not a separate
+    /// mechanism: deleting a node is the same splice as never having written it.
+    ///
+    /// `file` travels with the edit because the node is no longer in the document
+    /// to ask: a node that is leaving has, by definition, already been removed
+    /// from the structure, so the only record of which file its element lived in
+    /// is the one the caller kept.
+    Remove { node: NodeId, file: String },
+}
+
+/// The element to author for a created node.
+///
+/// Carries only what has to be written into markup. Where the node goes is not
+/// here: that is decided from the parent the document already records, so the
+/// element lands where the hierarchy says it belongs rather than wherever this
+/// edit happened to be built.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewElement {
+    /// The tag to author, e.g. `div`.
+    pub tag: String,
+    /// Authored text content, for an object whose kind carries text.
+    pub text: Option<String>,
+    /// Declarations for the element's own inline `style`.
+    ///
+    /// Inline because that is the convention the geometry writer already follows
+    /// for an element with no authored rule of its own, and because inventing a
+    /// class would write a stylesheet rule that the author's stylesheet never
+    /// asked for.
+    pub declarations: Vec<(String, String)>,
 }
 
 /// How a moved element's new position is expressed in source.
@@ -222,7 +270,37 @@ struct SavePlan {
     html: BTreeMap<String, BTreeMap<NodeId, ElementWrite>>,
     /// Stylesheet -> the declaration value spans to replace.
     css: BTreeMap<String, Vec<CssWrite>>,
+    /// Markup file -> parent node -> the children to author inside it.
+    ///
+    /// Keyed by the *parent*, not the new node, because every child of one
+    /// parent is written as a single splice. Two insertions into the same parent
+    /// share one offset; as separate splices they would collapse into one, and
+    /// only one of the two objects would be authored.
+    creates: BTreeMap<String, BTreeMap<NodeId, PlannedInsertion>>,
+    /// Markup file -> the authored elements to take back out.
+    removes: BTreeMap<String, Vec<PlannedRemoval>>,
     unsupported: Vec<UnsupportedEdit>,
+}
+
+/// The new children of one parent element, as a single splice.
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedInsertion {
+    /// Byte offset the markup goes at, inside the parent's content.
+    at: usize,
+    /// Whitespace before `at` that the insertion replaces, so new children do
+    /// not accumulate a blank line above the parent's close tag.
+    replaces: std::ops::Range<usize>,
+    /// Every new child, each already indented and newline-terminated, in the
+    /// order the edits were resolved — which is the order they were created, so
+    /// source order and creation order agree.
+    markup: String,
+}
+
+/// One authored element to cut back out of a markup file.
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedRemoval {
+    range: ByteRange,
+    node: NodeId,
 }
 
 /// One element's planned writes, resolved against the bytes they land in.
@@ -274,9 +352,27 @@ pub fn save_project(
     // ranges were resolved against, so a splice cannot drift onto a different
     // revision of the file.
     let mut rewritten: Vec<(String, String)> = Vec::new();
-    for (file, writes) in &plan.html {
+    // Every file this save touches has to be rendered, not only the ones with an
+    // in-place edit. A file whose only change is a created element has no
+    // replacement ranges at all, and leaving it out of `rewritten` would mean the
+    // element is never written while the metadata that declares it is — which is
+    // exactly the project this save refuses to create.
+    let mut markup_files: Vec<&String> = plan.html.keys().collect();
+    for file in plan.creates.keys().chain(plan.removes.keys()) {
+        if !markup_files.contains(&file) {
+            markup_files.push(file);
+        }
+    }
+    markup_files.sort();
+    for file in markup_files {
         let original = files.text(file).expect("planned files are read");
-        rewritten.push((file.clone(), render_html(original, writes)));
+        let rendered = render_html(
+            original,
+            plan.html.get(file).unwrap_or(&BTreeMap::new()),
+            plan.creates.get(file),
+            plan.removes.get(file),
+        );
+        rewritten.push((file.clone(), rendered));
     }
     for (file, writes) in &plan.css {
         let original = files.text(file).expect("planned files are read");
@@ -386,7 +482,29 @@ impl SavePlan {
             SourceEdit::Text { node, .. } => (node, "text"),
             SourceEdit::Geometry { node, .. } => (node, "geometry"),
             SourceEdit::Style { node, .. } => (node, "style"),
+            SourceEdit::Create { node, .. } => (node, "create"),
+            SourceEdit::Remove { node, .. } => (node, "remove"),
         };
+        // A removal is answered before the document is consulted, because the node
+        // it names is gone from the document — that is what removing one means.
+        // Asking the structure first would report every delete as an unknown node.
+        if let SourceEdit::Remove { file, .. } = edit {
+            let Ok(Some(index)) = files.index(file) else {
+                return;
+            };
+            let Some(binding) = index.find(node_id) else {
+                return;
+            };
+            let range = binding.element_range.clone();
+            self.removes
+                .entry(file.clone())
+                .or_default()
+                .push(PlannedRemoval {
+                    range,
+                    node: node_id.clone(),
+                });
+            return;
+        }
         let Some(node) = document.structure.nodes.iter().find(|n| &n.id == node_id) else {
             self.report(
                 node_id,
@@ -471,6 +589,38 @@ impl SavePlan {
                         set_declaration(&mut element.declarations, property.clone(), value.clone());
                         self.remember(file, node_id, element);
                     }
+                    Err(reason) => self.report(node_id, kind, reason),
+                }
+            }
+            // Unreachable: every removal returned above, before the document was
+            // consulted. Present only so the match is total.
+            SourceEdit::Remove { .. } => {}
+            SourceEdit::Create { element, .. } => {
+                match files.insertion_point(&file, node) {
+                    Ok(Some(plan)) => {
+                        let parent = node.parent.clone().expect("a plan implies a parent");
+                        let group = self.creates.entry(file.clone()).or_default();
+                        let insertion = group.entry(parent).or_insert_with(|| PlannedInsertion {
+                            at: plan.at,
+                            replaces: plan.replaces.clone(),
+                            markup: String::new(),
+                        });
+                        // No newline before the first child: the one already in
+                        // the file leads up to the replaced indent, and adding
+                        // another would leave a blank line above every new element.
+                        insertion.markup.push_str(&plan.indent);
+                        insertion
+                            .markup
+                            .push_str(&render_new_element(node_id, element));
+                    }
+                    // The node has no authored element yet — that is what this
+                    // edit is for — so there is nothing to report and nowhere to
+                    // report it to.
+                    Ok(None) => self.report(
+                        node_id,
+                        kind,
+                        "this node already has an authored element".into(),
+                    ),
                     Err(reason) => self.report(node_id, kind, reason),
                 }
             }
@@ -801,6 +951,76 @@ impl<'a> AuthoredFiles<'a> {
         Ok(index
             .find(&node.id)
             .and_then(|binding| binding.text_range.clone()))
+    }
+
+    /// The parse for one of the project's own markup files.
+    fn index(&mut self, file: &str) -> Result<Option<&SourceIndex>, String> {
+        if !self
+            .ensure_markup(file)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(None);
+        }
+        Ok(self.indexes.get(file))
+    }
+
+    /// Where a new element for `node` should be spliced into `file`.
+    ///
+    /// `Ok(None)` when the node already has an element, because then it needs no
+    /// new one. An error carries the reason it cannot be placed.
+    ///
+    /// The insertion point is the inside of the parent's content, and the
+    /// whitespace immediately before it is replaced rather than kept, so a new
+    /// child takes the parent's indentation and leaves no blank line above the
+    /// close tag. That is what keeps the authored diff to one added line.
+    fn insertion_point(
+        &mut self,
+        file: &str,
+        node: &StructuralNode,
+    ) -> Result<Option<InsertionPoint>, String> {
+        // Already authored: this edit would give one element two identities.
+        if let Some(index) = self.index(file)? {
+            if index.find(&node.id).is_some() {
+                return Ok(None);
+            }
+        }
+        let Some(parent_id) = node.parent.clone() else {
+            return Err(format!(
+                "{file} has no parent element to write into: a created object needs a \
+                 container, because a project with nowhere to put an element cannot \
+                 be reopened"
+            ));
+        };
+        let Some(index) = self.index(file)? else {
+            return Err(unreadable(file, "this creation"));
+        };
+        // The parent must live in the same file. Authoring a child into another
+        // page would mean inventing a cross-file reference, so it is reported.
+        let Some(parent) = index.find(&parent_id) else {
+            return Err(format!(
+                "{file} has no element for the parent {}",
+                parent_id.as_str()
+            ));
+        };
+        let at = parent.content_end;
+        let (indent_start, indent) = source_binding::trailing_indent(&index.source, at);
+        // Line up with the parent's existing children when it has any, so the new
+        // element is a sibling in the author's own layout rather than at some
+        // indentation the writer invented.
+        let child_indent = index
+            .element_ranges()
+            .iter()
+            .find(|range| {
+                range.start > parent.element_range.start && range.end <= parent.element_range.end
+            })
+            .map(|first_child| line_indent(&index.source, first_child.start))
+            .filter(|candidate| !candidate.is_empty())
+            .unwrap_or_else(|| format!("{indent}  "));
+        Ok(Some(InsertionPoint {
+            at,
+            replaces: indent_start..at,
+            indent: child_indent,
+        }))
     }
 
     /// The spans one element may be written at, resolved against current bytes.
@@ -1296,7 +1516,12 @@ fn geometry_writes(
 }
 
 /// Render one markup file from the bytes its write plan was resolved against.
-fn render_html(original: &str, writes: &BTreeMap<NodeId, ElementWrite>) -> String {
+fn render_html(
+    original: &str,
+    writes: &BTreeMap<NodeId, ElementWrite>,
+    creates: Option<&BTreeMap<NodeId, PlannedInsertion>>,
+    removes: Option<&Vec<PlannedRemoval>>,
+) -> String {
     let mut replacements: Vec<(ByteRange, String)> = Vec::new();
     for write in writes.values() {
         if let Some((range, text)) = &write.text {
@@ -1322,7 +1547,44 @@ fn render_html(original: &str, writes: &BTreeMap<NodeId, ElementWrite>) -> Strin
             )),
         }
     }
+    // Creation and removal are splices on the same bytes as everything else, so
+    // they travel through the same one pass. `apply_replacements` works back to
+    // front, which is what lets an insertion and a removal in one file each land
+    // without invalidating the other's offsets.
+    for insertion in creates.into_iter().flat_map(|group| group.values()) {
+        // The replaced run is the indentation that led up to the parent's close
+        // tag, so it has to be written back: without it the new element and the
+        // close tag end up sharing a line, and the file stops looking authored.
+        let tail = original
+            .get(insertion.replaces.clone())
+            .unwrap_or_default()
+            .to_owned();
+        replacements.push((
+            insertion.replaces.clone(),
+            format!("{}\n{}", insertion.markup, tail),
+        ));
+    }
+
+    for removal in removes.into_iter().flatten() {
+        // Taking an element out also takes the line it was on. Leaving the
+        // indentation behind would leave a line of spaces where the element was.
+        let start = line_start_with_indent(original, removal.range.start);
+        replacements.push((start..removal.range.end, String::new()));
+    }
     apply_replacements(original, replacements)
+}
+
+/// Start the line `offset` is on, including its indentation.
+///
+/// Used when removing an element: the newline and the spaces before it belong to
+/// the element's line, so removing the element without them would leave a line
+/// of trailing whitespace behind.
+fn line_start_with_indent(source: &str, offset: usize) -> usize {
+    let newline = source[..offset].rfind('\n');
+    match newline {
+        Some(index) => index + 1,
+        None => 0,
+    }
 }
 
 /// One `;`-separated segment of an authored inline style.
@@ -3362,6 +3624,119 @@ mod tests {
         );
     }
 
+    // -- Created objects: the authored half.
+
+    /// A project with deliberately unusual indentation, so "indent the new
+    /// element like its siblings" and "indent it two spaces past the parent" are
+    /// different answers. Four-space children under a column-zero parent is the
+    /// only way to tell them apart.
+    fn wide_indent_project(name: &str) -> PathBuf {
+        let html = "<body>\n<main data-spool-id=\"spool-frame-root\">\n    <h1 data-spool-id=\"spool-frame-head\">Title</h1>\n</main>\n</body>\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}",
+            node_yaml("spool-frame-root", None, "\"spool-frame-head\""),
+            node_yaml("spool-frame-head", Some("spool-frame-root"), "")
+        );
+        project_files(
+            name,
+            &[("lamine.yaml", yaml.as_str()), ("index.html", html)],
+        )
+    }
+
+    /// The document as the canvas leaves it after a creation: the node is already
+    /// in the structure, and what is left for the save is the authored element.
+    fn with_created(
+        mut loaded: crate::project_open::LoadedProject,
+        id: &str,
+        parent: &str,
+    ) -> crate::project_open::LoadedProject {
+        loaded.document.structure.nodes.push(StructuralNode {
+            id: node(id),
+            name: "Created".to_owned(),
+            kind: "rectangle".to_owned(),
+            parent: Some(node(parent)),
+            children: Vec::new(),
+            source: crate::source_document::SourceBinding {
+                file: "index.html".to_owned(),
+                selector: format!("[data-spool-id=\"{id}\"]"),
+            },
+        });
+        loaded
+    }
+
+    fn new_rectangle(id: &str) -> SourceEdit {
+        SourceEdit::Create {
+            node: node(id),
+            element: NewElement {
+                tag: "div".to_owned(),
+                text: None,
+                declarations: vec![("width".to_owned(), "10px".to_owned())],
+            },
+        }
+    }
+
+    #[test]
+    fn a_created_element_is_indented_like_the_authored_children_not_the_parent() {
+        let root = wide_indent_project("wide-indent");
+        let loaded = with_created(
+            open_project(&root).expect("opens"),
+            "spool-new",
+            "spool-frame-root",
+        );
+
+        let outcome = save_project(&root, &loaded.document, &[new_rectangle("spool-new")])
+            .expect("save succeeds");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("html");
+        let created = html
+            .lines()
+            .find(|line| line.contains("spool-new"))
+            .unwrap_or_else(|| panic!("the element was authored: {html}"));
+        assert!(
+            created.starts_with("    "),
+            "four spaces, like the sibling it was created beside, not two: {created:?}"
+        );
+        assert!(
+            html.contains("\n</main>"),
+            "and the parent's close tag kept its own line: {html}"
+        );
+    }
+
+    #[test]
+    fn two_created_elements_land_inside_the_parent_in_creation_order() {
+        // Both children share one insertion point. Written as separate splices
+        // they would collapse, so only one of the two objects would exist.
+        let root = wide_indent_project("two-children");
+        let mut document = open_project(&root).expect("opens").document;
+        for id in ["spool-a", "spool-b"] {
+            document.structure.nodes.push(StructuralNode {
+                id: node(id),
+                name: id.to_owned(),
+                kind: "rectangle".to_owned(),
+                parent: Some(node("spool-frame-root")),
+                children: Vec::new(),
+                source: crate::source_document::SourceBinding {
+                    file: "index.html".to_owned(),
+                    selector: format!("[data-spool-id=\"{id}\"]"),
+                },
+            });
+        }
+
+        save_project(
+            &root,
+            &document,
+            &[new_rectangle("spool-a"), new_rectangle("spool-b")],
+        )
+        .expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("index.html")).expect("html");
+        let a = html.find("spool-a").expect("first authored");
+        let b = html.find("spool-b").expect("second authored");
+        assert!(a < b, "creation order is source order: {html}");
+        assert_eq!(html.matches("data-spool-id=").count(), 4, "both were added");
+    }
+
     #[test]
     fn written_lengths_are_readable_rather_than_binary_noise() {
         // Layout runs in f32, so the editor's own geometry arrives as
@@ -3749,4 +4124,53 @@ mod tests {
             "hierarchy survived"
         );
     }
+}
+
+/// Where a new element goes, and what it displaces to get there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InsertionPoint {
+    /// Byte offset the markup is written at.
+    at: usize,
+    /// Whitespace immediately before `at` that the insertion replaces, so the
+    /// parent keeps one newline rather than accumulating a blank line per child.
+    replaces: std::ops::Range<usize>,
+    /// The line indentation the new element is written with.
+    indent: String,
+}
+
+/// The leading whitespace of the line `offset` sits on.
+///
+/// Only spaces and tabs: the newline is left for the caller to add, because
+/// whether the new element needs one depends on whether the file uses them.
+fn line_indent(source: &str, offset: usize) -> String {
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    source[line_start..offset]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// The markup for a created object.
+///
+/// One element, carrying its identity and the appearance the editor cannot
+/// express any other way for an element that was never authored with a class to
+/// own. Nothing is written that the object does not actually have: the
+/// declarations are the ones the editor will read back, and text is escaped so
+/// what the user typed cannot become markup.
+fn render_new_element(node: &NodeId, element: &NewElement) -> String {
+    let style = merge_inline_declarations("", &element.declarations);
+    let mut markup = format!(
+        "<{tag} data-spool-id=\"{id}\"",
+        tag = element.tag,
+        id = node.as_str()
+    );
+    if !style.is_empty() {
+        markup.push_str(&format!(" style=\"{style}\""));
+    }
+    markup.push('>');
+    if let Some(text) = &element.text {
+        markup.push_str(&escape_text(text));
+    }
+    markup.push_str(&format!("</{}>", element.tag));
+    markup
 }
