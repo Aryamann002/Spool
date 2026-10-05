@@ -35,11 +35,11 @@ access is needed the first time. Once dependencies are available locally,
 `cargo build --offline` can build without network access. Avoid `cargo update`,
 which changes dependency revisions.
 
-### Opening your own project
+### Opening your own project during development
 
-Set `SPOOL_PROJECT` to a directory containing a `lamine.yaml` file. Project
-paths are resolved relative to that directory. A project typically contains
-HTML, stylesheets and the Spool structure file:
+Set `SPOOL_PROJECT` to a directory containing a `lamine.yaml` file. Project paths
+are resolved relative to that directory. A project typically contains HTML,
+stylesheets and the Spool structure file:
 
 ```text
 my-project/
@@ -48,10 +48,110 @@ my-project/
 └── styles.css
 ```
 
-The `app/fixtures/landing` and `app/fixtures/nested` directories are working
-examples. On startup, Spool reports whether the project opened successfully;
-if it fails, the reason is printed and the editor falls back to the starter
-scene.
+This is the development override described under [Projects](#projects); it
+accepts any directory holding a `lamine.yaml`, so it does not require the
+`.spool` suffix a real project has.
+
+The `app/fixtures/landing.spool`, `app/fixtures/landing`,
+`app/fixtures/nested` and `app/fixtures/awkward` directories are working
+examples. On startup, Spool reports whether the project opened successfully. If
+it fails, the reason is printed and shown in the window; the starter scene stays
+on screen but is never presented as the project.
+
+## Projects
+
+A Spool project is a **directory whose name ends in `.spool`**. That is the whole
+format. The authored HTML, CSS and SVG stay plain files on disk so they remain
+readable, diffable and editable with the author's own tools.
+
+```text
+MyProject.spool/
+├── lamine.yaml          required — Spool identity, hierarchy, bindings
+├── pages/index.html     the source the bindings point at
+├── styles/styles.css    found through the document's <link href>
+└── assets/mark.svg      referenced by the markup; never parsed as structure
+```
+
+What owns what:
+
+- `lamine.yaml` — Spool's identity, hierarchy, source bindings and provenance.
+- `*.html`, `*.css`, `*.svg` — the authored design, and the only visual truth.
+- the runtime document — derived and disposable; drop it and reopen and you get
+  equivalent state.
+
+`lamine.yaml` is versioned (`version: 1`) and read strictly. An unknown version
+or an unrecognised field is refused rather than guessed at.
+
+### What the loader requires
+
+- The path is a directory, its name ends in `.spool`, and it holds a `lamine.yaml`
+  at its root. Failing any of those means "not a Spool project".
+- Every `file` in `lamine.yaml` resolves **inside** the project root, exists, and
+  its `selector` matches exactly one element in that file. Zero matches is a
+  dangling binding; more than one is ambiguous. Neither is guessed.
+- Stylesheets are discovered by following `<link href>` the way a browser would.
+  A missing stylesheet leaves the document unstyled rather than failing the open.
+
+The `pages/`, `styles/` and `assets/` names above are what
+`app/fixtures/landing.spool` uses, **not** a requirement. Nothing in the code
+names them: each binding carries its own project-relative `file`, so a project may
+lay itself out however it likes.
+
+### Opening a project
+
+The product's own path is a command-line argument:
+
+```sh
+dist/Spool.app/Contents/MacOS/Spool ~/projects/MyProject.spool
+```
+
+With no argument, Spool opens its empty starter state. A project that fails to
+open is reported on stderr *and* shown in the window — it is never presented as
+though the starter scene were the project.
+
+### `SPOOL_PROJECT` is a development override
+
+```sh
+cd app
+SPOOL_PROJECT=./fixtures/landing cargo run
+```
+
+`SPOOL_PROJECT` still works and is still how the committed fixtures and the test
+suite are used. It is a **development and testing override, not a product
+surface**: it accepts any directory containing a `lamine.yaml` and does not
+require the `.spool` suffix, which is how the plain `app/fixtures/landing`,
+`app/fixtures/nested` and `app/fixtures/awkward` directories remain usable.
+Nothing a user can reach should depend on it. A path given on the command line
+takes precedence over it.
+
+`app/fixtures/landing.spool` is the canonical fixture: the shape a user actually
+receives. The other three fixtures are internal loader test data.
+
+### Saving
+
+`⌘S` writes back into the same project, in place:
+
+- authored `HTML`/`CSS` are rewritten only where an edit changed them, byte for
+  byte elsewhere — same whitespace, attribute order and comments;
+- `lamine.yaml` is rewritten only when the structure actually changed;
+- a save with nothing to change writes nothing at all;
+- a second save is measured from the file as it is *now*, so consecutive saves
+  compose instead of fighting.
+
+Nothing is flattened, relocated, or copied into a second store.
+
+### Verifying the project contract
+
+```sh
+cd app
+cargo test --offline spool_project::   # the .spool contract
+./mutate_spool_project.sh              # proves those tests can fail
+```
+
+`mutate_spool_project.sh` breaks one boundary rule at a time and requires a test
+to notice. Three rules inside `lifecycle::install` are reported separately as
+`RTIME`: they need a live `App`, so they are covered by running the packaged
+application rather than by a unit test.
 
 ## Package a macOS app bundle
 

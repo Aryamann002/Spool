@@ -14,6 +14,7 @@ mod shell;
 mod snap;
 pub mod source_binding;
 pub mod source_document;
+mod spool_project;
 mod style;
 mod theme;
 mod visual;
@@ -24,6 +25,18 @@ use gpui::{
 use gpui_platform::application;
 
 fn main() {
+    // Resolved before the application starts, because it is the one piece of
+    // launch state that decides what the window shows. Two projects on the
+    // command line is a mistake worth reporting rather than resolving by taking
+    // the first one.
+    let requested = match spool_project::requested_from_args(std::env::args()) {
+        Ok(requested) => requested,
+        Err(error) => {
+            eprintln!("spool_project_request failed: {error}");
+            None
+        }
+    };
+
     application().run(|cx: &mut App| {
         lifecycle::install(cx);
         cx.bind_keys([
@@ -54,7 +67,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(shell::AppShell::new),
+            move |_, cx| cx.new(|cx| shell::AppShell::new_with_project(requested.clone(), cx)),
         )
         .expect("failed to open Spool window");
         cx.activate(true);

@@ -16,8 +16,9 @@ available in the app today.
 
 ## What works today
 
-- Open an existing HTML/CSS project with its `lamine.yaml` metadata and edit it
-  through the native Canvas, Layers and Inspector.
+- Open an existing `.spool` project — an `HTML`/`CSS` project with its
+  `lamine.yaml` metadata — and edit it through the native Canvas, Layers and
+  Inspector.
 - Select and multi-select objects, move and resize them, duplicate or delete
   them in the current session, rename layers, edit text and change supported
   visual properties.
@@ -77,6 +78,18 @@ To open the included source-backed example:
 cd app
 SPOOL_PROJECT=./fixtures/landing cargo run
 ```
+
+`SPOOL_PROJECT` is a development override. A real project is a directory named
+`*.spool`, and the application opens one from its command line:
+
+```sh
+dist/Spool.app/Contents/MacOS/Spool ~/projects/MyProject.spool
+```
+
+A `.spool` project is a directory containing a `lamine.yaml` manifest beside the
+authored HTML, CSS and SVG — plain files that stay readable and editable in
+place. See [app setup guide](docs/development/getting-started.md) for the exact
+contract.
 
 The first build downloads and compiles GPUI from the pinned Zed source, so it
 can take a while and needs network access. See the

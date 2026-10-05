@@ -12,7 +12,14 @@
 //! `Window::remove_window`. The red button was already wired; only the two key
 //! equivalents were missing.
 
-use gpui::{App, KeyBinding};
+//! # MUTATION HARNESS
+//!
+//! `app/mutate_spool_project.sh` breaks one rule at a time in this file — the
+//! application menu that keeps `⌘Q` alive with no windows, the deferred window
+//! removal, the action each key dispatches — and requires the suite to notice.
+//! The script refuses to run unless it sees this marker.
+
+use gpui::{App, KeyBinding, Menu, MenuItem};
 
 gpui::actions!(
     spool_app,
@@ -38,7 +45,35 @@ pub fn bindings() -> [KeyBinding; 2] {
     ]
 }
 
-/// Bind the lifecycle keys and handle the actions they dispatch.
+/// The application menu.
+///
+/// This exists for exactly one reason, and it is not decoration.
+///
+/// Key dispatch in GPUI is *window*-scoped: a keystroke is matched against the
+/// key bindings inside the window that receives it. Close the last window and
+/// there is no window left to receive one, so `cmd-q` is never even looked at
+/// and the application cannot be quit. That is not a bug in the `Quit` handler —
+/// it is simply never reached. On macOS the state is reachable and normal: a
+/// document-based app whose last window is closed stays running and must still
+/// answer `⌘Q`.
+///
+/// A menu fixes this the way AppKit intends. A key equivalent belongs to the
+/// application menu rather than to a window, so AppKit matches it while routing
+/// the event and hands it to `NSApplication`, which reaches GPUI's
+/// `on_app_menu_action` → `App::dispatch_action`. That path does not consult the
+/// window list, so it fires with or without windows. GPUI reads the key
+/// equivalent for this item out of the keymap, which is why [`bindings`] still
+/// has to register `cmd-q`.
+///
+/// Only `Quit` appears here. `⌘W` needs no menu entry: it is pressed while a
+/// window exists, so the ordinary window-scoped binding already reaches it, and
+/// adding a Window menu would be UI this milestone has no reason to add.
+pub fn menus() -> Vec<Menu> {
+    vec![Menu::new("Spool").items([MenuItem::action("Quit Spool", Quit)])]
+}
+
+/// Bind the lifecycle keys, install the application menu, and handle the actions
+/// they dispatch.
 ///
 /// Both handlers register globally, and that is not a shortcut around a better
 /// option. An action dispatched to an element only reaches listeners along the
@@ -55,6 +90,7 @@ pub fn bindings() -> [KeyBinding; 2] {
 /// finished and put it back.
 pub fn install(cx: &mut App) {
     cx.bind_keys(bindings());
+    cx.set_menus(menus());
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &CloseWindow, cx| {
         let Some(window) = cx.active_window() else {
@@ -119,6 +155,47 @@ mod tests {
                 "{} collides with an editor shortcut",
                 keystroke(&binding)
             );
+        }
+    }
+
+    /// `⌘Q` has to survive the last window closing, and the application menu is
+    /// the only reason it does. If the Quit item is dropped, the app silently
+    /// becomes unquittable once its only window is gone — with no failing test
+    /// and no error anywhere, because key dispatch is window-scoped and simply
+    /// never looks at the binding.
+    #[test]
+    fn the_application_menu_carries_quit() {
+        let menus = menus();
+        let app_menu = menus.first().expect("an application menu is installed");
+        assert_eq!(app_menu.name, "Spool");
+        let quit = app_menu
+            .items
+            .iter()
+            .find(|item| matches!(item, MenuItem::Action { name, .. } if *name == "Quit Spool"));
+        let quit = quit.expect("the application menu offers Quit");
+        match quit {
+            MenuItem::Action { action, .. } => {
+                assert_eq!(action.name(), "spool_app::Quit")
+            }
+            _ => unreachable!("Quit is an action item"),
+        }
+    }
+
+    /// `⌘W` must not gain a menu entry. A Window-menu Close item would be a
+    /// second path to the same verb, and the distinction between closing a window
+    /// and quitting the application is the thing this module exists to keep.
+    #[test]
+    fn only_quit_is_in_the_menu() {
+        for menu in menus() {
+            for item in &menu.items {
+                match item {
+                    MenuItem::Action { name, .. } => {
+                        assert_eq!(*name, "Quit Spool", "no other menu action is expected")
+                    }
+                    MenuItem::Separator => {}
+                    _ => panic!("unexpected menu item in the application menu"),
+                }
+            }
         }
     }
 }

@@ -2,6 +2,7 @@ use gpui::{
     div, point, prelude::*, px, rgb, Context, Entity, Modifiers, Render, SharedString,
     Subscription, Window,
 };
+use std::path::PathBuf;
 
 use crate::{canvas, commands, inspector, layers::LayersView, project_open, theme};
 
@@ -17,21 +18,73 @@ const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
 
 const PAGES: [&str; 4] = ["Landing", "App", "Components", "Explorations"];
 
-/// Open the project named by `SPOOL_PROJECT`, if one was requested.
+/// Which project the application was asked to open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectRequest {
+    /// A `.spool` project named on the command line. The product's own path.
+    Project(PathBuf),
+    /// A directory named by `SPOOL_PROJECT`.
+    ///
+    /// A development and testing override, not a product surface. It accepts any
+    /// directory holding a `lamine.yaml`, which is how the committed fixtures are
+    /// used, and it deliberately does *not* require the `.spool` suffix. Nothing
+    /// a user can reach should depend on this.
+    DevelopmentOverride(PathBuf),
+}
+
+/// Decide which project this launch asked for.
 ///
-/// This is the application's only project-opening path. `SPOOL_PROJECT` points
-/// at a directory containing `lamine.yaml` and its authored source; without it
-/// the editor opens the blank starter scene exactly as before.
+/// The command line wins over the development override: a person who typed a path
+/// meant that path, and an inherited `SPOOL_PROJECT` should not quietly redirect
+/// it.
 ///
-/// A failure is reported deterministically on stderr and leaves the blank
-/// document in place. It never silently produces an empty canvas that looks
-/// like a project that happened to be empty, and it never falls back to a
-/// partially loaded document.
-fn open_requested_project(view: &mut canvas::CanvasView) {
-    let Ok(root) = std::env::var("SPOOL_PROJECT") else {
-        return;
+/// Pure, so the three states the application has to tell apart — a project, an
+/// unusable path, and nothing at all — can be decided in a test without a window.
+fn project_request(
+    requested: Option<PathBuf>,
+    development_override: Option<PathBuf>,
+) -> Option<ProjectRequest> {
+    requested
+        .map(ProjectRequest::Project)
+        .or_else(|| development_override.map(ProjectRequest::DevelopmentOverride))
+}
+
+/// `SPOOL_PROJECT`, if it is set to something.
+///
+/// A development and testing override. See [`ProjectRequest::DevelopmentOverride`].
+fn development_override() -> Option<PathBuf> {
+    std::env::var_os("SPOOL_PROJECT")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+/// Load the requested project into `view`.
+///
+/// Returns the message to show the user when the project could not be opened.
+/// Three outcomes, kept distinct because they mean different things:
+///
+/// - **no project requested** — the starter scene, which is a normal state.
+/// - **a project that opened** — loaded into the canvas.
+/// - **a project that did not open** — an error, reported on stderr *and* shown
+///   in the window. The starter scene is still what is on screen, but it is
+///   never presented as though it were the project: a named project that failed
+///   to open has failed, and saying so is the whole point of reporting it.
+fn load_requested_project(
+    request: Option<&ProjectRequest>,
+    view: &mut canvas::CanvasView,
+) -> Option<SharedString> {
+    let request = request?;
+    let (root, opened) = match request {
+        ProjectRequest::Project(path) => (
+            path.display().to_string(),
+            crate::spool_project::open(path).map_err(|error| error.to_string()),
+        ),
+        ProjectRequest::DevelopmentOverride(path) => (
+            path.display().to_string(),
+            project_open::open_project(path).map_err(|error| error.to_string()),
+        ),
     };
-    match project_open::open_project(&root) {
+    match opened {
         Ok(loaded) => {
             // Reported so a launch log shows what actually opened, rather than
             // leaving the operator to infer it from pixels.
@@ -44,9 +97,11 @@ fn open_requested_project(view: &mut canvas::CanvasView) {
                 loaded.unstyled,
             );
             view.load_project(loaded);
+            None
         }
         Err(error) => {
             eprintln!("spool_project_open failed root={root}: {error}");
+            Some(format!("Could not open {root}: {error}").into())
         }
     }
 }
@@ -68,11 +123,13 @@ pub struct AppShell {
     share_open: bool,
     export_open: bool,
     zoom_open: bool,
-    /// Result of the last save, shown over the canvas.
+    /// A message shown over the canvas, and whether it reports a failure.
     ///
-    /// Save reports what it wrote and what it could not, so the message has to
-    /// be visible: a save that silently dropped an edit would look identical to
-    /// one that persisted everything.
+    /// Carries the result of the last save and the result of opening the
+    /// requested project. Both have to be visible for the same reason: a save
+    /// that silently dropped an edit, or a project that silently failed to open
+    /// and left the starter scene on screen, would each look identical to one
+    /// that succeeded.
     save_status: Option<(SharedString, bool)>,
     /// Repaint subscriptions that must outlive this function.
     ///
@@ -85,9 +142,17 @@ pub struct AppShell {
 }
 
 impl AppShell {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    /// Open the project named on the command line.
+    ///
+    /// `requested` is the path from the process arguments. `None` — a launch with
+    /// no argument — is the ordinary empty state, and is also what the tests and
+    /// the `SPOOL_PROJECT` override rely on.
+    pub fn new_with_project(requested: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let canvas = cx.new(canvas::CanvasView::new_with_context);
-        canvas.update(cx, |view, _| open_requested_project(view));
+        let request = project_request(requested, development_override());
+        let status = canvas.update(cx, |view, _| {
+            load_requested_project(request.as_ref(), view).map(|message| (message, true))
+        });
         let layers = cx.new(|_| LayersView::new(canvas.downgrade()));
         let inspector = cx.new(|cx| inspector::Inspector::new(canvas.clone(), cx));
         // Held, not dropped: a GPUI subscription detaches its observer when it
@@ -105,7 +170,7 @@ impl AppShell {
             share_open: false,
             export_open: false,
             zoom_open: false,
-            save_status: None,
+            save_status: status,
         }
     }
 
@@ -1208,4 +1273,64 @@ fn popover_row(label: &'static str, shortcut: &'static str) -> impl IntoElement 
         .text_color(rgb(theme::TEXT_SECONDARY))
         .child(label)
         .child(div().text_color(rgb(theme::TEXT_MUTED)).child(shortcut))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(value: &str) -> PathBuf {
+        PathBuf::from(value)
+    }
+
+    /// A launch that named nothing is the ordinary empty state. It is not an
+    /// error, and it must not be reported as one.
+    #[test]
+    fn naming_no_project_is_not_an_error() {
+        assert_eq!(project_request(None, None), None);
+    }
+
+    /// A `.spool` path on the command line is the product's own way in.
+    #[test]
+    fn a_command_line_path_is_a_project_request() {
+        assert_eq!(
+            project_request(Some(path("/tmp/MyProject.spool")), None),
+            Some(ProjectRequest::Project(path("/tmp/MyProject.spool"))),
+        );
+    }
+
+    /// `SPOOL_PROJECT` still works for development, and is labelled as such
+    /// rather than being indistinguishable from the product path.
+    #[test]
+    fn the_development_override_is_a_distinct_request() {
+        assert_eq!(
+            project_request(None, Some(path("fixtures/landing"))),
+            Some(ProjectRequest::DevelopmentOverride(path(
+                "fixtures/landing"
+            ))),
+        );
+    }
+
+    /// The command line wins. A person who typed a path meant that path, and an
+    /// inherited `SPOOL_PROJECT` must not silently redirect it.
+    #[test]
+    fn the_command_line_wins_over_the_development_override() {
+        assert_eq!(
+            project_request(
+                Some(path("/tmp/MyProject.spool")),
+                Some(path("fixtures/landing")),
+            ),
+            Some(ProjectRequest::Project(path("/tmp/MyProject.spool"))),
+        );
+    }
+
+    /// The three states are genuinely distinct types, so no caller can handle an
+    /// unusable project and a missing one the same way by accident.
+    #[test]
+    fn the_two_requests_are_not_interchangeable() {
+        assert_ne!(
+            ProjectRequest::Project(path("a.spool")),
+            ProjectRequest::DevelopmentOverride(path("a.spool")),
+        );
+    }
 }
