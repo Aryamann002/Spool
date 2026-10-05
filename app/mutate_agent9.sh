@@ -358,17 +358,106 @@ source = source.replace(old, new, 1)' \
 # 22. Save measures a change from what the source currently says, so the
 #     baseline has to advance when the source is written. Pinned to the opening
 #     state it re-applies every delta on top of the last one.
+#     Re-anchored when the refresh became a per-aspect merge: the invariant under
+#     test is unchanged (the baseline must follow what was written), only the
+#     shape of the code that does it.
 run_mutation "save keeps measuring from the project opening" \
   src/canvas.rs \
-  'old = """        self.source_snapshot = self
-            .opened_state()
-            .into_iter()
-            .filter(|(node, _)| !unwritten.contains(node))
-            .collect();"""
-new = """        let _ = unwritten;"""
+  'old = """        self.source_snapshot = next;"""
+new = """        let _ = next;"""
 assert old in source, "save snapshot refresh not found"
 source = source.replace(old, new, 1)' \
   "workflow_p_undo_then_save_puts_the_authored_bytes_back"
+
+# 23. A refusal must not cost a node its baseline. Dropping the refused node
+#     entirely is what used to happen, and it turned a real conflict into a
+#     "no opened state" report and retired the edit for the rest of the session.
+run_mutation "a refused node loses its baseline" \
+  src/canvas.rs \
+  'old = """            let Some(old) = previous.get(&node) else {
+                if !whole {
+                    next.insert(node, fresh);
+                }
+                continue;
+            };"""
+new = """            if whole {
+                continue;
+            }
+            let old = &fresh;"""
+assert old in source, "refused-node baseline retention not found"
+source = source.replace(old, new, 1)' \
+  "a_refused_node_keeps_its_baseline_and_does_not_hold_back_a_node_that_saved"
+
+# 24. The keyboard camera commands answer the same question the wheel does. The
+#     gesture gate was applied to the wheel and the pinch only, so `+` mid-drag
+#     rewrote the distance already dragged.
+run_mutation "the keyboard camera ignores a live gesture" \
+  src/canvas.rs \
+  'old = """    fn camera_is_frozen(&self) -> bool {
+        self.pointer_gesture_active()
+    }"""
+new = """    fn camera_is_frozen(&self) -> bool {
+        let _ = self.pointer_gesture_active();
+        false
+    }"""
+assert old in source, "camera_is_frozen not found"
+source = source.replace(old, new, 1)' \
+  "the_keyboard_camera_commands_are_frozen_by_a_live_gesture_too"
+
+# 25. A pan on top of a live drag used to assign `Interaction::None` outright,
+#     leaving applied geometry with no history entry and nothing to restore from.
+run_mutation "a pan drops a live drag instead of giving it back" \
+  src/canvas.rs \
+  'old = """        self.abandon_interaction();
+        self.marquee = None;
+        self.pan = Some(PanGesture {"""
+new = """        self.interaction = Interaction::None;
+        self.marquee = None;
+        self.pan = Some(PanGesture {"""
+assert old in source, "begin_pan_from abandonment not found"
+source = source.replace(old, new, 1)' \
+  "a_pan_that_starts_on_top_of_a_live_drag_puts_the_drag_back"
+
+# 26. CSS ownership has to see the element's id. Dropping it is what made an
+#     `#hero { ... }` rule look unowned, so save wrote an inline declaration over
+#     the author's rule while the renderer kept honouring it.
+run_mutation "save cannot see an element id" \
+  src/project_save.rs \
+  'old = """                winning_declaration(sheet, &tag, &classes, id.as_deref(), property)"""
+new = """                winning_declaration(sheet, &tag, &classes, None, property)"""
+assert old in source, "ownership id threading not found"
+source = source.replace(old, new, 1)' \
+  "an_id_rule_owns_its_property_rather_than_being_overridden_inline"
+
+# 27. Across stylesheets the cascade is last-wins, in the order the documents
+#     link them. Taking the first match rewrote a rule that loses, so the edit
+#     appeared to do nothing.
+run_mutation "cross-sheet cascade takes the first match instead of the last" \
+  src/project_save.rs \
+  'old = """            owner = Some(StyleTarget::Declaration {
+                file: name.clone(),
+                range,
+                authored,
+            });"""
+new = """            return Ok(StyleTarget::Declaration {
+                file: name.clone(),
+                range,
+                authored,
+            });"""
+assert old in source, "cross-sheet last-wins not found"
+source = source.replace(old, new, 1)' \
+  "a_stylesheet_order_that_is_not_its_name_order_still_resolves_the_winner"
+
+# 28. The wheel handler must convert both readings at the same line height, or a
+#     notch and a trackpad pixel are governed by two literals that only agree by
+#     accident.
+run_mutation "the wheel reads only the vertical component when panning" \
+  src/canvas.rs \
+  'old = """        let mut screen_delta = point(f32::from(pixels.x), f32::from(pixels.y));"""
+new = """        let mut screen_delta = point(0.0, f32::from(pixels.y));"""
+assert old in source, "wheel pan reading not found"
+source = source.replace(old, new, 1)' \
+  "a_shifted_wheel_scrolls_sideways_without_touching_the_other_axis"
 
 if [ "$failures" -eq 0 ]; then
   echo

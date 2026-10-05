@@ -71,6 +71,16 @@ const MIN_OBJECT_SIZE: f32 = 20.0;
 /// allows.
 const DUPLICATE_OFFSET: f32 = 16.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+/// Wheel deltas are converted at this many pixels per line.
+///
+/// Named because both the pan reading and the zoom reading use it, and two
+/// independent literals that agree by accident are two literals waiting to stop
+/// agreeing.
+const WHEEL_LINE_PX: f32 = 24.0;
+
+/// How fast a wheel notch zooms, per pixel of converted delta.
+const ZOOM_WHEEL_GAIN: f32 = 0.002;
+
 /// Screen pixels left around content on each side when fitting the viewport.
 const FIT_MARGIN: f32 = 48.0;
 const RESIZE_HANDLE_SIZE: f32 = 8.0;
@@ -2382,8 +2392,12 @@ impl CanvasView {
         self.marquee = None;
         self.text_edit = None;
         // Projected objects are laid out by the projection's own placeholder
-        // rule, so fitting the camera is what actually brings them on screen.
-        self.camera.fit();
+        // rule, so fitting the camera is what actually brings them on screen —
+        // and it has to fit *these* objects. `Camera::fit` frames a fixed
+        // placeholder box, which is right for the empty starter scene and wrong
+        // for a loaded project of any other size, so a small project opened
+        // off to one side and a large one overflowed the window.
+        self.fit_canvas();
     }
 
     /// The runtime state the project was opened with, for every managed object.
@@ -2588,31 +2602,100 @@ impl CanvasView {
             };
             edits.extend(style_edits(&object.spool_id, &before.appearance, &now));
         }
-        let mut written = crate::project_save::save_project(root, &self.session.document, &edits)?;
+        // A multi-file save is not atomic, so a failure can arrive with some files
+        // already replaced. The baseline must never move past what actually
+        // reached the disk: advancing it for a file that did not land would make
+        // the next save skip an edit the user still has open, and advancing it
+        // for a file that did land is what prevents the double-apply this
+        // snapshot exists to stop.
+        //
+        // The snapshot is per *node* while a write is per *file*, and the two are
+        // not linked, so there is no honest per-node answer to give after a
+        // partial write: a node's geometry may have landed in one file while its
+        // fill was refused in another. Leaving the whole baseline where it was
+        // is the conservative choice — it can leave a file one edit ahead of the
+        // record until the project is reopened, which is recoverable, whereas
+        // guessing can corrupt an offset that then persists. Reopening re-derives
+        // the baseline from the bytes, so that is the documented way back.
+        let written = match crate::project_save::save_project(root, &self.session.document, &edits)
+        {
+            Ok(written) => written,
+            Err(failure) => {
+                if !failure.written.is_empty() {
+                    diagnostics::count("save_partial_write", 1);
+                    let unattempted: Vec<&str> = failure
+                        .unsupported
+                        .iter()
+                        .map(|edit| edit.node.as_str())
+                        .collect();
+                    eprintln!(
+                        "spool_save_partial root={} landed={} unattempted={:?} error={}",
+                        root.display(),
+                        failure.written.len(),
+                        unattempted,
+                        failure.source
+                    );
+                }
+                return Err(*failure.source);
+            }
+        };
+        let mut written = written;
         written.unsupported.append(&mut outcome.unsupported);
 
-        // The snapshot answers "what does the authored source say?", and the
-        // source was just rewritten, so the baseline moves with it.
+        // The snapshot answers "what does the authored source say?", and the source
+        // was just rewritten, so the baseline moves with it — but only as far as
+        // the write actually got.
         //
-        // Without this the comparison above stays pinned to the state the project
-        // was *opened* in, which is right for the first save and wrong for every
-        // one after it: undo puts an object back where it was authored, live then
-        // matches the opening snapshot, so save concludes nothing changed and
-        // writes nothing — leaving the file still describing the move the user
-        // just undid. The undo would hold until the next edit and a reopen would
-        // bring it back.
+        // Without any refresh the comparison above stays pinned to the state the
+        // project was *opened* in, which is right for the first save and wrong
+        // for every one after it: undo puts an object back where it was
+        // authored, live then matches the opening snapshot, so save concludes
+        // nothing changed and writes nothing — leaving the file still describing
+        // the move the user just undid.
         //
-        // A node the save *refused* keeps its old baseline on purpose. Nothing
-        // was written for it, so advancing its snapshot would retire the edit
-        // silently instead of letting the next save try again and report the same
-        // conflict.
-        let unwritten: BTreeSet<&NodeId> =
-            written.unsupported.iter().map(|edit| &edit.node).collect();
-        self.source_snapshot = self
-            .opened_state()
-            .into_iter()
-            .filter(|(node, _)| !unwritten.contains(node))
-            .collect();
+        // Refusals are honoured per *aspect*, not per node, because a save can
+        // write one thing about a node and be refused another: a geometry move
+        // that lands beside a fill the editor may not rewrite. Advancing
+        // everything would retire the refused edit silently, and advancing
+        // nothing would make the next save re-apply the part that did land —
+        // which is the double-apply this refresh exists to prevent. So each
+        // field keeps whichever answer is true of the bytes now on disk.
+        let mut refused: BTreeMap<&NodeId, BTreeSet<&'static str>> = BTreeMap::new();
+        for edit in &written.unsupported {
+            refused.entry(&edit.node).or_default().insert(edit.kind);
+        }
+        let previous = std::mem::take(&mut self.source_snapshot);
+        let mut next: BTreeMap<NodeId, SourceSnapshot> = BTreeMap::new();
+        for (node, mut fresh) in self.opened_state() {
+            let Some(kinds) = refused.get(&node) else {
+                next.insert(node, fresh);
+                continue;
+            };
+            // `object` and `unknown-node` refuse the node as a whole. With no
+            // earlier baseline to fall back on there is nothing truthful to
+            // record, so the node keeps no baseline and keeps being reported —
+            // which is the honest answer for an object this editor cannot write.
+            let whole = kinds.contains("object") || kinds.contains("unknown-node");
+            let Some(old) = previous.get(&node) else {
+                if !whole {
+                    next.insert(node, fresh);
+                }
+                continue;
+            };
+            if whole || kinds.contains("geometry") {
+                fresh.position = old.position;
+                fresh.parent_relative = old.parent_relative;
+                fresh.size = old.size;
+            }
+            if whole || kinds.contains("text") {
+                fresh.text = old.text.clone();
+            }
+            if whole || kinds.contains("style") {
+                fresh.appearance = old.appearance;
+            }
+            next.insert(node, fresh);
+        }
+        self.source_snapshot = next;
         Ok(written)
     }
 
@@ -3242,10 +3325,7 @@ impl CanvasView {
     }
 
     fn apply_selected_style(&mut self, edit: StyleEdit) -> bool {
-        if self.interaction.is_active() {
-            self.interaction.restore(&mut self.session.runtime);
-            self.interaction = Interaction::None;
-        }
+        self.abandon_interaction();
         let changes: Vec<_> = self
             .selection
             .ids()
@@ -3519,8 +3599,12 @@ impl CanvasView {
         (self.camera.zoom * 100.0).round() as u32
     }
 
-    pub fn set_zoom_percent(&mut self, zoom_percent: u32) {
+    pub fn set_zoom_percent(&mut self, zoom_percent: u32) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         self.camera.set_zoom_at_center(zoom_percent as f32 / 100.0);
+        true
     }
 
     /// Nudge every selected object by a world-space delta, as one operation.
@@ -3842,6 +3926,9 @@ impl CanvasView {
     /// user means by "zoom to fit": show me my document. It is also what
     /// `load_project` calls, so opening a project frames the project.
     pub fn fit_canvas(&mut self) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         match WorldRect::around(self.session.runtime.objects()) {
             Some(bounds) => self.camera.fit_bounds(bounds),
             None => self.camera.fit(),
@@ -3854,6 +3941,9 @@ impl CanvasView {
     /// Falls back to fitting everything when nothing is selected, because
     /// zooming to nothing has no meaning and silently doing nothing is worse.
     pub fn zoom_to_selection(&mut self) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         let selected: Vec<DesignObject> = self
             .selection
             .ids()
@@ -3872,6 +3962,9 @@ impl CanvasView {
     /// Anchored on the selection when there is one, because that is the thing
     /// the user is looking at; otherwise on the viewport centre.
     pub fn zoom_to_actual_size(&mut self) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         let anchor = self.selection_bounds_screen();
         match anchor {
             Some(screen) => self.camera.set_zoom_at(1.0, screen),
@@ -3895,6 +3988,9 @@ impl CanvasView {
     }
 
     fn zoom_by(&mut self, factor: f32) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         match self.selection_bounds_screen() {
             Some(screen) => self.camera.zoom_at(factor, screen),
             None => self.camera.set_zoom_at_center(self.camera.zoom * factor),
@@ -3923,11 +4019,87 @@ impl CanvasView {
         self.camera.viewport_contains(screen).then_some(screen)
     }
 
+    /// One wheel event, in the terms the camera works in.
+    ///
+    /// Figma: the wheel scrolls the canvas, `⇧`+wheel scrolls sideways, and
+    /// `⌘`/`Ctrl`+wheel (or a trackpad pinch) zooms. Spool accepted the wheel
+    /// only as a zoom gesture, which left a trackpad user with no way to pan at
+    /// all.
+    ///
+    /// Named rather than left inline in the listener so that the behaviour is
+    /// reachable from a test. The previous test for the `⇧` rule re-implemented
+    /// the arithmetic instead of calling this, which meant it would still have
+    /// passed with the handler deleted — a test that cannot fail is worse than
+    /// no test, because it reads as coverage.
+    fn handle_wheel(
+        &mut self,
+        delta: gpui::ScrollDelta,
+        zoom: bool,
+        shift: bool,
+        cursor: Point<f32>,
+    ) -> bool {
+        // The guard lives here rather than in the listener, so that the named
+        // production path is the whole behaviour: a caller reaching the wheel
+        // cannot get the movement without the rule that withholds it.
+        if self.workload_controls_input() || self.camera_is_frozen() {
+            return false;
+        }
+        // One line height for both readings, so a wheel notch and a trackpad
+        // pixel are converted by the same rule rather than by two literals that
+        // happen to agree today.
+        let pixels = delta.pixel_delta(gpui_px(WHEEL_LINE_PX));
+        if zoom {
+            // Only the vertical component means anything to a zoom, so a purely
+            // horizontal wheel event zooms by `exp(0)` — which is nothing, and
+            // deliberately so rather than by accident.
+            let gain = f32::from(pixels.y);
+            self.camera.zoom_at((gain * ZOOM_WHEEL_GAIN).exp(), cursor);
+            return true;
+        }
+        let mut screen_delta = point(f32::from(pixels.x), f32::from(pixels.y));
+        if shift {
+            // `⇧` turns a vertical scroll into a horizontal one, which is what
+            // every editor does because a trackpad only scrolls vertically by
+            // default.
+            //
+            // The two components are *summed* rather than swapped. A swap also
+            // rewrites the horizontal component, so a genuine diagonal scroll — a
+            // trackpad user's two fingers rarely produce a perfectly vertical
+            // delta — ends up moving less sideways and more vertically than the
+            // user asked for, on the one axis `⇧` is supposed to be suppressing.
+            screen_delta = point(screen_delta.x + screen_delta.y, 0.0);
+        }
+        self.pan_by(screen_delta)
+    }
+
+    /// Whether the camera is unavailable because a pointer gesture owns the input.
+    ///
+    /// One question for every reader. The wheel and the pinch are gated at their
+    /// handlers; this is the same rule for the keys, the zoom menu and the
+    /// arrow-key pan fallback, because the coordinate frame a gesture measures
+    /// against is the one the camera defines — a `+` pressed mid-drag rewrites
+    /// the distance already dragged exactly as a pinch does.
+    ///
+    /// Answered inside the canvas rather than in the shell so that no camera
+    /// command can reach the camera ungated from a caller that has never heard
+    /// of this rule.
+    ///
+    /// [`Camera::resize`] is deliberately *not* behind this. A window resize has
+    /// to be honoured or the projection stops matching the viewport it is drawing
+    /// into, which is a worse failure than a drag that lands oddly; it is left
+    /// alone rather than half-fixed here.
+    fn camera_is_frozen(&self) -> bool {
+        self.pointer_gesture_active()
+    }
+
     /// Pan by a screen-space delta, for wheel scrolling.
     ///
     /// Exposed so the wheel path and the space/middle-drag path share one
     /// camera rule instead of two.
     pub fn pan_by(&mut self, screen_delta: Point<f32>) -> bool {
+        if self.camera_is_frozen() {
+            return false;
+        }
         self.camera.offset.x -= screen_delta.x / self.camera.zoom;
         self.camera.offset.y -= screen_delta.y / self.camera.zoom;
         true
@@ -3952,17 +4124,40 @@ impl CanvasView {
         if self.workload_controls_input() {
             return;
         }
-        if !self.pans_with(button) {
-            return;
+        let pointer_start = point(f32::from(event.position.x), f32::from(event.position.y));
+        if self.begin_pan_from(button, pointer_start) {
+            self.capture_pointer(window);
         }
-        self.interaction = Interaction::None;
+    }
+
+    /// Give the pointer to a pan, from the camera offset it starts at.
+    ///
+    /// Split from [`Self::begin_pan`] so the policy is reachable from a test: the
+    /// mouse event is the only thing the listener has that this does not, and
+    /// keeping the event out of it is what lets the interesting half — what
+    /// happens to a gesture already in flight — be checked at all.
+    ///
+    /// A pan starting on top of a live move, resize or creation has to give that
+    /// gesture up properly. Assigning `interaction = None` on its own left the
+    /// transient geometry it had already written applied to the document with no
+    /// history entry behind it and no snapshots left to restore from — an edit the
+    /// user could neither see in the undo stack nor get back.
+    ///
+    /// Abandoning rather than committing is the choice every other interrupting
+    /// command makes, and it is the safe one: a pan means the pointer is wanted
+    /// for something else, so the drag in flight was not completed.
+    fn begin_pan_from(&mut self, button: MouseButton, pointer_start: Point<f32>) -> bool {
+        if !self.pans_with(button) {
+            return false;
+        }
+        self.abandon_interaction();
         self.marquee = None;
         self.pan = Some(PanGesture {
             button,
-            pointer_start: point(f32::from(event.position.x), f32::from(event.position.y)),
+            pointer_start,
             offset_start: self.camera.offset,
         });
-        self.capture_pointer(window);
+        true
     }
 
     fn begin_text_pointer_selection(
@@ -4677,49 +4872,22 @@ impl Render for CanvasView {
             .on_action(cx.listener(Self::text_copy))
             .on_action(cx.listener(Self::text_cut))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                if this.workload_controls_input() || this.pointer_gesture_active() {
-                    // A gesture in flight measures itself against the camera it
-                    // started with, so moving the camera now would move the
-                    // object instead of the view. See
-                    // `CanvasView::pointer_gesture_active`.
-                    return;
-                }
                 let cursor = this.cursor_in_viewport(event.position);
-                // Figma: the wheel scrolls the canvas, `⇧`+wheel scrolls
-                // sideways, and `⌘`/`Ctrl`+wheel (or a trackpad pinch) zooms.
-                // Spool accepted the wheel only as a zoom gesture, which left a
-                // trackpad user with no way to pan at all.
-                if event.modifiers.control || event.modifiers.platform {
-                    let delta = f32::from(event.delta.pixel_delta(gpui_px(24.0)).y);
-                    this.camera.zoom_at((delta * 0.002).exp(), cursor);
-                } else {
-                    let line = gpui_px(24.0);
-                    let delta = event.delta.pixel_delta(line);
-                    let mut screen_delta = point(f32::from(delta.x), f32::from(delta.y));
-                    if event.modifiers.shift {
-                        // `⇧` turns a vertical scroll into a horizontal one,
-                        // which is what every editor does because a trackpad
-                        // only scrolls vertically by default.
-                        //
-                        // The two components are *summed* rather than swapped.
-                        // A swap also rewrites the horizontal component, so a
-                        // genuine diagonal scroll — a trackpad user's two
-                        // fingers rarely produce a perfectly vertical delta —
-                        // ends up moving less sideways and more vertically than
-                        // the user asked for, on the one axis `⇧` is supposed to
-                        // be suppressing.
-                        screen_delta = point(screen_delta.x + screen_delta.y, 0.0);
-                    }
-                    this.pan_by(screen_delta);
+                if this.handle_wheel(
+                    event.delta,
+                    event.modifiers.control || event.modifiers.platform,
+                    event.modifiers.shift,
+                    cursor,
+                ) {
+                    diagnostics::count("canvas_notify", 1);
+                    cx.notify();
                 }
-                diagnostics::count("canvas_notify", 1);
-                cx.notify();
             }))
             .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
-                if this.workload_controls_input() || this.pointer_gesture_active() {
-                    // A trackpad pinch is the easy way to zoom without noticing
-                    // you did it mid-drag, so this is the case that matters:
-                    // see `CanvasView::pointer_gesture_active`.
+                // A trackpad pinch is the easy way to zoom without noticing you
+                // did it mid-drag, so this is the case that matters — and it asks
+                // the same question the wheel now asks.
+                if this.workload_controls_input() || this.camera_is_frozen() {
                     return;
                 }
                 let cursor = this.cursor_in_viewport(event.position);
@@ -6758,22 +6926,155 @@ mod tests {
     }
 
     #[test]
-    fn a_shifted_wheel_scroll_becomes_horizontal_without_touching_the_other_axis() {
-        // `⇧` is here because a trackpad only scrolls vertically. It must *add*
-        // the vertical travel to the horizontal and drop the vertical, not swap
-        // the two: a swap also rewrites a genuine horizontal component, so a
-        // diagonal scroll ends up moving less sideways and more vertically than
-        // the user asked for, on the axis `⇧` is meant to be suppressing.
-        let shifted = point(5.0, 3.0);
-        assert_eq!(
-            point(shifted.x + shifted.y, 0.0),
-            point(8.0, 0.0),
-            "the vertical travel goes sideways and stops there"
+    fn a_shifted_wheel_scrolls_sideways_without_touching_the_other_axis() {
+        // Drives `handle_wheel` — the body the listener calls — rather than
+        // restating its arithmetic. The previous version of this test computed
+        // `point(x + y, 0.0)` and asserted on the result, which would have
+        // passed with the handler deleted.
+        let mut canvas = CanvasView::new();
+        canvas.camera.resize(size(800.0, 600.0));
+        let centre = point(400.0, 300.0);
+
+        // A diagonal scroll, the case that separates summing from swapping.
+        let before = canvas.camera.offset;
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(5.0), gpui_px(3.0))),
+            false,
+            true,
+            centre,
         );
-        // A purely vertical trackpad delta, which is the case that matters:
-        // swapping and summing agree here, and only summing survives the
-        // diagonal case above.
-        assert_eq!(point(0.0 + 12.0, 0.0), point(12.0, 0.0));
+        let after = canvas.camera.offset;
+        assert_eq!(
+            after.y, before.y,
+            "the vertical travel is suppressed, so nothing moved up or down"
+        );
+        assert!(
+            after.x < before.x,
+            "and the travel went sideways instead: {:?} -> {:?}",
+            before,
+            after
+        );
+
+        // Without `⇧`, both axes move, and the vertical one by exactly its own
+        // delta — a swap would have thrown that away.
+        let before = canvas.camera.offset;
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(5.0), gpui_px(3.0))),
+            false,
+            false,
+            centre,
+        );
+        let after = canvas.camera.offset;
+        assert!(
+            after.y < before.y && after.x < before.x,
+            "an unshifted scroll uses both axes: {:?} -> {:?}",
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn a_wheel_zoom_reads_the_vertical_component_at_the_documented_gain() {
+        // The other half of the wheel, and the reason the line height and the
+        // gain are named constants: the conversion is the behaviour, so it is
+        // asserted through the handler instead of beside it.
+        let mut canvas = CanvasView::new();
+        canvas.camera.resize(size(800.0, 600.0));
+        let centre = point(400.0, 300.0);
+        assert_eq!(canvas.camera.zoom, 1.0, "the camera starts at actual size");
+
+        // A `⌘`+wheel notch: one line of travel, zoomed by the gain.
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(24.0))),
+            true,
+            false,
+            centre,
+        );
+        let notched = canvas.camera.zoom;
+        assert!(
+            notched > 1.0,
+            "a zoom wheel zooms in: {} -> {notched}",
+            canvas.camera.zoom
+        );
+        assert!(
+            (notched - (24.0f32 * ZOOM_WHEEL_GAIN).exp()).abs() < 0.0001,
+            "and by exactly the documented gain, {notched}"
+        );
+
+        // A purely horizontal wheel event carries no vertical travel, so a zoom
+        // wheel does nothing. Deliberate rather than accidental: the gain is
+        // applied to `y` because that is the axis a notch moves on.
+        let before = canvas.camera.zoom;
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(24.0), gpui_px(0.0))),
+            true,
+            false,
+            centre,
+        );
+        assert_eq!(
+            canvas.camera.zoom, before,
+            "a horizontal-only wheel event is not a zoom"
+        );
+
+        // And the inverse: the same notch downwards zooms back out.
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(-24.0))),
+            true,
+            false,
+            centre,
+        );
+        assert!(
+            canvas.camera.zoom < notched,
+            "the opposite notch zooms back out"
+        );
+    }
+
+    #[test]
+    fn a_wheel_is_refused_while_a_gesture_owns_the_pointer() {
+        // The gate the handler shares with the pinch, asserted where the wheel
+        // now goes through the same named path.
+        let mut canvas = CanvasView::new();
+        canvas.camera.resize(size(800.0, 600.0));
+        let centre = point(400.0, 300.0);
+        let id = ObjectId::LANDING;
+
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(60.0))),
+            false,
+            false,
+            centre,
+        );
+        let panned = canvas.camera.offset;
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(60.0))),
+            true,
+            false,
+            centre,
+        );
+        assert_ne!(canvas.camera.zoom, 1.0, "both work with the pointer free");
+
+        begin_live_move(&mut canvas, &[id]);
+        canvas.camera.offset = panned;
+        let zoom = canvas.camera.zoom;
+        canvas.pan = None;
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(60.0))),
+            false,
+            false,
+            centre,
+        );
+        assert_eq!(
+            canvas.camera.offset, panned,
+            "a pan wheel is refused mid-drag"
+        );
+        canvas.handle_wheel(
+            gpui::ScrollDelta::Pixels(point(gpui_px(0.0), gpui_px(60.0))),
+            true,
+            false,
+            centre,
+        );
+        assert_eq!(canvas.camera.zoom, zoom, "and so is a zoom wheel");
+        canvas.cancel_interaction();
     }
 
     #[test]
@@ -11964,6 +12265,137 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_node_keeps_its_baseline_and_does_not_hold_back_a_node_that_saved() {
+        // A refusal must be scoped to the node that earned it.
+        //
+        // The baseline refresh used to *replace* the whole map with the nodes the
+        // save accepted, so a refused node lost its baseline entirely. On the next
+        // save that node reported "no opened state to compare against" — a
+        // different and far less useful reason than the one that applies — and its
+        // edit was never attempted again. The nodes that did save were unaffected,
+        // so the bookkeeping bug looked like a per-node problem.
+        //
+        // Two buttons sharing one `.cta` rule gives exactly that shape: a fill edit
+        // on either is refused because the rule governs two elements, while a move
+        // on either lands as an inline `transform` the rule has no opinion about.
+        let root = std::env::temp_dir().join(format!(
+            "spool-refusal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create project");
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a class=\"cta\" data-spool-id=\"spool-cta-primary\">One</a>\n  <a class=\"cta\" data-spool-id=\"spool-cta-secondary\">Two</a>\n</body>\n</html>\n",
+        )
+        .expect("write html");
+        std::fs::write(root.join("styles.css"), ".cta { background: #3b5bfd; }\n")
+            .expect("write css");
+        let node = |id: &str| {
+            format!(
+                "  - id: \"{id}\"\n    name: \"{id}\"\n    kind: \"frame\"\n    parent: null\n    file: \"index.html\"\n    selector: \"[data-spool-id=\\\"{id}\\\"]\"\n    children: []\n"
+            )
+        };
+        std::fs::write(
+            root.join("lamine.yaml"),
+            format!(
+                "version: 1\nnodes:\n{}{}",
+                node("spool-cta-primary"),
+                node("spool-cta-secondary")
+            ),
+        )
+        .expect("write metadata");
+
+        let mut view = project_view(&root);
+        let refused = id_of(&view, "spool-cta-primary");
+        let saved = id_of(&view, "spool-cta-secondary");
+
+        // The node that lands: a move needs no stylesheet declaration to rewrite.
+        let resting = view.session.runtime.geometry(saved).unwrap();
+        view.selection.replace(vec![saved]);
+        begin_live_move_with_snap(&mut view, &[saved], true);
+        drag_to(&mut view, point(0.0, 30.0));
+        let moved = view.session.runtime.geometry(saved).unwrap().position;
+        assert_ne!(moved, resting.position, "the move really happened");
+
+        // The node that is refused: the `.cta` fill governs both buttons.
+        assert_eq!(
+            object_with_node(&view, "spool-cta-primary")
+                .fill
+                .map(|fill| fill.color),
+            Some(Color::from_rgb(0x3b_5b_fd)),
+            "the fill comes from the rule the two buttons share"
+        );
+        view.selection.replace(vec![refused]);
+        assert!(
+            view.apply_selected_style(StyleEdit::Fill(Some(Color::from_rgb(0xff0000)))),
+            "the style edit is a real operation"
+        );
+
+        let outcome = view.save_project().expect("first save succeeds");
+        let reported: Vec<(&str, &str)> = outcome
+            .unsupported
+            .iter()
+            .map(|edit| (edit.node.as_str(), edit.kind))
+            .collect();
+        assert!(
+            !outcome
+                .unsupported
+                .iter()
+                .any(|edit| edit.node.as_str() == "spool-cta-secondary"),
+            "the node that could be written was written: {reported:?}"
+        );
+        assert_eq!(
+            reported,
+            vec![("spool-cta-primary", "style")],
+            "and the shared rule leaves exactly the one node reported"
+        );
+
+        let css_after_first = std::fs::read_to_string(root.join("styles.css")).unwrap();
+        assert_eq!(
+            css_after_first, ".cta { background: #3b5bfd; }\n",
+            "the shared rule is untouched"
+        );
+        let html_after_first = std::fs::read_to_string(root.join("index.html")).unwrap();
+        assert!(
+            html_after_first.contains("translate(0px"),
+            "the accepted edit is in the source: {html_after_first}"
+        );
+        assert!(
+            !html_after_first.contains("background"),
+            "and the refused fill was not smuggled in as an inline override"
+        );
+
+        // The second save is the one that matters. The accepted node's baseline has
+        // advanced, so nothing is written for it again — no double-apply. The
+        // refused node still holds a baseline, so the refusal is reported as the
+        // conflict it is rather than as a missing baseline.
+        let outcome = view.save_project().expect("second save succeeds");
+        assert_eq!(
+            std::fs::read_to_string(root.join("index.html")).unwrap(),
+            html_after_first,
+            "the accepted node's baseline advanced, so its edit is not written twice"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("styles.css")).unwrap(),
+            css_after_first,
+            "and the refused rule is still untouched"
+        );
+        let again = outcome
+            .unsupported
+            .iter()
+            .find(|edit| edit.node.as_str() == "spool-cta-primary")
+            .expect("the refused node is reported again");
+        assert_eq!(again.kind, "style", "with the same kind of refusal");
+        assert!(
+            !again.reason.contains("no opened state"),
+            "and reported as the real conflict rather than a missing baseline: {}",
+            again.reason
+        );
+    }
+
+    #[test]
     fn a_style_change_rewrites_the_declaration_that_already_owns_it() {
         let root = project_scratch("landing");
         let mut view = project_view(&root);
@@ -13422,6 +13854,285 @@ mod tests {
         assert!(
             !canvas.is_manipulating(),
             "but it is not a gesture as far as the Escape ladder is concerned"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_camera_commands_are_frozen_by_a_live_gesture_too() {
+        // The wheel and the pinch are gated at their handlers; every other way
+        // the camera can move has to answer the same question, or `+` mid-drag
+        // rewrites the distance already dragged exactly as a pinch does.
+        let mut canvas = CanvasView::new();
+        canvas.camera.resize(size(800.0, 600.0));
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+
+        // With nothing in flight every one of them works.
+        assert!(canvas.zoom_in(), "zoom in works when the pointer is free");
+        assert!(canvas.zoom_out(), "zoom out works when the pointer is free");
+        assert!(
+            canvas.set_zoom_percent(100),
+            "an explicit percentage works when the pointer is free"
+        );
+        assert!(
+            canvas.fit_canvas(),
+            "zoom to fit works when the pointer is free"
+        );
+        assert!(
+            canvas.zoom_to_selection(),
+            "zoom to selection works when the pointer is free"
+        );
+        assert!(
+            canvas.zoom_to_actual_size(),
+            "zoom to actual size works when the pointer is free"
+        );
+        assert!(
+            canvas.pan_by(point(30.0, 0.0)),
+            "and so does a keyboard pan"
+        );
+
+        // Now hold a drag and try all of them again.
+        begin_live_move(&mut canvas, &[id]);
+        canvas.update_interaction(point(40.0, 0.0));
+        let zoom = canvas.camera.zoom;
+        let offset = canvas.camera.offset;
+        let live = geometry_of(&canvas, id);
+
+        assert!(!canvas.zoom_in(), "zoom in is refused");
+        assert!(!canvas.zoom_out(), "zoom out is refused");
+        assert!(
+            !canvas.set_zoom_percent(200),
+            "an explicit percentage is refused"
+        );
+        assert!(!canvas.fit_canvas(), "zoom to fit is refused");
+        assert!(!canvas.zoom_to_selection(), "zoom to selection is refused");
+        assert!(
+            !canvas.zoom_to_actual_size(),
+            "zoom to actual size is refused"
+        );
+        assert!(
+            !canvas.pan_by(point(30.0, 0.0)),
+            "a keyboard pan is refused"
+        );
+
+        assert_eq!(
+            (canvas.camera.zoom, canvas.camera.offset),
+            (zoom, offset),
+            "so the coordinate frame the gesture measures against never moved"
+        );
+        assert_eq!(
+            geometry_of(&canvas, id),
+            live,
+            "and the object is exactly where the drag had put it"
+        );
+
+        // The gesture is still the gesture: finishing it lands one entry, not two.
+        canvas.finish_interaction(point(40.0, 0.0));
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "the refused camera commands left the gesture intact"
+        );
+    }
+
+    #[test]
+    fn a_pan_that_starts_on_top_of_a_live_drag_puts_the_drag_back() {
+        // `begin_pan` used to assign `Interaction::None` outright. The drag had
+        // already written its geometry to the document, so that left an applied
+        // change with no history entry behind it and no snapshots left to restore
+        // from — an edit the user could neither see in the undo stack nor get
+        // back. The pan now goes through the same abandonment every other
+        // interrupting command uses.
+        //
+        // `begin_pan` needs a mouse event, so what is asserted is the policy it
+        // now uses: a live gesture is handed back through the central path.
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let resting = geometry_of(&canvas, id);
+
+        begin_live_move_with_snap(&mut canvas, &[id], true);
+        canvas.update_interaction(point(70.0, 40.0));
+        assert_ne!(
+            geometry_of(&canvas, id),
+            resting,
+            "the drag really did move things before the pan began"
+        );
+        assert!(canvas.interaction.is_active());
+
+        // What `begin_pan` does, in the order it does it. Driven through the same
+        // method the mouse path calls, because a test that asserted the policy
+        // separately from the caller would keep passing if the caller stopped
+        // using it.
+        assert!(
+            canvas.begin_pan_from(MouseButton::Middle, point(400.0, 300.0)),
+            "the middle button starts a pan"
+        );
+        assert!(canvas.pan.is_some(), "and the pan is live");
+
+        assert_eq!(
+            geometry_of(&canvas, id),
+            resting,
+            "the document is back where the drag started"
+        );
+        assert!(
+            !canvas.session.history.can_undo(),
+            "and nothing was recorded for an abandoned drag"
+        );
+        assert!(!canvas.interaction.is_active());
+    }
+
+    #[test]
+    fn a_style_edit_that_interrupts_a_duplicate_drag_leaves_no_dead_selection() {
+        // The same hole `abandon_interaction` was introduced to close, in the one
+        // interrupting command that was still open-coded: `apply_selected_style`
+        // restored the gesture — which removes the `⌥`-drag's copies — but never
+        // reconciled the selection those copies had been handed. The Inspector's
+        // preset chips reach this path, so applying one mid-drag left the panel
+        // selecting objects the document no longer had.
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let original = geometry_of(&canvas, id);
+
+        begin_live_move_with_modifiers(&mut canvas, &[id], true, true);
+        canvas.update_interaction(point(60.0, 40.0));
+        let copies: Vec<ObjectId> = canvas.selection.ids().to_vec();
+        assert_eq!(copies.len(), 1, "the drag handed the selection to the copy");
+
+        // Whether this changes anything depends on what is left selected once the
+        // copies are gone, and that is not what this test is about.
+        let _ = canvas.apply_selected_style(StyleEdit::Opacity(0.5));
+
+        for copy in &copies {
+            assert!(
+                canvas.session.runtime.object(*copy).is_none(),
+                "the interrupt took the copy out of the document"
+            );
+        }
+        assert_eq!(
+            geometry_of(&canvas, id),
+            original,
+            "and put the original back"
+        );
+        assert!(
+            !canvas
+                .selection
+                .ids()
+                .iter()
+                .any(|held| copies.contains(held)),
+            "so the selection cannot still be naming it: {:?}",
+            canvas.selection.ids()
+        );
+        for held in canvas.selection.ids() {
+            assert!(
+                canvas.session.runtime.object(*held).is_some(),
+                "every selected id still names a live object: {held:?}"
+            );
+        }
+        assert!(
+            !canvas.session.history.can_undo(),
+            "and an abandoned drag is still not an edit"
+        );
+    }
+
+    #[test]
+    fn a_style_edit_interrupting_a_plain_drag_restores_it_and_then_applies() {
+        // The same command, on a drag that has not duplicated anything, so the
+        // selection survives the abandon and the edit has something to act on.
+        // Both halves matter: the drag must be given up cleanly, and the command
+        // the user actually asked for must still happen.
+        let mut canvas = CanvasView::new();
+        let id = ObjectId::LANDING;
+        canvas.selection.click_flat(Some(id), false);
+        let resting = geometry_of(&canvas, id);
+
+        begin_live_move_with_snap(&mut canvas, &[id], true);
+        canvas.update_interaction(point(70.0, 40.0));
+        assert_ne!(geometry_of(&canvas, id), resting);
+
+        assert!(
+            canvas.apply_selected_style(StyleEdit::Opacity(0.5)),
+            "the style edit applies to what is still selected"
+        );
+        assert_eq!(
+            geometry_of(&canvas, id),
+            resting,
+            "and the interrupted drag was put back rather than left applied"
+        );
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            1,
+            "one entry: the style edit. The abandoned drag recorded nothing."
+        );
+        assert!(canvas.undo_history());
+        assert_eq!(
+            canvas
+                .session
+                .runtime
+                .appearance(id)
+                .map(|a| a.style.opacity),
+            Some(1.0),
+            "and undo reverts the style edit, not a drag the user never completed"
+        );
+    }
+
+    #[test]
+    fn opening_a_project_frames_the_projects_own_objects() {
+        // `load_project` called `Camera::fit`, which frames a fixed placeholder
+        // box. That is right for the empty starter scene and wrong for every
+        // other project: a small one opened off to one side and a large one
+        // overflowed the window, because the camera was framing a box the
+        // document had no relationship to.
+        //
+        // The claim is that the viewport ends up containing the objects the
+        // project actually has — checked against their real bounds rather than
+        // against the placeholder constants.
+        let root = project_scratch("landing");
+        let mut view = project_view(&root);
+        // The camera cannot frame anything until it knows how big the window is,
+        // and `resize` applies the fit the load asked for.
+        assert!(view.camera.resize(size(800.0, 600.0)));
+
+        let bounds = WorldRect::around(view.session.runtime.objects()).expect("objects");
+        let width = bounds.width();
+        let height = bounds.height();
+        assert!(
+            width > 0.0 && height > 0.0,
+            "the fixture is a real document, not an empty one"
+        );
+
+        let viewport = view.camera.viewport;
+        let visible = |world: gpui::Point<f32>| view.camera.world_to_screen(world);
+        for corner in [
+            bounds.min,
+            point(bounds.max.x, bounds.min.y),
+            point(bounds.min.x, bounds.max.y),
+            bounds.max,
+        ] {
+            let screen = visible(corner);
+            assert!(
+                screen.x >= -1.0 && screen.x <= viewport.width + 1.0,
+                "the project's own corner is inside the viewport: {screen:?}"
+            );
+            assert!(
+                screen.y >= -1.0 && screen.y <= viewport.height + 1.0,
+                "and inside it vertically too: {screen:?}"
+            );
+        }
+
+        // And the fit is a real fit rather than the placeholder box: a camera
+        // framing `WORLD_BOUNDS` would put a project this size somewhere else
+        // entirely, so pinning the zoom to the bounds-derived value is what makes
+        // the test fail if the old call comes back.
+        let margin = 48.0_f32;
+        let expected = ((viewport.width - margin * 2.0) / width)
+            .min((viewport.height - margin * 2.0) / height)
+            .clamp(MIN_ZOOM, MAX_ZOOM);
+        assert!(
+            (view.camera.zoom - expected).abs() < 0.001,
+            "the zoom is the one the project's bounds imply: {} vs {expected}",
+            view.camera.zoom
         );
     }
 

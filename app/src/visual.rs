@@ -278,7 +278,7 @@ const VOID_ELEMENTS: &[&str] = &[
 fn element_facts(index: &SourceIndex, element_range: std::ops::Range<usize>) -> ElementFacts {
     let source = index.source.as_str();
     let fragment = source.get(element_range).unwrap_or("");
-    let (tag, classes, id) = element_identity_of(fragment);
+    let (tag, classes, id) = element_identity(fragment);
     let open_tag_end = fragment.find('>').unwrap_or(fragment.len());
     let inline = inline_declarations(&fragment[..open_tag_end]);
     // Text is the element's own content, minus its tags. Nested elements'
@@ -336,15 +336,17 @@ fn longhand_of(property: &str) -> String {
 /// module resolves style against, and two readers of an open tag would be two
 /// chances to disagree about who owns a declaration.
 ///
+/// All three, because the cascade needs all three. The id was previously
+/// dropped here and read from a private twin instead, which is how the renderer
+/// ended up honouring a `#hero { … }` rule that save concluded did not exist and
+/// overrode with an inline declaration. One function returning everything the
+/// cascade matches on means a caller cannot forget the id by accident: the
+/// tuple arity is the compiler's problem.
+///
 /// Attributes are read from the element's own open tag only. Searching the
 /// whole fragment would pick up a child's `class` and style the parent as if it
 /// carried it.
-pub fn element_identity(fragment: &str) -> (String, Vec<String>) {
-    let (tag, classes, _) = element_identity_of(fragment);
-    (tag, classes)
-}
-
-fn element_identity_of(fragment: &str) -> (String, Vec<String>, Option<String>) {
+pub fn element_identity(fragment: &str) -> (String, Vec<String>, Option<String>) {
     let mut tag = String::new();
     if let Some(open) = fragment.find('<') {
         let rest = &fragment[open + 1..];
@@ -459,7 +461,7 @@ fn strip_tags(fragment: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The project's stylesheets, in the order the documents link them.
+/// The names of the project's stylesheets, in the order the cascade walks them.
 ///
 /// Cascade order across files is document order: the sheet a `<link>` appears
 /// later in wins, exactly as in a browser. Sorting by filename instead would
@@ -468,34 +470,46 @@ fn strip_tags(fragment: &str) -> String {
 ///
 /// Sheets that nothing links are appended in name order, so the list stays
 /// total and does not depend on hash iteration.
-fn collect_stylesheets(document: &PersistentDocument) -> Vec<(String, Stylesheet)> {
-    let mut pages: Vec<&String> = document
-        .sources
+///
+/// Public because save needs the same order. It used to sort names
+/// alphabetically while the renderer walked link order, so a project whose
+/// alphabetical order differed from its link order could have a save rewrite a
+/// declaration that did not control the rendered value. One traversal, so the
+/// two cannot disagree about which file won.
+///
+/// Returns names only. Takes the source map rather than the document because
+/// the two callers that share this order do not have the same document: the
+/// renderer parses each sheet from [`PersistentDocument::sources`], while save
+/// must parse from the bytes on disk. Sharing the *order* is the point, and
+/// sharing the bytes would be wrong.
+pub fn stylesheet_order(sources: &std::collections::HashMap<String, String>) -> Vec<String> {
+    let mut pages: Vec<&String> = sources
         .keys()
         .filter(|name| name.ends_with(".html"))
         .collect();
     pages.sort();
     let mut order: Vec<String> = Vec::new();
     for page in pages {
-        let Some(contents) = document.sources.get(page) else {
+        let Some(contents) = sources.get(page) else {
             continue;
         };
         for href in linked_stylesheets(contents, page) {
-            if document.sources.contains_key(&href) && !order.contains(&href) {
+            if sources.contains_key(&href) && !order.contains(&href) {
                 order.push(href);
             }
         }
     }
-    for name in document
-        .sources
-        .keys()
-        .filter(|name| name.ends_with(".css"))
-    {
+    for name in sources.keys().filter(|name| name.ends_with(".css")) {
         if !order.contains(name) {
             order.push(name.clone());
         }
     }
     order
+}
+
+/// [`stylesheet_order`], with each name paired with its parsed stylesheet.
+fn collect_stylesheets(document: &PersistentDocument) -> Vec<(String, Stylesheet)> {
+    stylesheet_order(&document.sources)
         .into_iter()
         .map(|name| {
             let contents = document
@@ -1116,7 +1130,7 @@ fn unmanaged_wrappers(source: &str, start: usize) -> Vec<Wrapper> {
         // Read the open tag through the same readers a node's own facts use, so
         // a wrapper's classes and id are extracted exactly one way.
         let reconstructed = format!("<{tag}>");
-        let (parsed_tag, classes, id) = element_identity_of(&reconstructed);
+        let (parsed_tag, classes, id) = element_identity(&reconstructed);
         open.push(Wrapper {
             tag: parsed_tag,
             classes,
@@ -2153,16 +2167,23 @@ mod tests {
         // Attribute lookup was a substring search, so `data-class` matched `class`
         // and `data-style` matched `style`. A framework's data attributes would
         // silently become the element's styling.
-        let (tag, classes) =
-            element_identity("<div data-class=\"bad\" class=\"good\" data-spool-id=\"s\">x</div>");
+        let (tag, classes, id) = element_identity(
+            "<div data-class=\"bad\" class=\"good\" id=\"real\" data-spool-id=\"s\">x</div>",
+        );
         assert_eq!(tag, "div");
         assert_eq!(
             classes,
             vec!["good".to_owned()],
             "only the real `class` attribute"
         );
-        let (_, none) = element_identity("<div data-style=\"x\" class=\"y\">z</div>");
+        assert_eq!(
+            id.as_deref(),
+            Some("real"),
+            "and the id reaches the caller, because the cascade matches on it"
+        );
+        let (_, none, absent) = element_identity("<div data-style=\"x\" class=\"y\">z</div>");
         assert_eq!(none, vec!["y".to_owned()]);
+        assert_eq!(absent, None, "an element with no `id` says so");
         assert!(
             inline_declarations("<div data-style=\"background-color: red\">").is_empty(),
             "and an authored `data-style` is not an inline style"

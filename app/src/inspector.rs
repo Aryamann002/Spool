@@ -679,13 +679,24 @@ impl Property {
     }
 
     /// How this property is spelled for one geometry.
+    ///
+    /// Every variant is named, including the ones that have no place in a box.
+    /// A wildcard here used to answer `0.0` for anything it did not recognise,
+    /// so a property added later would read zero rather than fail to compile —
+    /// and a field showing `0` for a property it has never heard of looks like a
+    /// real value. Naming them makes the compiler the thing that notices.
     fn read_geometry(self, geometry: canvas::Geometry) -> f32 {
         match self {
             Self::X => geometry.position.x,
             Self::Y => geometry.position.y,
             Self::Width => geometry.size.width,
             Self::Height => geometry.size.height,
-            _ => 0.0,
+            // Paint and typography properties are not box numbers. The panel only
+            // asks for geometry where `is_continuous` is true, which is exactly
+            // this set, so this arm is unreachable from the panel today — and
+            // saying so explicitly is what keeps a new property from inheriting a
+            // silent zero.
+            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => 0.0,
         }
     }
 
@@ -702,7 +713,10 @@ impl Property {
             Self::Y => next.position.y = value,
             Self::Width => next.size.width = floor_size(value),
             Self::Height => next.size.height = floor_size(value),
-            _ => {}
+            // As in `read_geometry`: named rather than wildcard, so writing a
+            // number into a property with no box to write it into has to be a
+            // deliberate act instead of a silently ignored one.
+            Self::BorderRadius | Self::Opacity | Self::StrokeWidth | Self::FontSize => {}
         }
         next
     }
@@ -715,7 +729,11 @@ impl Property {
             Self::Opacity => canvas::StyleEdit::Opacity(value),
             Self::StrokeWidth => canvas::StyleEdit::StrokeWidth(value),
             Self::FontSize => canvas::StyleEdit::FontSize(value),
-            _ => return None,
+            // A geometry property commits a `Geometry` command instead, so it has
+            // no style edit. `None` is the real answer rather than a fallthrough:
+            // naming the four is what makes a ninth variant a compile error here
+            // instead of a property that quietly never commits.
+            Self::X | Self::Y | Self::Width | Self::Height => return None,
         })
     }
 

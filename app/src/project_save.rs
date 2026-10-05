@@ -158,6 +158,55 @@ pub struct SaveOutcome {
     pub unsupported: Vec<UnsupportedEdit>,
 }
 
+/// A save that failed part-way through.
+///
+/// Multi-file writes are **not** atomic, and this type exists so that is visible
+/// rather than implied. Each individual file is replaced atomically — a sibling
+/// temporary and a rename — so no file is ever half-written. The *set* is
+/// different: `lamine.yaml` is written last precisely because a crash between
+/// two renames should leave metadata that still matches the source it was
+/// written against, but nothing rolls a file that already landed back off the
+/// disk.
+///
+/// So a failure can arrive with some files persisted and some not, and a caller
+/// keeping per-file state has to be able to tell which is which. Returning a
+/// bare [`BundleError`] would say only that something failed, and a caller would
+/// reasonably conclude nothing was written.
+#[derive(Debug)]
+pub struct SaveError {
+    /// What went wrong.
+    ///
+    /// Boxed because [`BundleError`] is itself a wide enum, and carrying it by
+    /// value made every `Result` in the save path expensive to move.
+    pub source: Box<BundleError>,
+    /// Files that were replaced before the failure. These *are* on disk, so
+    /// anything that tracks "what does the source say" must treat them as
+    /// persisted rather than assume the save was a no-op.
+    pub written: Vec<PathBuf>,
+    /// Edits that were planned but never reached, because the failure came first.
+    pub unsupported: Vec<UnsupportedEdit>,
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl From<BundleError> for SaveError {
+    /// A failure before any file was reached. `written` is empty because
+    /// nothing was replaced.
+    fn from(source: BundleError) -> Self {
+        Self {
+            source: Box::new(source),
+            written: Vec::new(),
+            unsupported: Vec::new(),
+        }
+    }
+}
+
 /// Everything one save intends to do, decided before a byte is written.
 ///
 /// The phases are separate on purpose. Every edit is resolved against the
@@ -205,11 +254,15 @@ struct CssWrite {
 ///
 /// Returns what was written and what was not, so a caller never has to guess
 /// whether an edit survived.
+///
+/// A multi-file save is not atomic — see [`SaveError`] — so the failure case
+/// carries the files that did land rather than reporting only that something
+/// broke.
 pub fn save_project(
     root: &Path,
     document: &PersistentDocument,
     edits: &[SourceEdit],
-) -> Result<SaveOutcome, BundleError> {
+) -> Result<SaveOutcome, SaveError> {
     // Phase 1 — resolve every edit against the bytes on disk right now.
     let mut files = AuthoredFiles::from_disk(root, document);
     let mut plan = SavePlan::default();
@@ -291,13 +344,27 @@ pub fn save_project(
         written: Vec::new(),
         unsupported: plan.unsupported,
     };
-    for (file, contents) in &rewritten {
-        let original = files.text(file).expect("planned files are read");
-        write_if_changed(&resolve(root, file)?, original, contents, &mut outcome)?;
-    }
-    if let Some(encoded) = metadata {
-        crate::project_bundle::write_atomically(&metadata_path, encoded.as_bytes())?;
-        outcome.written.push(metadata_path);
+    // Authored files first, then metadata, with the partial outcome carried out
+    // of a failure: everything in `outcome.written` at the moment of the error is
+    // on disk, and a caller whose bookkeeping depends on that has to be able to
+    // see it.
+    let write_all = || -> Result<(), BundleError> {
+        for (file, contents) in &rewritten {
+            let original = files.text(file).expect("planned files are read");
+            write_if_changed(&resolve(root, file)?, original, contents, &mut outcome)?;
+        }
+        if let Some(encoded) = metadata {
+            crate::project_bundle::write_atomically(&metadata_path, encoded.as_bytes())?;
+            outcome.written.push(metadata_path);
+        }
+        Ok(())
+    };
+    if let Err(source) = write_all() {
+        return Err(SaveError {
+            source: Box::new(source),
+            written: outcome.written,
+            unsupported: outcome.unsupported,
+        });
     }
     Ok(outcome)
 }
@@ -547,12 +614,7 @@ struct AuthoredFiles<'a> {
     indexes: BTreeMap<String, SourceIndex>,
     /// Stylesheets, parsed, in the order [`Self::sheet_names`] gives.
     sheets: BTreeMap<String, Stylesheet>,
-    /// Tag and classes of every element per markup file.
-    ///
-    /// Read exactly the way the renderer reads them. Two readers of an
-    /// element's identity would be two chances to disagree about which
-    /// declaration owns a property, and an ownership answer that disagrees with
-    /// the cascade would write to the wrong span.
+    /// Tag, classes and id of every element per markup file.
     identities: BTreeMap<String, Vec<ElementIdentity>>,
     /// The stylesheets this project owns, in cascade order.
     sheet_names: Vec<String>,
@@ -561,7 +623,15 @@ struct AuthoredFiles<'a> {
 }
 
 /// What the renderer calls one element's tag and classes.
-type ElementIdentity = (String, Vec<String>);
+/// Tag, classes and id of every element per markup file.
+///
+/// Read exactly the way the renderer reads them, id included, because that is
+/// what the cascade matches on. Two readers of an element's identity would be
+/// two chances to disagree about which declaration owns a property, and an
+/// ownership answer that disagrees with the cascade would write to the wrong
+/// span — or, when the id is dropped, conclude the element has no authored
+/// owner at all and paper over an `#id` rule with an inline declaration.
+type ElementIdentity = (String, Vec<String>, Option<String>);
 
 impl<'a> AuthoredFiles<'a> {
     /// Read from the project on disk. What a save uses.
@@ -575,12 +645,7 @@ impl<'a> AuthoredFiles<'a> {
     /// is the only description of the project to hand. Nothing is written from
     /// here, so there is nothing for the missing structure to plan against.
     fn from_snapshot(sources: &'a std::collections::HashMap<String, String>) -> Self {
-        let mut sheets: Vec<String> = sources
-            .keys()
-            .filter(|name| name.ends_with(".css"))
-            .cloned()
-            .collect();
-        sheets.sort();
+        let sheets = crate::visual::stylesheet_order(sources);
         let mut markup: Vec<String> = sources
             .keys()
             .filter(|name| is_markup(name))
@@ -599,16 +664,11 @@ impl<'a> AuthoredFiles<'a> {
     }
 
     fn new(origin: Origin<'a>, document: &PersistentDocument) -> Self {
-        // Both lists are sorted so an answer never depends on the order a hash
-        // map happens to iterate in, and so the stylesheet order matches the
-        // order the cascade itself walks.
-        let mut sheets: Vec<String> = document
-            .sources
-            .keys()
-            .filter(|name| name.ends_with(".css"))
-            .cloned()
-            .collect();
-        sheets.sort();
+        // Cascade order is the order the documents link the sheets, not their
+        // names: the renderer walks [`crate::visual::stylesheet_order`], and
+        // answering with a different order here would let a save rewrite a
+        // declaration that does not control the rendered value.
+        let sheets = crate::visual::stylesheet_order(&document.sources);
         let mut markup: Vec<String> = document
             .sources
             .keys()
@@ -847,7 +907,7 @@ impl<'a> AuthoredFiles<'a> {
         let Some(fragment) = index.source.get(binding.element_range.clone()) else {
             return Err(format!("this node's element in {file} could not be read"));
         };
-        let (tag, classes) = crate::visual::element_identity(fragment);
+        let (tag, classes, id) = crate::visual::element_identity(fragment);
 
         let open_end = fragment.find('>').unwrap_or(fragment.len());
         if let Some(declared) = inline_segments(&fragment[..open_end])
@@ -865,11 +925,22 @@ impl<'a> AuthoredFiles<'a> {
             return self.authored_inline(property, authored, ownership);
         }
 
+        // Across files the cascade is last-wins: `self.sheet_names` is in the order
+        // the documents link the sheets, and a sheet linked later overrides an
+        // earlier one. So the owner is the *last* sheet with a winning
+        // declaration, not the first — which is the opposite of what this loop
+        // used to do, and disagreed with the renderer for any project whose
+        // sheets are linked in an order that is not their name order.
+        //
+        // The rewindability check runs on the sheet that actually won, because
+        // that is the only one an edit here would be rewriting.
+        let mut owner: Option<StyleTarget> = None;
         for name in &self.sheet_names {
             let Some(sheet) = self.sheets.get(name) else {
                 return Err(unreadable(name, property));
             };
-            let Some((range, spelling)) = winning_declaration(sheet, &tag, &classes, property)
+            let Some((range, spelling)) =
+                winning_declaration(sheet, &tag, &classes, id.as_deref(), property)
             else {
                 continue;
             };
@@ -880,15 +951,14 @@ impl<'a> AuthoredFiles<'a> {
                 .unwrap_or("")
                 .to_owned();
             self.check_rewritable(name, &range, &spelling, &authored, ownership)?;
-            return Ok(StyleTarget::Declaration {
+            owner = Some(StyleTarget::Declaration {
                 file: name.clone(),
                 range,
                 authored,
             });
         }
-
         // Nothing authored here, so the element itself becomes the owner.
-        Ok(StyleTarget::Element { authored: None })
+        Ok(owner.unwrap_or(StyleTarget::Element { authored: None }))
     }
 
     /// Guard the two ways rewriting a declaration would not mean what it says.
@@ -953,8 +1023,8 @@ impl<'a> AuthoredFiles<'a> {
         };
         let mut owners = 0;
         for census in self.identities.values() {
-            for (tag, classes) in census {
-                if stylesheet.declaration_value_range(tag, classes, None, spelling)
+            for (tag, classes, id) in census {
+                if stylesheet.declaration_value_range(tag, classes, id.as_deref(), spelling)
                     == Some((range.start, range.end))
                 {
                     owners += 1;
@@ -1007,13 +1077,14 @@ fn winning_declaration(
     stylesheet: &Stylesheet,
     tag: &str,
     classes: &[String],
+    id: Option<&str>,
     property: &str,
 ) -> Option<(ByteRange, String)> {
     ownership_spellings(property)
         .into_iter()
         .find_map(|spelling| {
             stylesheet
-                .declaration_value_range(tag, classes, None, spelling)
+                .declaration_value_range(tag, classes, id, spelling)
                 .map(|(start, end)| (start..end, spelling.to_owned()))
         })
 }
@@ -1504,6 +1575,9 @@ mod tests {
     use super::*;
     use crate::project_open::open_project;
     use crate::source_document::NodeId;
+    // `from_mode` is how a directory is made read-only, which is how the
+    // partial-write test refuses a write without touching any editor code.
+    use std::os::unix::fs::PermissionsExt;
 
     /// Copy a fixture so a save never touches the committed files.
     fn scratch(fixture: &str) -> PathBuf {
@@ -1875,7 +1949,7 @@ mod tests {
         );
 
         assert!(
-            matches!(outcome, Err(BundleError::MalformedMetadata { .. })),
+            matches!(outcome, Err(ref failure) if matches!(*failure.source, BundleError::MalformedMetadata { .. })),
             "the unencodable structure is reported: {outcome:?}"
         );
         for (path, contents) in before {
@@ -2029,6 +2103,235 @@ mod tests {
             css,
             &read(&root.join("styles.css")),
             &[("background: #222222", "background: #ff0000")],
+        );
+    }
+
+    // -- Selector identity: the ownership answer must be the cascade's answer.
+    //
+    // Every one of these failed the same way before element identity carried the
+    // id: ownership was resolved from tag and classes alone, so a property held
+    // by a `#id` rule looked unowned and save papered over it with an inline
+    // declaration. The renderer honoured the rule, so the file and the screen
+    // disagreed about who owned the value.
+
+    /// One element whose `background` is owned by an `#id` rule.
+    ///
+    /// The edit must land in the author's rule. Writing an inline override
+    /// instead would be indistinguishable from the bug: the fill would still be
+    /// red on screen, and the author's `#hero` rule would silently stop
+    /// governing the element it was written for.
+    fn id_owned_project(name: &str, html: &str, css: &str) -> PathBuf {
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        let root = project_named(name, html, Some(css), &yaml);
+        assert!(
+            open_project(&root).is_ok(),
+            "the fixture is a project that opens"
+        );
+        root
+    }
+
+    #[test]
+    fn an_id_rule_owns_its_property_rather_than_being_overridden_inline() {
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        let css = ".cta { border-radius: 4px; }\n#hero { background: #222222; }\n";
+        let root = id_owned_project("id-owned", html, css);
+        let loaded = open_project(&root).expect("opens");
+
+        // What the renderer resolves is the check that matters: the ownership
+        // answer has to be about the declaration the cascade actually picked.
+        assert_eq!(
+            loaded
+                .runtime
+                .object(
+                    loaded
+                        .runtime
+                        .objects()
+                        .iter()
+                        .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+                        .expect("projected")
+                        .id,
+                )
+                .and_then(|object| object.fill)
+                .map(|fill| fill.color.to_rgb()),
+            Some(0x22_22_22),
+            "the `#hero` rule is what the element is drawn from"
+        );
+
+        let outcome = save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save");
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        assert_only(
+            css,
+            &read(&root.join("styles.css")),
+            &[(
+                "#hero { background: #222222;",
+                "#hero { background: #ff0000;",
+            )],
+        );
+        assert!(
+            !read(&root.join("index.html")).contains("background"),
+            "and no inline override was invented on top of the author's rule"
+        );
+    }
+
+    #[test]
+    fn a_type_rule_and_a_class_rule_still_own_their_properties() {
+        // The cases that already worked, pinned so the `#id` fix did not buy
+        // them by breaking them: ownership follows the cascade for a type
+        // selector and for a class selector, and neither grows an inline
+        // override.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        let css = "a { color: #808080; }\n.cta { background: #222222; }\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        let root = project_named("type-and-class", html, Some(css), &yaml);
+        let loaded = open_project(&root).expect("opens");
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[
+                SourceEdit::Style {
+                    node: node("spool-cta-primary"),
+                    property: "background".into(),
+                    value: "#ff0000".into(),
+                },
+                SourceEdit::Style {
+                    node: node("spool-cta-primary"),
+                    property: "color".into(),
+                    value: "#00ff00".into(),
+                },
+            ],
+        )
+        .expect("save");
+
+        assert_only(
+            css,
+            &read(&root.join("styles.css")),
+            &[
+                ("background: #222222", "background: #ff0000"),
+                ("color: #808080", "color: #00ff00"),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_inline_style_still_outranks_the_stylesheet_and_is_edited_in_place() {
+        // The inline branch runs before any rule is consulted, so adding the id
+        // to the cascade query must not have reordered it.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a id=\"hero\" class=\"cta\" style=\"background: #333333\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        let css = "#hero { background: #222222; }\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        let root = project_named("inline-beats-id", html, Some(css), &yaml);
+        let loaded = open_project(&root).expect("opens");
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save");
+
+        assert!(
+            read(&root.join("index.html")).contains("background: #ff0000"),
+            "the inline declaration is the owner and is rewritten: {}",
+            read(&root.join("index.html"))
+        );
+        assert_eq!(
+            read(&root.join("styles.css")),
+            css,
+            "and the `#hero` rule is left exactly as authored"
+        );
+    }
+
+    #[test]
+    fn a_selector_naming_both_an_id_and_a_class_matches_the_element_it_describes() {
+        // `#hero.cta` is in the supported subset, and it is the case that would
+        // break if only the id were threaded through and the classes dropped.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        let css = ".cta { color: #808080; }\n#hero.cta { background: #222222; }\n";
+        let root = id_owned_project("id-and-class", html, css);
+        let loaded = open_project(&root).expect("opens");
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_only(
+            css,
+            &read(&root.join("styles.css")),
+            &[(
+                "#hero.cta { background: #222222;",
+                "#hero.cta { background: #ff0000;",
+            )],
+        );
+    }
+
+    #[test]
+    fn an_id_rule_shared_by_two_elements_is_reported_rather_than_rewritten() {
+        // The exclusive-ownership guard has to keep working now that `#id` rules
+        // are visible to it. A rule that governs two elements is not this
+        // element's to rewrite, and the count is taken with the same query that
+        // found the declaration — id included — so it sees both owners.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"styles.css\" /></head>\n<body>\n  <a id=\"hero\" class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n  <a id=\"hero\" class=\"cta\" data-spool-id=\"spool-frame-root\">Also</a>\n</body>\n</html>\n";
+        let css = "#hero { background: #222222; }\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}{}",
+            node_yaml("spool-cta-primary", None, ""),
+            node_yaml("spool-frame-root", None, "")
+        );
+        let root = project_named("id-shared", html, Some(css), &yaml);
+        let loaded = open_project(&root).expect("opens");
+
+        let outcome = save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_eq!(
+            outcome.unsupported.len(),
+            1,
+            "a rule with two owners is reported, not rewritten: {:?}",
+            outcome.unsupported
+        );
+        assert_eq!(
+            read(&root.join("styles.css")),
+            css,
+            "and the shared rule is untouched"
         );
     }
 
@@ -2380,6 +2683,169 @@ mod tests {
 
         assert_eq!(outcome.unsupported.len(), 1, "{:?}", outcome.unsupported);
         assert_eq!(read(&root.join("styles.css")), css);
+    }
+
+    #[test]
+    fn a_failure_part_way_through_reports_the_files_that_did_land() {
+        // A multi-file save is not atomic, and this is the case that proves the
+        // code says so rather than implying it.
+        //
+        // A geometry edit lands in the markup and a fill edit in a stylesheet
+        // under `assets/`, so the save writes `index.html` and then fails on the
+        // stylesheet — because that directory is made read-only after the
+        // project was opened, so the sibling temp file cannot be created. Reading
+        // is unaffected, which is what makes this a *write* failure rather than
+        // an unreadable project.
+        //
+        // The error has to carry the fact that `index.html` is already on disk. A
+        // caller that concluded "the save failed, so nothing changed" would keep
+        // per-file state that no longer describes the file, and write its next
+        // edit against it twice.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"assets/styles.css\" /></head>\n<body>\n  <a class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        let css = ".cta { background: #222222; }\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        let root = project_files(
+            "partial-write",
+            &[
+                ("lamine.yaml", yaml.as_str()),
+                ("index.html", html),
+                ("assets/styles.css", css),
+            ],
+        );
+        let loaded = open_project(&root).expect("opens");
+
+        let assets = root.join("assets");
+        let writable = std::fs::Permissions::from_mode(0o755);
+        let blocked_mode = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&assets, blocked_mode)
+            .expect("make the stylesheet directory read-only");
+        assert!(
+            std::fs::File::create(assets.join("probe.tmp")).is_err(),
+            "the directory really does refuse a new file, so the failure below is \
+             the filesystem's and not this code's"
+        );
+        let outcome = save_project(
+            &root,
+            &loaded.document,
+            &[
+                SourceEdit::Style {
+                    node: node("spool-cta-primary"),
+                    property: "background".into(),
+                    value: "#ff0000".into(),
+                },
+                SourceEdit::Geometry {
+                    node: node("spool-cta-primary"),
+                    placement: Some(Placement::Flow { dx: 8.0, dy: 0.0 }),
+                    width: None,
+                    height: None,
+                },
+            ],
+        );
+        std::fs::set_permissions(&assets, writable).expect("restore permissions");
+
+        let failure = outcome.expect_err("the blocked directory refuses the write");
+        assert!(
+            matches!(*failure.source, BundleError::Io { .. }),
+            "and it is an I/O failure, not a silent success: {:?}",
+            failure.source
+        );
+        assert_eq!(
+            failure.written,
+            vec![root.join("index.html")],
+            "the file replaced before the failure is named, so a caller can tell \
+             the save was not a no-op"
+        );
+        assert!(
+            read(&root.join("index.html")).contains("translate(8px, 0px)"),
+            "and that file really is on disk with the edit in it: {}",
+            read(&root.join("index.html"))
+        );
+        assert_eq!(
+            read(&root.join("assets/styles.css")),
+            css,
+            "while the stylesheet is untouched"
+        );
+        assert!(
+            !failure
+                .written
+                .iter()
+                .any(|path| path.ends_with("lamine.yaml")),
+            "metadata is written last, so a failure before it leaves it alone"
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_order_that_is_not_its_name_order_still_resolves_the_winner() {
+        // The cascade across files is document order and last-wins: the sheet a
+        // page links *last* overrides the earlier ones, and that is the only
+        // declaration an edit may rewrite.
+        //
+        // Three sheets, because two cannot separate the two candidate orders.
+        // Alphabetical is `a, m, z`; the page links `z, a, m`, so `m.css` wins
+        // the cascade while `a.css` sorts first. An implementation that sorted by
+        // name and took the first match would rewrite `a.css` — a declaration
+        // that loses, so the element would go on rendering `m.css` and the edit
+        // would appear to do nothing.
+        let html = "<!doctype html>\n<html>\n<head><link rel=\"stylesheet\" href=\"z.css\" /><link rel=\"stylesheet\" href=\"a.css\" /><link rel=\"stylesheet\" href=\"m.css\" /></head>\n<body>\n  <a class=\"cta\" data-spool-id=\"spool-cta-primary\">Go</a>\n</body>\n</html>\n";
+        // All three match this element and disagree on the value, so which one
+        // won is visible in the render.
+        let z_css = ".cta { background: #0000ff; }\n";
+        let a_css = ".cta { background: #00ff00; }\n";
+        let m_css = ".cta { background: #ff00ff; }\n";
+        let yaml = format!(
+            "version: 1\nnodes:\n{}",
+            node_yaml("spool-cta-primary", None, "")
+        );
+        let root = project_files(
+            "sheet-order",
+            &[
+                ("lamine.yaml", yaml.as_str()),
+                ("index.html", html),
+                ("z.css", z_css),
+                ("a.css", a_css),
+                ("m.css", m_css),
+            ],
+        );
+        let loaded = open_project(&root).expect("opens");
+
+        // What the renderer resolved, which is the answer save has to match.
+        let cta = loaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id.as_str() == "spool-cta-primary")
+            .expect("projected");
+        assert_eq!(
+            cta.fill.map(|fill| fill.color.to_rgb()),
+            Some(0xff_00_ff),
+            "`m.css` is linked last, so it is the declaration the cascade chose"
+        );
+
+        save_project(
+            &root,
+            &loaded.document,
+            &[SourceEdit::Style {
+                node: node("spool-cta-primary"),
+                property: "background".into(),
+                value: "#ff0000".into(),
+            }],
+        )
+        .expect("save");
+
+        assert_eq!(
+            read(&root.join("m.css")),
+            ".cta { background: #ff0000; }\n",
+            "the edit lands in the rule the cascade actually chose"
+        );
+        assert_eq!(
+            read(&root.join("a.css")),
+            a_css,
+            "and the rule that merely sorted first is left as the author wrote it"
+        );
+        assert_eq!(read(&root.join("z.css")), z_css);
     }
 
     // -- Known limitations, pinned so they cannot drift silently.
