@@ -5,6 +5,7 @@ mod document_runtime_bridge;
 mod hierarchy;
 mod inspector;
 mod layers;
+mod lifecycle;
 mod operations;
 pub mod project_bundle;
 mod project_open;
@@ -24,6 +25,7 @@ use gpui_platform::application;
 
 fn main() {
     application().run(|cx: &mut App| {
+        lifecycle::install(cx);
         cx.bind_keys([
             KeyBinding::new("backspace", canvas::Backspace, None),
             KeyBinding::new("delete", canvas::Delete, None),
