@@ -220,7 +220,6 @@ pub struct AppShell {
     canvas: Entity<canvas::CanvasView>,
     layers: Entity<LayersView>,
     inspector: Entity<inspector::Inspector>,
-    selected_tool: canvas::Tool,
     selected_page: usize,
     ai_open: bool,
     share_open: bool,
@@ -269,7 +268,6 @@ impl AppShell {
             layers,
             inspector,
             observations,
-            selected_tool: canvas::Tool::Select,
             selected_page: 0,
             new_project: None,
             ai_open: false,
@@ -355,7 +353,7 @@ impl AppShell {
             gesture: self.canvas.read(cx).is_manipulating(),
             text_editing: self.canvas.read(cx).is_text_editing(),
             selection: !self.canvas.read(cx).selection().is_empty(),
-            tool: self.selected_tool != canvas::Tool::Select,
+            tool: self.canvas.read(cx).tool() != canvas::Tool::Select,
         };
         match state.next() {
             Some(commands::Rung::Panel) => {
@@ -381,7 +379,6 @@ impl AppShell {
                 true
             }
             Some(commands::Rung::Tool) => {
-                self.selected_tool = canvas::Tool::Select;
                 self.canvas
                     .update(cx, |canvas, _| canvas.set_tool(canvas::Tool::Select));
                 cx.notify();
@@ -561,7 +558,6 @@ impl AppShell {
             }
             commands::Command::Rename => self.rename_selection(cx),
             commands::Command::Tool(tool) => {
-                self.selected_tool = tool;
                 self.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
                 cx.notify();
             }
@@ -796,7 +792,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.selected_tool == *tool;
+            let selected = self.canvas.read(cx).tool() == *tool;
             let background = if selected {
                 theme::SURFACE_HOVER
             } else {
@@ -823,7 +819,6 @@ impl AppShell {
                     .text_sm()
                     .text_color(rgb(foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_tool = tool;
                         this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
                         cx.notify();
                     }))
@@ -1158,7 +1153,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.selected_tool == *tool;
+            let selected = self.canvas.read(cx).tool() == *tool;
             let background = if selected {
                 theme::ACCENT_WASH
             } else {
@@ -1186,7 +1181,6 @@ impl AppShell {
                     .active(|style| style.opacity(0.78))
                     .text_color(rgb(foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected_tool = tool;
                         this.canvas.update(cx, |canvas, _| canvas.set_tool(tool));
                         cx.notify();
                     }))

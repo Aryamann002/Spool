@@ -72,6 +72,24 @@ const MIN_OBJECT_SIZE: f32 = 20.0;
 /// allows.
 const DUPLICATE_OFFSET: f32 = 16.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+
+/// The side a creation tool makes when the user clicks rather than drags.
+///
+/// A click has no bounds to honour, so the tool needs an answer of its own. In
+/// world units, so it is a size in the document and not in the window: the same
+/// 100 units at 50% and at 200%.
+///
+/// `docs/research/products/figma.md` records the rule this implements — every
+/// tool works with a click and with a drag, and the two differ: click gives a
+/// default size, drag gives explicit bounds.
+const DEFAULT_CREATION_SIZE: f32 = 100.0;
+
+/// The box a Text click leaves.
+///
+/// Text auto-sizes once it holds text, so this is only the box the caret starts
+/// in. It is the size Text click-creation already used.
+const DEFAULT_TEXT_WIDTH: f32 = 180.0;
+const DEFAULT_TEXT_HEIGHT: f32 = 48.0;
 /// Wheel deltas are converted at this many pixels per line.
 ///
 /// Named because both the pan reading and the zoom reading use it, and two
@@ -1723,6 +1741,17 @@ struct CreateGesture {
     pointer_start_screen: Point<f32>,
     pointer_start_world: Point<f32>,
     current_world: Point<f32>,
+    /// Whether the pointer has moved at all since the press.
+    ///
+    /// Not the same question as whether the drag threshold was crossed, and the
+    /// difference is the whole of click creation. Sub-threshold movement is still
+    /// movement: the user dragged, just not far enough to mean anything by drag,
+    /// and it leaves no object behind. A press and release with no movement at all
+    /// is a click, and gets the tool's default size.
+    ///
+    /// `current_world` cannot answer this, because below the threshold it is never
+    /// updated — so a 3px jiggle and a perfect click are indistinguishable there.
+    moved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1778,6 +1807,20 @@ impl Interaction {
             object_type: gesture.object_type,
             geometry: creation_geometry(gesture.pointer_start_world, gesture.current_world),
         })
+    }
+}
+
+/// The size a click with this tool makes.
+///
+/// A named answer per tool rather than one number everywhere, because Text is
+/// genuinely a different shape: it auto-sizes, so its click box is only a starting
+/// box. Text's value is preserved from what click-creation already used.
+fn default_creation_size(object_type: ObjectType) -> Size<f32> {
+    match object_type {
+        ObjectType::Text => size(DEFAULT_TEXT_WIDTH, DEFAULT_TEXT_HEIGHT),
+        ObjectType::Frame | ObjectType::Rectangle | ObjectType::Ellipse => {
+            size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE)
+        }
     }
 }
 
@@ -3320,6 +3363,31 @@ impl CanvasView {
         &self.session.runtime
     }
 
+    /// The tool the canvas is acting with.
+    ///
+    /// Read by the shell so the toolbar shows the tool that is actually in
+    /// effect. Creation completes by changing it, and a second copy in the shell
+    /// would be a toolbar that disagrees with the canvas.
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Return to the Selection tool after a creation.
+    ///
+    /// So the next thing the user does — move, resize, rename, duplicate, delete —
+    /// acts on the object they just made, without a trip back to the toolbar
+    /// first. One method, called from every creation, so a click-created object
+    /// and a drag-created one finish identically.
+    ///
+    /// Deliberately not `set_tool`: that commits an open text edit, and for a Text
+    /// click the session this is about to open is not the one to end.
+    fn finish_creation(&mut self) {
+        self.abandon_interaction();
+        self.marquee = None;
+        self.clear_gesture_feedback();
+        self.tool = Tool::Select;
+    }
+
     pub fn set_tool(&mut self, tool: Tool) {
         self.commit_text_edit();
         self.abandon_interaction();
@@ -4425,6 +4493,7 @@ impl CanvasView {
                 pointer_start_screen: screen,
                 pointer_start_world: world,
                 current_world: world,
+                moved: false,
             });
             self.capture_pointer(window);
             return;
@@ -4497,6 +4566,16 @@ impl CanvasView {
                         })
                 })
                 .collect();
+            // Focusing here is what makes the editor-wide keyboard reach the
+            // canvas at all. An action is only dispatched to elements on the path
+            // from the focused node, and with nothing focused that path is the
+            // dispatch tree's synthetic root — which contains no editor element,
+            // so the shell's key handler never runs and no shortcut fires. The
+            // Layers rows focus themselves on click for the same reason; without
+            // this the canvas is the one surface whose keys do nothing.
+            if let Some(focus_handle) = &self.focus_handle {
+                window.focus(focus_handle, cx);
+            }
             self.interaction = Interaction::PotentialMove(MoveGesture {
                 pointer_start_screen: screen,
                 pointer_start_world: world,
@@ -4684,6 +4763,7 @@ impl CanvasView {
             }
             Interaction::PotentialCreate(mut gesture) => {
                 if !drag_threshold_crossed(gesture.pointer_start_screen, screen) {
+                    gesture.moved = gesture.moved || gesture.pointer_start_screen != screen;
                     self.interaction = Interaction::PotentialCreate(gesture);
                     return false;
                 }
@@ -4741,15 +4821,27 @@ impl CanvasView {
             }
             Interaction::PotentialCreate(gesture) => {
                 if gesture.object_type == ObjectType::Text {
+                    // Text has always answered a click, and a drag reaches
+                    // `Creating` below instead.
                     self.commit_creation(
                         gesture.object_type,
                         gesture.pointer_start_world,
-                        size(180.0, 48.0),
+                        default_creation_size(ObjectType::Text),
                     );
                 } else if drag_threshold_crossed(gesture.pointer_start_screen, screen) {
                     let current_world = self.camera.screen_to_world(screen);
                     let geometry = creation_geometry(gesture.pointer_start_world, current_world);
                     self.commit_creation(gesture.object_type, geometry.position, geometry.size);
+                } else if !gesture.moved {
+                    // A click: pressed and released without moving. The object is
+                    // placed at the same point a drag would start from, so the two
+                    // share one anchor — its top-left, because
+                    // `creation_geometry` puts a drag's top-left at the press.
+                    self.commit_creation(
+                        gesture.object_type,
+                        gesture.pointer_start_world,
+                        default_creation_size(gesture.object_type),
+                    );
                 }
             }
             Interaction::Creating(gesture) => {
@@ -4777,6 +4869,12 @@ impl CanvasView {
         self.selection
             .click(Some(object.id), false, &self.hierarchy());
         self.commit_created(vec![placement]);
+        // Text keeps its tool: the session the pointer-up handler opens is
+        // announced by the tool still being Text, and the tool returns to
+        // Selection once that session is open. Every other tool is finished here.
+        if object_type != ObjectType::Text {
+            self.finish_creation();
+        }
     }
 
     /// Record new objects in the document *and* on the canvas, as one history
@@ -5265,6 +5363,11 @@ impl Render for CanvasView {
                                                 |object| object.object_type == ObjectType::Text,
                                             ) {
                                                 this.begin_text_edit(id, window, cx);
+                                                // The session is open, so the
+                                                // creation is over: back to the
+                                                // Selection tool like every
+                                                // other one.
+                                                this.tool = Tool::Select;
                                             }
                                         }
                                     }
@@ -7517,6 +7620,414 @@ mod tests {
         assert_eq!(geometry.size, size(160.0, 120.0));
     }
 
+    // -- Click creation and the tool that completes it.
+
+    /// Press and release without moving, with `tool` active: the production
+    /// pointer-up path, driven the way a pointer drives it.
+    fn click_with(tool: Tool, object_type: ObjectType, at: Point<f32>) -> CanvasView {
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(tool);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        canvas
+    }
+
+    /// The same, with the camera already zoomed, and the world point the press
+    /// actually landed on.
+    fn click_with_zoomed(
+        tool: Tool,
+        object_type: ObjectType,
+        at: Point<f32>,
+        zoom: f32,
+    ) -> (CanvasView, Point<f32>) {
+        let mut canvas = CanvasView::new();
+        canvas.camera.set_zoom_at_center(zoom);
+        canvas.set_tool(tool);
+        let world = canvas.camera.screen_to_world(at);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type,
+            pointer_start_screen: at,
+            pointer_start_world: world,
+            current_world: world,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        (canvas, world)
+    }
+
+    /// The object the gesture just made, read back off the canvas.
+    fn last_object(canvas: &CanvasView) -> DesignObject {
+        canvas
+            .session
+            .runtime
+            .objects()
+            .last()
+            .cloned()
+            .expect("an object was created")
+    }
+
+    #[test]
+    fn a_click_creates_the_tools_default_box() {
+        for (tool, object_type) in [
+            (Tool::Frame, ObjectType::Frame),
+            (Tool::Rectangle, ObjectType::Rectangle),
+            (Tool::Ellipse, ObjectType::Ellipse),
+        ] {
+            let canvas = click_with(tool, object_type, point(240.0, 180.0));
+            let created = last_object(&canvas);
+            assert_eq!(created.object_type, object_type);
+            assert_eq!(
+                created.size,
+                size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE),
+                "{object_type:?} gets the default square"
+            );
+            // Named here so the requirement is stated rather than implied.
+            assert_eq!(DEFAULT_CREATION_SIZE, 100.0, "Frame click is 100x100");
+        }
+    }
+
+    #[test]
+    fn a_click_with_the_text_tool_creates_its_existing_box() {
+        // Text's click size predates click creation for the other tools; it is
+        // preserved rather than folded into the default square.
+        let canvas = click_with(Tool::Text, ObjectType::Text, point(240.0, 180.0));
+        let created = last_object(&canvas);
+        assert_eq!(created.object_type, ObjectType::Text);
+        // Literal, not the constants: asserting a constant against itself would
+        // pass whatever the constants were changed to, which is the opposite of
+        // pinning the box down.
+        assert_eq!(
+            created.size,
+            size(180.0, 48.0),
+            "text keeps its existing box"
+        );
+    }
+
+    #[test]
+    fn a_click_places_the_object_by_its_top_left_where_a_drag_would() {
+        // One anchor for both. `creation_geometry` puts a drag's top-left at the
+        // press, so a click does the same rather than inventing a centre.
+        //
+        // Zoomed, because at 1x the press point and its own world coordinate are
+        // the same number and a click anchored to either would look identical.
+        // At 2x they are genuinely different places, and only the press point's
+        // world coordinate can be where the click was.
+        let press = point(140.0, 110.0);
+        let zoomed = click_with_zoomed(Tool::Rectangle, ObjectType::Rectangle, press, 2.0);
+        let at = zoomed.1;
+        let clicked = last_object(&zoomed.0);
+
+        let mut canvas = CanvasView::new();
+        canvas.camera.set_zoom_at_center(2.0);
+        canvas.set_tool(Tool::Rectangle);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        let to = point(360.0, 300.0);
+        canvas.update_interaction(to);
+        canvas.finish_interaction(to);
+        let dragged = last_object(&canvas);
+
+        assert_eq!(clicked.position, at, "click anchors top-left at the press");
+        assert_eq!(
+            dragged.position, at,
+            "and so does a drag, which is the whole claim"
+        );
+        let to_world = canvas.camera.screen_to_world(to);
+        assert_eq!(
+            dragged.size,
+            size((to_world.x - at.x).abs(), (to_world.y - at.y).abs()),
+            "the drag still sets its own bounds"
+        );
+    }
+
+    #[test]
+    fn a_drag_still_creates_explicit_geometry() {
+        let at = point(100.0, 100.0);
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Frame);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Frame,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.update_interaction(point(260.0, 220.0));
+        canvas.finish_interaction(point(260.0, 220.0));
+        let created = last_object(&canvas);
+        assert_eq!(created.size, size(160.0, 120.0), "the drag's own bounds");
+    }
+
+    #[test]
+    fn a_clicks_default_size_is_the_same_at_every_zoom() {
+        // The default is in world units. Zoom changes how big the box looks on
+        // screen and must not change the box in the document.
+        for zoom in [0.5, 1.0, 2.0] {
+            let mut canvas = CanvasView::new();
+            canvas.camera.set_zoom_at_center(zoom);
+            canvas.set_tool(Tool::Frame);
+            // Deliberately off-centre: on the viewport's own centre, the world
+            // point a press maps to is the same at every zoom, which would let an
+            // anchor bug hide.
+            let at = canvas.camera.screen_to_world(point(260.0, 210.0));
+            canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+                object_type: ObjectType::Frame,
+                pointer_start_screen: point(260.0, 210.0),
+                pointer_start_world: at,
+                current_world: at,
+                moved: false,
+            });
+            canvas.finish_interaction(point(260.0, 210.0));
+            let created = last_object(&canvas);
+            assert_eq!(
+                created.size,
+                size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE),
+                "at {zoom}x the world size is unchanged"
+            );
+            assert_eq!(created.position, at, "and it lands where the click was");
+        }
+    }
+
+    #[test]
+    fn a_creation_selects_the_new_object_and_returns_to_selection() {
+        for (tool, object_type) in [
+            (Tool::Frame, ObjectType::Frame),
+            (Tool::Text, ObjectType::Text),
+        ] {
+            let canvas = click_with(tool, object_type, point(240.0, 180.0));
+            let created = last_object(&canvas);
+            assert_eq!(
+                canvas.selection.ids(),
+                vec![created.id],
+                "{object_type:?}: the new object is the only selection"
+            );
+            // Text's session is opened by the pointer-up handler that also owns
+            // this transition, and it returns to Selection there.
+            if object_type != ObjectType::Text {
+                assert_eq!(
+                    canvas.tool(),
+                    Tool::Select,
+                    "{object_type:?}: creation finishes back on Selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_creation_deselects_whatever_was_selected_first() {
+        let mut canvas = CanvasView::new();
+        let previously = canvas.session.runtime.objects()[0].id;
+        canvas.selection.replace(vec![previously]);
+        assert_eq!(canvas.selection.ids(), vec![previously]);
+
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+
+        let created = last_object(&canvas).id;
+        assert_eq!(
+            canvas.selection.ids(),
+            vec![created],
+            "the new object replaced the selection, not joined it"
+        );
+    }
+
+    #[test]
+    fn a_drag_creation_also_returns_to_selection() {
+        let at = point(100.0, 100.0);
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Ellipse);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Ellipse,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.update_interaction(point(200.0, 200.0));
+        canvas.finish_interaction(point(200.0, 200.0));
+        assert_eq!(canvas.tool(), Tool::Select);
+        assert_eq!(canvas.selection.ids(), vec![last_object(&canvas).id]);
+    }
+
+    #[test]
+    fn a_click_creation_is_one_history_entry_that_undo_and_redo_restore() {
+        let mut canvas = CanvasView::new();
+        let before = canvas.session.runtime.objects().len();
+        let entries = canvas.session.history.undo_len();
+
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        let created = last_object(&canvas).spool_id.clone();
+
+        assert_eq!(canvas.session.runtime.objects().len(), before + 1);
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "a click is one gesture and therefore one entry"
+        );
+        // Selecting the new object is runtime state and records nothing.
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "tool switching and selection are not history"
+        );
+
+        canvas.session.undo().expect("undo");
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        canvas.session.redo().expect("redo");
+        assert!(canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .any(|object| object.spool_id == created));
+    }
+
+    #[test]
+    fn repeated_clicks_keep_creating() {
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Rectangle);
+        let before = canvas.session.runtime.objects().len();
+        for index in 0..3 {
+            let at = point(100.0 + index as f32 * 50.0, 100.0);
+            canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+                object_type: ObjectType::Rectangle,
+                pointer_start_screen: at,
+                pointer_start_world: at,
+                current_world: at,
+                moved: false,
+            });
+            canvas.finish_interaction(at);
+            // Each creation returns to Selection, so the tool is re-armed each
+            // time exactly as a user's would be.
+            canvas.set_tool(Tool::Rectangle);
+        }
+        assert_eq!(canvas.session.runtime.objects().len(), before + 3);
+    }
+
+    // -- Deleting from the canvas.
+
+    #[test]
+    fn deleting_the_canvas_selection_removes_it_and_one_history_entry_covers_it() {
+        let mut canvas = CanvasView::new();
+        let victims: Vec<_> = canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .take(2)
+            .map(|object| object.id)
+            .collect();
+        canvas.selection.replace(victims.clone());
+        let entries = canvas.session.history.undo_len();
+        let before = canvas.session.runtime.objects().len();
+
+        assert!(canvas.delete_selected_objects());
+
+        assert_eq!(canvas.session.runtime.objects().len(), before - 2);
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "two objects, one gesture, one entry"
+        );
+        assert!(
+            canvas.selection.ids().is_empty(),
+            "and nothing deleted is left selected"
+        );
+
+        canvas.session.undo().expect("undo");
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        for victim in &victims {
+            assert!(
+                canvas.session.runtime.object(*victim).is_some(),
+                "undo restored {victim:?}"
+            );
+        }
+        canvas.session.redo().expect("redo");
+        assert_eq!(canvas.session.runtime.objects().len(), before - 2);
+    }
+
+    #[test]
+    fn the_delete_key_and_backspace_are_one_command_on_the_canvas() {
+        // Both spellings reach the same `Command::Delete`, which is the only
+        // deletion implementation: Canvas and Layers have no separate paths.
+        let modifiers = gpui::Modifiers::default();
+        for key in ["delete", "backspace"] {
+            assert_eq!(
+                crate::commands::resolve(key, modifiers, crate::commands::Scope::Editor),
+                Some(crate::commands::Command::Delete),
+                "{key} deletes the selection"
+            );
+        }
+        // And not while a text buffer owns the key.
+        assert_eq!(
+            crate::commands::resolve("backspace", modifiers, crate::commands::Scope::TextEditing),
+            None,
+            "a caret outranks deletion"
+        );
+    }
+
+    #[test]
+    fn a_creation_then_delete_leaves_nothing_behind() {
+        // The completion chain this milestone exists for: create, the new object
+        // is selected, delete it, and the document is back where it started.
+        let mut canvas = CanvasView::new();
+        let before = canvas.session.runtime.objects().len();
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+
+        let created = last_object(&canvas).id;
+        assert_eq!(
+            canvas.selection.ids(),
+            vec![created],
+            "the new object is selected, so Delete needs no further setup"
+        );
+        assert!(canvas.delete_selected_objects());
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        assert!(canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .all(|object| object.id != created));
+        assert!(canvas.selection.ids().is_empty());
+    }
+
     #[test]
     fn sub_threshold_creation_gesture_creates_no_object() {
         let mut canvas = CanvasView::new();
@@ -7526,6 +8037,7 @@ mod tests {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(100.0, 100.0),
             current_world: point(100.0, 100.0),
+            moved: false,
         });
 
         canvas.update_interaction(point(3.0, 0.0));
@@ -7552,6 +8064,7 @@ mod tests {
                 pointer_start_screen: start_screen,
                 pointer_start_world: start_world,
                 current_world: start_world,
+                moved: false,
             });
 
             assert!(canvas.update_interaction(end_screen));
@@ -7576,6 +8089,7 @@ mod tests {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(100.0, 100.0),
             current_world: point(180.0, 160.0),
+            moved: true,
         });
         let preview = canvas.interaction.preview();
         assert!(preview.is_some());
@@ -7597,6 +8111,7 @@ mod tests {
             pointer_start_screen: point(100.0, 120.0),
             pointer_start_world: point(100.0, 120.0),
             current_world: point(100.0, 120.0),
+            moved: false,
         });
 
         canvas.finish_interaction(point(100.0, 120.0));
