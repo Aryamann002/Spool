@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 
 use crate::project_bundle::{BundleError, ProjectBundle, METADATA_FILE};
 use crate::project_open::{LoadedProject, ProjectOpenError};
+use crate::source_document::{NodeId, PersistentDocument, SourceBinding, StructuralNode};
 
 /// The suffix that makes a directory a Spool project.
 pub const PROJECT_EXTENSION: &str = "spool";
@@ -213,6 +214,142 @@ impl SpoolProject {
 /// opening as an empty scene.
 pub fn open(path: impl AsRef<Path>) -> Result<LoadedProject, ProjectError> {
     Ok(SpoolProject::locate(path)?.open()?)
+}
+
+/// The identity of a brand-new project's one object.
+///
+/// Fixed, because there is exactly one and it is the document's root. It is the
+/// same identity the fixtures use, so a project Spool created and one a person
+/// authored are the same shape on disk.
+const NEW_ROOT_ID: &str = "spool-frame-root";
+
+/// The one authored file a new project needs.
+///
+/// Flat rather than `pages/`, because a layout is a choice the author makes and
+/// `lamine.yaml` records per binding. A project with no layout yet should not
+/// impose one.
+const NEW_SOURCE_FILE: &str = "index.html";
+
+/// Why a new project could not be written.
+#[derive(Debug)]
+pub enum ProjectCreateError {
+    /// The name is empty or is not a path.
+    NoName,
+    /// The directory name does not end in `.spool`.
+    NotAProjectName { path: PathBuf, name: String },
+    /// Something is already there, so writing would destroy it.
+    AlreadyExists { path: PathBuf },
+    /// The parent directory could not be created.
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The metadata could not be encoded, or could not be written.
+    Bundle(BundleError),
+}
+
+impl std::fmt::Display for ProjectCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoName => write!(f, "give a name for the new project"),
+            Self::NotAProjectName { path, name } => write!(
+                f,
+                "{} must be named something.{PROJECT_EXTENSION}, and {name:?} is not",
+                path.display()
+            ),
+            Self::AlreadyExists { path } => {
+                write!(f, "{} already exists", path.display())
+            }
+            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Bundle(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectCreateError {}
+
+/// Write a new, minimal, valid `.spool` project at `path`.
+///
+/// The smallest thing the loader accepts, and nothing more: a manifest and one
+/// authored file, with the manifest produced by the *same* encoder that reads it
+/// back. That is what makes the result indistinguishable from a project someone
+/// authored by hand — the only way to guarantee it is not to write the format a
+/// second time.
+///
+/// `path` is the project directory including its `.spool` suffix; the directory
+/// name is the project's name, because `lamine.yaml` has no project-level name
+/// field to hold one.
+///
+/// Refuses rather than overwrites: an existing directory with anything in it is
+/// someone's work.
+pub fn create(path: impl AsRef<Path>) -> Result<SpoolProject, ProjectCreateError> {
+    let root = path.as_ref().to_path_buf();
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Err(ProjectCreateError::NoName);
+    }
+    if Path::new(&name).extension().and_then(|ext| ext.to_str()) != Some(PROJECT_EXTENSION) {
+        return Err(ProjectCreateError::NotAProjectName { path: root, name });
+    }
+    // An existing empty directory is a location the user already chose and is
+    // fine to fill. Anything in it is not.
+    if root.exists() {
+        let empty = std::fs::read_dir(&root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            return Err(ProjectCreateError::AlreadyExists { path: root });
+        }
+    }
+    // The project directory itself, not only its parent: the location may be a
+    // new folder several levels deep.
+    std::fs::create_dir_all(&root).map_err(|source| ProjectCreateError::Io {
+        path: root.clone(),
+        source,
+    })?;
+
+    let mut document = PersistentDocument::default();
+    document.structure.nodes.push(StructuralNode {
+        id: NodeId::new(NEW_ROOT_ID).expect("a fixed id is valid"),
+        name: "Frame".to_owned(),
+        kind: "frame".to_owned(),
+        parent: None,
+        children: Vec::new(),
+        source: SourceBinding {
+            file: NEW_SOURCE_FILE.to_owned(),
+            selector: format!("[data-spool-id=\"{NEW_ROOT_ID}\"]"),
+        },
+    });
+
+    // The authored file first. If the manifest were written first and this
+    // failed, the project would be a manifest pointing at nothing.
+    let document_html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <title>Spool</title>\n  </head>\n  <body>\n    <main data-spool-id=\"{NEW_ROOT_ID}\"></main>\n  </body>\n</html>\n"
+    );
+    std::fs::write(root.join(NEW_SOURCE_FILE), &document_html).map_err(|source| {
+        ProjectCreateError::Io {
+            path: root.join(NEW_SOURCE_FILE),
+            source,
+        }
+    })?;
+
+    // Through the existing bundle writer, so the manifest is encoded exactly as
+    // a saved project's is.
+    ProjectBundle::from_document(&root, document)
+        .and_then(|bundle| bundle.save())
+        .map_err(ProjectCreateError::Bundle)?;
+
+    // Located rather than constructed: the project now has to satisfy exactly the
+    // check every other project does, or it is not one.
+    SpoolProject::locate(&root).map_err(|error| {
+        ProjectCreateError::Bundle(BundleError::Io {
+            path: root,
+            source: std::io::Error::other(error.to_string()),
+        })
+    })
 }
 
 /// The project named by the process's arguments, if one was.
@@ -564,6 +701,246 @@ mod tests {
         );
     }
 
+    // -- creating a project.
+
+    /// A path no test has used, inside the temp dir.
+    fn fresh(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "spool-new-{name}-{}-{:?}.spool",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn a_created_project_opens_through_the_existing_path() {
+        let root = fresh("opens");
+        let project = create(&root).expect("a valid path creates a project");
+        assert_eq!(project.root(), root);
+
+        // The whole point: indistinguishable from a project someone authored. The
+        // only way to know is to open it with the loader that opens every other
+        // project, and to get the same answer.
+        let loaded = open(&root).expect("the new project opens");
+        assert_eq!(loaded.document.structure.nodes.len(), 1, "one object");
+        assert_eq!(loaded.runtime.objects().len(), 1, "and it is drawable");
+        assert!(
+            loaded.unrendered.is_empty(),
+            "a new project has nothing unrendered: {:?}",
+            loaded.unrendered
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_created_project_writes_exactly_the_minimum() {
+        let root = fresh("minimum");
+        create(&root).expect("creates");
+        assert_eq!(
+            tree_of(&root),
+            vec!["index.html", "lamine.yaml"],
+            "a manifest and one authored file, and nothing else"
+        );
+        let manifest = std::fs::read_to_string(root.join("lamine.yaml")).expect("manifest");
+        assert!(
+            manifest.starts_with("version: 1\nnodes:\n"),
+            "the manifest is in the loader's own format: {manifest}"
+        );
+        assert!(manifest.contains("kind: \"frame\""), "{manifest}");
+        let html = std::fs::read_to_string(root.join("index.html")).expect("html");
+        assert!(
+            html.contains("data-spool-id=\"spool-frame-root\""),
+            "and the element carries the identity the manifest binds: {html}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_created_projects_identity_is_bound_by_the_loader() {
+        // The selector the loader accepts is exactly one spelling, and a binding
+        // in any other form resolves to zero elements and fails the open.
+        let root = fresh("bound");
+        create(&root).expect("creates");
+        let loaded = open(&root).expect("opens");
+        let node = &loaded.document.structure.nodes[0];
+        assert_eq!(node.id.as_str(), "spool-frame-root");
+        assert_eq!(node.source.selector, "[data-spool-id=\"spool-frame-root\"]");
+        assert_eq!(
+            crate::source_document::HtmlSource {
+                file: node.source.file.clone(),
+                contents: loaded.document.sources[&node.source.file].clone(),
+            }
+            .binding_occurrences(node),
+            1,
+            "the binding resolves to exactly one authored element"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_created_project_rejects_a_name_that_is_not_a_project() {
+        for name in ["NoSuffix", "NotADir.txt"] {
+            let path = std::env::temp_dir().join(format!(
+                "spool-badname-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            assert!(
+                matches!(
+                    create(&path),
+                    Err(ProjectCreateError::NotAProjectName { .. })
+                ),
+                "{name} must not become a project"
+            );
+        }
+    }
+
+    #[test]
+    fn creating_refuses_to_overwrite_something_that_is_already_there() {
+        let root = fresh("occupied");
+        std::fs::create_dir_all(&root).expect("make the directory");
+        std::fs::write(root.join("work.html"), "someone's work").expect("write");
+
+        assert!(matches!(
+            create(&root),
+            Err(ProjectCreateError::AlreadyExists { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("work.html")).expect("read"),
+            "someone's work",
+            "and the existing file is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn creating_into_an_empty_directory_is_allowed() {
+        // The user may have made the folder first and then pointed Spool at it.
+        let root = fresh("empty-dir");
+        std::fs::create_dir_all(&root).expect("make the directory");
+        create(&root).expect("an empty directory is a location, not a project");
+        assert!(open(&root).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn creating_refuses_an_empty_name() {
+        assert!(matches!(create(""), Err(ProjectCreateError::NoName)));
+    }
+
+    #[test]
+    fn a_created_project_is_a_full_peer_of_a_committed_fixture() {
+        // The strongest statement available without a file dialog: a project Spool
+        // wrote opens, binds, projects and edits exactly as a committed fixture
+        // does, because nothing about it is a special case.
+        let root = fresh("peer");
+        create(&root).expect("creates");
+        let loaded = open(&root).expect("opens");
+        assert_eq!(loaded.runtime.objects().len(), 1);
+
+        // And a created object survives save and reopen in it, which is the whole
+        // product loop and the reason the project exists.
+        let mut document = loaded.document.clone();
+        document.structure.nodes.push(StructuralNode {
+            id: NodeId::new("spool-added").expect("valid"),
+            name: "Added".to_owned(),
+            kind: "rectangle".to_owned(),
+            parent: Some(NodeId::new("spool-frame-root").unwrap()),
+            children: Vec::new(),
+            source: crate::source_document::SourceBinding {
+                file: "index.html".to_owned(),
+                selector: "[data-spool-id=\"spool-added\"]".to_owned(),
+            },
+        });
+        crate::project_save::save_project(
+            &root,
+            &document,
+            &[crate::project_save::SourceEdit::Create {
+                node: NodeId::new("spool-added").unwrap(),
+                element: crate::project_save::NewElement {
+                    tag: "div".to_owned(),
+                    text: None,
+                    declarations: vec![],
+                },
+            }],
+        )
+        .expect("a save into a new project succeeds");
+
+        let reopened = open(&root).expect("reopens");
+        assert_eq!(reopened.document.structure.nodes.len(), 2);
+        assert_eq!(reopened.runtime.objects().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saving_a_new_project_with_no_edits_changes_nothing() {
+        // The chain the milestone asks for, on a project Spool made rather than
+        // one it opened. A fresh save must not reformat, re-encode or otherwise
+        // "tidy" a project the user has not touched — the two files are already
+        // what the writer would produce, so a save has nothing to do.
+        let root = fresh("noop");
+        create(&root).expect("creates");
+        let before: Vec<(String, String)> = tree_of(&root)
+            .into_iter()
+            .map(|rel| {
+                let bytes = std::fs::read_to_string(root.join(&rel)).expect("read");
+                (rel, bytes)
+            })
+            .collect();
+
+        let loaded = open(&root).expect("opens");
+        let outcome =
+            crate::project_save::save_project(&loaded.root, &loaded.document, &[]).expect("save");
+        assert!(
+            outcome.written.is_empty(),
+            "a save with nothing to change wrote {:?}",
+            outcome.written
+        );
+        assert!(outcome.unsupported.is_empty(), "{:?}", outcome.unsupported);
+
+        for (rel, bytes) in before {
+            assert_eq!(
+                std::fs::read_to_string(root.join(&rel)).expect("read"),
+                bytes,
+                "{rel} was rewritten by a no-op save"
+            );
+        }
+        // And a second one is still a no-op, measured from the first.
+        let reopened = open(&root).expect("reopens");
+        let again = crate::project_save::save_project(&reopened.root, &reopened.document, &[])
+            .expect("save");
+        assert!(again.written.is_empty(), "{:?}", again.written);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `root`, relative and sorted.
+    fn tree_of(root: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir") {
+                let entry = entry.expect("entry");
+                if entry.file_type().expect("file type").is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    found.push(
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .expect("inside the root")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     // -- the command line -------------------------------------------------
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -827,6 +1204,45 @@ mod tests {
         let reopened = open(&root).expect("reopens");
         assert_eq!(reopened.document.structure.nodes[1].name, "First");
         assert_eq!(reopened.document.structure.nodes[2].name, "Second");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+#[ignore = "prints the contract for a reader"]
+fn show_what_a_new_project_looks_like() {
+    // Not an assertion: prints the two files so the contract can be read rather
+    // than inferred. Ignored by default.
+    // `SPOOL_NEW_PROJECT_DIR` writes it somewhere a real binary can then be asked
+    // to open, which is how the packaged app is checked against a project Spool
+    // made. Otherwise a throwaway in the temp dir.
+    let keep = std::env::var_os("SPOOL_NEW_PROJECT_DIR").is_some();
+    let root = std::env::var_os("SPOOL_NEW_PROJECT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("spool-show-{}.spool", std::process::id()))
+        });
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    create(&root).expect("creates");
+    println!("--- tree ---");
+    for entry in std::fs::read_dir(&root).unwrap() {
+        println!(
+            "{}",
+            entry.unwrap().path().file_name().unwrap().to_string_lossy()
+        );
+    }
+    println!(
+        "--- lamine.yaml ---\n{}",
+        std::fs::read_to_string(root.join("lamine.yaml")).unwrap()
+    );
+    println!(
+        "--- index.html ---\n{}",
+        std::fs::read_to_string(root.join("index.html")).unwrap()
+    );
+    // Left in place when a caller named a destination, so a real binary can be
+    // asked to open exactly what was just written.
+    if !keep {
         let _ = std::fs::remove_dir_all(&root);
     }
 }

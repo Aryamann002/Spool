@@ -106,6 +106,109 @@ fn load_requested_project(
     }
 }
 
+/// The open "New Project" prompt.
+///
+/// A typed path and nothing else. There is no folder picker to open: GPUI has no
+/// file dialog, and adding a native one for this would mean a platform
+/// dependency and a second way to choose a path — for a workflow whose whole
+/// input is one string. The path is typed, so the name is the directory's name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NewProjectPrompt {
+    buffer: String,
+    select_all: bool,
+}
+
+/// What a key did to an open New Project prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromptEffect {
+    /// The path changed; the prompt is still open.
+    Continue,
+    /// Create the project at this path.
+    Commit(PathBuf),
+    /// Close the prompt without creating anything.
+    Abandon,
+}
+
+impl NewProjectPrompt {
+    fn opening() -> Self {
+        Self {
+            buffer: String::new(),
+            select_all: true,
+        }
+    }
+
+    /// Apply one keystroke.
+    ///
+    /// A modifier combination is an editor shortcut rather than a character, and
+    /// is swallowed rather than typed, exactly as the Inspector's rename does —
+    /// otherwise `⌘S` would type an `s` into the path.
+    fn apply_key(&mut self, key: &str) -> PromptEffect {
+        match key {
+            "enter" | "return" => {
+                let path = self.buffer.trim().to_owned();
+                if path.is_empty() {
+                    return PromptEffect::Continue;
+                }
+                let path = PathBuf::from(shellexpand_home(&path));
+                self.buffer.clear();
+                self.select_all = true;
+                PromptEffect::Commit(path)
+            }
+            "escape" => {
+                self.buffer.clear();
+                self.select_all = true;
+                PromptEffect::Abandon
+            }
+            "backspace" => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                } else {
+                    self.buffer.pop();
+                }
+                PromptEffect::Continue
+            }
+            other if other.chars().count() == 1 => {
+                if self.select_all {
+                    self.buffer.clear();
+                    self.select_all = false;
+                }
+                self.buffer.push_str(other);
+                PromptEffect::Continue
+            }
+            _ => PromptEffect::Continue,
+        }
+    }
+}
+
+/// The home directory with a trailing separator, for the prompt's placeholder.
+fn home_directory_prefix() -> String {
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/"),
+        Err(_) => String::from("./"),
+    }
+}
+
+/// Expand a leading `~`, so a typed path can start with one.
+///
+/// The only shell expansion worth having: everything else in a project location
+/// is written out in full, and expanding the rest would mean running a shell to
+/// interpret a string that names a directory.
+fn shellexpand_home(path: &str) -> String {
+    let Some(rest) = path.strip_prefix('~') else {
+        return path.to_owned();
+    };
+    // `~/` and a bare `~` both mean the home directory; `~someone` is not ours to
+    // expand and is left alone rather than guessed at.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return path.to_owned();
+    }
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}{rest}"),
+        Err(_) => path.to_owned(),
+    }
+}
+
 /// The editor shell.
 ///
 /// The shell arranges the three surfaces and owns the editor-wide keyboard: which
@@ -123,6 +226,8 @@ pub struct AppShell {
     share_open: bool,
     export_open: bool,
     zoom_open: bool,
+    /// The open New Project prompt, when one is.
+    new_project: Option<NewProjectPrompt>,
     /// A message shown over the canvas, and whether it reports a failure.
     ///
     /// Carries the result of the last save and the result of opening the
@@ -166,6 +271,7 @@ impl AppShell {
             observations,
             selected_tool: canvas::Tool::Select,
             selected_page: 0,
+            new_project: None,
             ai_open: false,
             share_open: false,
             export_open: false,
@@ -324,6 +430,56 @@ impl AppShell {
         true
     }
 
+    /// Apply one key to an open New Project prompt.
+    fn handle_new_project_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(prompt) = self.new_project.as_mut() else {
+            return;
+        };
+        match prompt.apply_key(key) {
+            PromptEffect::Continue => {}
+            PromptEffect::Abandon => self.new_project = None,
+            PromptEffect::Commit(path) => {
+                self.new_project = None;
+                self.create_project(path, cx);
+            }
+        }
+    }
+
+    /// Create a project at `path` and open it, or say why it could not.
+    ///
+    /// Creation and opening are one step from here on purpose. The new project is
+    /// opened through [`load_requested_project`] — the same path a command-line
+    /// launch takes — rather than a second one, so there is still exactly one way
+    /// a project reaches the editor.
+    ///
+    /// A failure is reported and nothing is loaded. Leaving the previous document
+    /// on screen after a failed create would present it as though it were the
+    /// project that was just asked for.
+    fn create_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let project = match crate::spool_project::create(&path) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!(
+                    "spool_project_create failed path={}: {error}",
+                    path.display()
+                );
+                self.save_status = Some((
+                    format!("Could not create {}: {error}", path.display()).into(),
+                    true,
+                ));
+                return;
+            }
+        };
+        eprintln!("spool_project_create ok root={}", project.root().display());
+        let request = ProjectRequest::Project(path.clone());
+        let status = self.canvas.update(cx, |view, _| {
+            load_requested_project(Some(&request), view).map(|message| (message, true))
+        });
+        if let Some(status) = status {
+            self.save_status = Some(status);
+        }
+    }
+
     /// The one place a keystroke the whole editor answers to is handled.
     ///
     /// Four steps, always in this order, and the order is the whole point: what
@@ -340,6 +496,13 @@ impl AppShell {
     /// 4. Everything else is one row of [`commands::resolve`].
     fn handle_key(&mut self, key: &str, modifiers: Modifiers, cx: &mut Context<Self>) {
         if self.canvas.read(cx).workload_controls_input() {
+            return;
+        }
+        // An open prompt owns the keyboard outright: it is the only surface
+        // accepting a path right now, so letting the Inspector or an editor
+        // shortcut answer first would type into the wrong place.
+        if self.new_project.is_some() {
+            self.handle_new_project_key(key, cx);
             return;
         }
         if self.inspector.update(cx, |inspector, cx| {
@@ -485,6 +648,98 @@ impl AppShell {
         cx.notify();
     }
 
+    /// The New Project affordance, and the prompt when one is open.
+    ///
+    /// Deliberately a button and a typed path. GPUI has no file dialog, and this
+    /// milestone is not the place to add a platform dependency and a second way
+    /// to choose a directory; the project's location is one string and is typed.
+    fn new_project_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = div()
+            .id("new-project-button")
+            .flex()
+            .items_center()
+            .gap_1()
+            .px(px(9.0))
+            .py(px(5.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER_SOFT))
+            .text_xs()
+            .text_color(rgb(theme::TEXT_SECONDARY))
+            .hover(|style| style.bg(rgb(theme::SURFACE_HOVER)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.new_project = match this.new_project.take() {
+                    Some(_) => None,
+                    None => Some(NewProjectPrompt::opening()),
+                };
+                cx.notify();
+            }))
+            .child("+");
+        let button = div().relative().child(button);
+        if self.new_project.is_none() {
+            return button;
+        }
+        div()
+            .relative()
+            .child(button)
+            .child(self.new_project_prompt())
+    }
+
+    /// The open prompt: the path being typed, and what Enter will do with it.
+    fn new_project_prompt(&self) -> impl IntoElement {
+        let buffer = self
+            .new_project
+            .as_ref()
+            .map(|prompt| prompt.buffer.as_str())
+            .unwrap_or_default();
+        let shown = if buffer.is_empty() {
+            format!("{}MyProject.spool", home_directory_prefix())
+        } else {
+            buffer.to_owned()
+        };
+        div()
+            .id("new-project-prompt")
+            .absolute()
+            .top(px(34.0))
+            .left(px(0.0))
+            .w(px(360.0))
+            .p(px(10.0))
+            .rounded_lg()
+            .bg(rgb(theme::SURFACE_RAISED))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::TEXT))
+                    .child("New Spool Project"),
+            )
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded_md()
+                    .bg(rgb(theme::CANVAS))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_SOFT))
+                    .text_xs()
+                    .text_color(if buffer.is_empty() {
+                        rgb(theme::TEXT_MUTED)
+                    } else {
+                        rgb(theme::TEXT)
+                    })
+                    .child(shown),
+            )
+            .child(div().text_xs().text_color(rgb(theme::TEXT_MUTED)).child(
+                "The directory name is the project name. Enter creates and opens it; Esc cancels.",
+            ))
+    }
+
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let left = div()
             .flex()
@@ -528,7 +783,8 @@ impl AppShell {
                             .text_color(rgb(theme::TEXT_MUTED))
                             .child(format!("Website  /  {}", PAGES[self.selected_page])),
                     ),
-            );
+            )
+            .child(self.new_project_button(cx));
 
         let mut tools = div()
             .flex()

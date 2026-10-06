@@ -141,6 +141,41 @@ run "$BOUNDARY" "spool_project::" "a file is accepted as a project directory" \
         }' \
   'let _ = &root;'
 
+echo "== creating a project =="
+
+run "$BOUNDARY" "spool_project::" "a new project's name need not end in .spool" \
+  'if Path::new(&name).extension().and_then(|ext| ext.to_str()) != Some(PROJECT_EXTENSION) {
+        return Err(ProjectCreateError::NotAProjectName { path: root, name });
+    }' \
+  'let _ = &name;'
+
+run "$BOUNDARY" "spool_project::" "creating overwrites whatever was there" \
+  'if !empty {
+            return Err(ProjectCreateError::AlreadyExists { path: root });
+        }' \
+  'let _ = empty;'
+
+run "$BOUNDARY" "spool_project::" "a new project directory is never created" \
+  'std::fs::create_dir_all(&root).map_err(|source| ProjectCreateError::Io {
+        path: root.clone(),
+        source,
+    })?;' \
+  ''
+
+run "$BOUNDARY" "spool_project::" "the new object gets no identity attribute" \
+  'selector: format!("[data-spool-id=\"{NEW_ROOT_ID}\"]"),' \
+  'selector: String::new(),'
+
+run "$BOUNDARY" "spool_project::" "the new object is an undrawable kind" \
+  'kind: "frame".to_owned(),' \
+  'kind: "shape".to_owned(),'
+
+run "$BOUNDARY" "spool_project::" "the manifest is not written at all" \
+  'ProjectBundle::from_document(&root, document)
+        .and_then(|bundle| bundle.save())
+        .map_err(ProjectCreateError::Bundle)?;' \
+  'let _ = (ProjectBundle::from_document(&root, document), ProjectCreateError::NoName);'
+
 echo "== the command line =="
 
 run "$BOUNDARY" "spool_project::" "the first of two project paths is chosen" \
