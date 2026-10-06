@@ -3363,6 +3363,55 @@ impl CanvasView {
         &self.session.runtime
     }
 
+    /// The undo stack, for the window-level interaction tests.
+    ///
+    /// Test-only for the same reason `runtime_document` is: history depth is an
+    /// assertion about an interaction's consequences, and the interactions that
+    /// matter most here — a click, a key press — cannot be run without a window.
+    #[cfg(test)]
+    pub fn test_history(&self) -> &crate::operations::SemanticHistory {
+        &self.session.history
+    }
+
+    /// Whether the canvas currently holds keyboard focus.
+    ///
+    /// Asked as a question rather than exposing the handle, so that nothing can
+    /// take the handle and use it for something other than asking this. It is
+    /// the precondition for every editor shortcut, and until the canvas takes
+    /// focus on pointer interaction a key press goes to the dispatch tree's
+    /// synthetic root instead of to the shell.
+    #[cfg(test)]
+    pub fn holds_keyboard_focus(&self, window: &Window) -> bool {
+        self.focus_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_focused(window))
+    }
+
+    /// A world point in canvas-local screen coordinates.
+    ///
+    /// The inverse of `object_screen_center`, for the tests that need to click
+    /// somewhere rather than something — empty canvas, mostly.
+    #[cfg(test)]
+    pub fn world_to_canvas_screen(&self, world: Point<f32>) -> Point<f32> {
+        self.camera.world_to_screen(world)
+    }
+
+    /// An object's centre in canvas-local screen coordinates.
+    ///
+    /// For tests that intend to click a particular object. Computing the point
+    /// from the camera is the point: a hard-coded coordinate would quietly stop
+    /// pointing at the object the moment the layout or zoom changed, and the
+    /// test would go on passing while clicking empty canvas.
+    #[cfg(test)]
+    pub fn object_screen_center(&self, index: usize) -> Option<Point<f32>> {
+        let object = self.document_objects().get(index)?;
+        let centre = point(
+            object.position.x + object.size.width / 2.0,
+            object.position.y + object.size.height / 2.0,
+        );
+        Some(self.camera.world_to_screen(centre))
+    }
+
     /// The tool the canvas is acting with.
     ///
     /// Read by the shell so the toolbar shows the tool that is actually in
@@ -4566,16 +4615,13 @@ impl CanvasView {
                         })
                 })
                 .collect();
-            // Focusing here is what makes the editor-wide keyboard reach the
-            // canvas at all. An action is only dispatched to elements on the path
-            // from the focused node, and with nothing focused that path is the
-            // dispatch tree's synthetic root — which contains no editor element,
-            // so the shell's key handler never runs and no shortcut fires. The
-            // Layers rows focus themselves on click for the same reason; without
-            // this the canvas is the one surface whose keys do nothing.
-            if let Some(focus_handle) = &self.focus_handle {
-                window.focus(focus_handle, cx);
-            }
+            // Deliberately no `window.focus` here. GPUI already moves focus to a
+            // `track_focus` element on mouse-down, and the viewport has one, so
+            // an explicit call would only restate it — and an editor shortcut
+            // still depends on it, because a key event reaches only the path from
+            // the focused node up to the root. What keeps the canvas reachable is
+            // the `track_focus` in `render`, which is what the window tests
+            // mutate.
             self.interaction = Interaction::PotentialMove(MoveGesture {
                 pointer_start_screen: screen,
                 pointer_start_world: world,
@@ -5195,6 +5241,11 @@ impl Render for CanvasView {
         let input_entity = entity.clone();
         let mut viewport = div()
             .id("canvas-viewport")
+            // GPUI's own hook for locating an element's bounds from a test, and a
+            // no-op in release builds. It is what lets the window-level
+            // interaction tests click the object they mean to click instead of
+            // guessing a coordinate — see `src/interaction_window_tests.rs`.
+            .debug_selector(|| "canvas-viewport".to_string())
             .relative()
             .flex_1()
             .overflow_hidden()

@@ -4,6 +4,8 @@ mod diagnostics;
 mod document_runtime_bridge;
 mod hierarchy;
 mod inspector;
+#[cfg(test)]
+mod interaction_window_tests;
 mod layers;
 mod lifecycle;
 mod operations;

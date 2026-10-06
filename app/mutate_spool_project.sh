@@ -93,15 +93,20 @@ open(path, 'w').write(source.replace(old, new, 1))
 
   # A compile error or a run with no results means the mutation did not build,
   # which is not evidence about the tests.
-  if ! printf '%s' "$out" | grep -q "^test result:"; then
+  # Read through a here-string rather than a pipe. Under `set -o pipefail`, and
+  # with `grep -q` exiting the instant it matches, a large enough `$out` leaves the
+  # writer killed by SIGPIPE and the pipeline reports that instead of grep's
+  # result — so a run where tests failed could be scored as a survivor. See
+  # `mutate_interaction.sh` for the run where that actually happened.
+  if ! grep -q "^test result:" <<<"$out"; then
     echo "ERROR $name (mutation did not compile)"
-    printf '%s\n' "$out" | grep -E "^error" | head -3
+    grep -E "^error" <<<"$out" | head -3
     return
   fi
 
-  if printf '%s' "$out" | grep -q "FAILED"; then
+  if grep -q "FAILED" <<<"$out"; then
     local failed
-    failed=$(printf '%s\n' "$out" | grep -cE "^test .*FAILED")
+    failed=$(grep -cE "^test .*FAILED" <<<"$out")
     printf 'KILL  %-56s (%s failing)\n' "$name" "$failed"
     passed=$((passed + 1))
   else

@@ -1,12 +1,16 @@
 use gpui::{
-    div, point, prelude::*, px, rgb, Context, Entity, Modifiers, Render, SharedString,
+    div, point, prelude::*, px, rgb, App, Context, Entity, Modifiers, Render, SharedString,
     Subscription, Window,
 };
 use std::path::PathBuf;
 
 use crate::{canvas, commands, inspector, layers::LayersView, project_open, theme};
 
-const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
+/// The tools the toolbar offers, in the order it shows them.
+///
+/// `pub(crate)` so the window-level interaction tests can enumerate exactly what
+/// the toolbar renders rather than keeping a second list that could drift.
+pub(crate) const TOOLS: [(&str, &str, &str, canvas::Tool); 7] = [
     ("↖", "Select", "V", canvas::Tool::Select),
     ("▱", "Frame", "F", canvas::Tool::Frame),
     ("□", "Rectangle", "R", canvas::Tool::Rectangle),
@@ -530,6 +534,33 @@ impl AppShell {
         }
     }
 
+    /// Whether the toolbar should show `tool` as the one in effect.
+    ///
+    /// One method rather than the expression written out in each toolbar,
+    /// because there are two of them and they had already drifted: when the shell
+    /// carried its own copy of the active tool, the two toolbars and the Escape
+    /// logic each read a different field. Reading the canvas here means there is
+    /// only one answer to this question in the program.
+    fn tool_is_highlighted(&self, tool: canvas::Tool, cx: &App) -> bool {
+        self.canvas.read(cx).tool() == tool
+    }
+
+    /// The same question, for the window-level interaction tests.
+    #[cfg(test)]
+    pub fn test_tool_is_highlighted(&self, tool: canvas::Tool, cx: &App) -> bool {
+        self.tool_is_highlighted(tool, cx)
+    }
+
+    /// The canvas entity, for the window-level interaction tests.
+    ///
+    /// Test-only because it is only ever needed to ask the canvas something from
+    /// outside its own module: those tests drive a real window, and a real
+    /// window reaches the canvas through the shell that contains it.
+    #[cfg(test)]
+    pub fn canvas(&self) -> &Entity<canvas::CanvasView> {
+        &self.canvas
+    }
+
     /// Carry out one editor-wide command.
     ///
     /// Every history-affecting arm below goes through the canvas, which commits
@@ -792,7 +823,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.canvas.read(cx).tool() == *tool;
+            let selected = self.tool_is_highlighted(*tool, cx);
             let background = if selected {
                 theme::SURFACE_HOVER
             } else {
@@ -807,6 +838,11 @@ impl AppShell {
             tools = tools.child(
                 div()
                     .id(SharedString::from(format!("top-tool-{index}")))
+                    // GPUI's hook for locating an element from a test; a
+                    // no-op in release builds. Lets the interaction tests click
+                    // the actual toolbar button instead of calling the command
+                    // the button is bound to.
+                    .debug_selector(|| format!("tool-{label}"))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1153,7 +1189,7 @@ impl AppShell {
             .border_1()
             .border_color(rgb(theme::BORDER));
         for (index, (icon, label, _shortcut, tool)) in TOOLS.iter().enumerate() {
-            let selected = self.canvas.read(cx).tool() == *tool;
+            let selected = self.tool_is_highlighted(*tool, cx);
             let background = if selected {
                 theme::ACCENT_WASH
             } else {

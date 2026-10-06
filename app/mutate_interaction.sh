@@ -21,7 +21,11 @@ cd "$(dirname "$0")" || exit 2
 
 CANVAS="src/canvas.rs"
 SHELL="src/shell.rs"
-FILTER="canvas::tests"
+# Empty on purpose. The three behaviours this harness exists for — keyboard
+# focus, the Text handover, and the toolbar highlight — can only be seen
+# through a live window, so they live in `interaction_window_tests`. A filter
+# would quietly exclude exactly the tests that make this harness meaningful.
+FILTER=""
 
 # No marker check here: unlike `operations.rs` and `project_save.rs`, the files
 # this harness mutates predate the marker convention, and adding one to the
@@ -41,47 +45,6 @@ trap restore EXIT
 passed=0
 survived=0
 equivalent=0
-
-# gaps: invariants this harness deliberately does not prove, reported rather than
-# silently counted. An untested claim about the editor is not a passing test.
-gaps=0
-
-# gap <file> <name> <old> <new> [all]
-#
-# Apply the mutation and report what came back without counting it as coverage.
-# "No test failed" here means "nothing was watching", which is not a pass, so
-# these are named as open obligations rather than folded into the kill count.
-gap() {
-  local file="$1" name="$2" old="$3" new="$4" mode="${5:-one}"
-  restore
-  if ! python3 -c "
-import sys
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
-mode = sys.argv[4]
-source = open(path).read()
-count = source.count(old)
-if mode == 'all':
-    if count < 1:
-        print('ANCHOR-MISSING:' + str(count), file=sys.stderr)
-        sys.exit(3)
-else:
-    if count != 1:
-        print('ANCHOR-AMBIGUOUS:' + str(count), file=sys.stderr)
-        sys.exit(3)
-open(path, 'w').write(source.replace(old, new))
-" "$file" "$old" "$new" "$mode"; then
-    echo "SKIP  $name (anchor not unique or malformed)"
-    return
-  fi
-
-  if cargo test --offline "$FILTER" >/dev/null 2>&1; then
-    printf 'GAP    %-56s (no test can observe it)\n' "$name"
-    gaps=$((gaps + 1))
-  else
-    printf 'KILL  %-56s (a test does observe it)\n' "$name"
-    passed=$((passed + 1))
-  fi
-}
 
 # equiv <file> <filter> <name> <old> <new>
 #
@@ -119,20 +82,44 @@ open(path, 'w').write(source.replace(old, new))
     return
   fi
 
+  # Cargo decides whether to rebuild from file mtimes. A mutation written in the
+  # same instant as the previous build can leave the mtime looking unchanged, and
+  # the run then tests unmutated code and reports a false survivor. That is not a
+  # hypothetical: two runs of this harness a minute apart disagreed about which
+  # mutants survived. So: confirm the mutation is on disk, then let the clock move
+  # past the last build before invoking cargo.
+  if ! grep -qF "$new" "$file"; then
+    echo "SKIP  $name (mutation is not on disk)"
+    return
+  fi
+  sleep 1
+
   local out
-  out=$(cargo test --offline "$filter" 2>&1)
+  if [ -n "$filter" ]; then
+    out=$(cargo test --offline "$filter" 2>&1)
+  else
+    out=$(cargo test --offline 2>&1)
+  fi
 
   # No `test result:` line means the mutation did not build, which says nothing
   # about whether the tests are any good.
-  if ! printf '%s' "$out" | grep -q "^test result:"; then
+  #
+  # These greps read `$out` through a here-string rather than a pipe, and that is
+  # not a style preference. The harness runs under `set -o pipefail`, and
+  # `grep -q` exits the moment it matches: on a large enough `$out` that leaves
+  # the writer killed by SIGPIPE, pipefail reports that as the pipeline's status,
+  # and a run in which twelve tests failed is scored as SURVIVED. It happened
+  # here: the whole-suite runs are ~60KB, which is exactly where it starts. A
+  # mutation harness that cannot tell a kill from a pass is worse than none.
+  if ! grep -q "^test result:" <<<"$out"; then
     echo "ERROR $name (mutation did not compile)"
     printf '%s\n' "$out" | grep -E "^error" | head -2
     return
   fi
 
-  if printf '%s' "$out" | grep -q "FAILED"; then
+  if grep -q "FAILED" <<<"$out"; then
     local failed
-    failed=$(printf '%s\n' "$out" | grep -cE "^test .*FAILED")
+    failed=$(grep -cE "^test .*FAILED" <<<"$out")
     printf 'KILL  %-56s (%s failing)\n' "$name" "$failed"
     passed=$((passed + 1))
   else
@@ -223,41 +210,35 @@ run "$CANVAS" "$FILTER" "creation does not return to the Selection tool" \
 
 
 echo
-echo "== documented gaps =="
-# Three of this milestone's rules are not observable from a unit test, and all
-# three for the same reason: they happen inside a pointer-up handler or a render,
-# where GPUI only exposes them through a live Window. This crate has no
-# test-support harness, so "no test failed" below means "nothing was watching".
-# That is a limit of the suite rather than a property of the code, and it is
-# recorded as an open obligation instead of being counted as coverage.
-gap "$CANVAS" "a selection gesture does not take keyboard focus" \
-  'if let Some(focus_handle) = &self.focus_handle {
-                window.focus(focus_handle, cx);
-            }' \
-  'let _ = cx;'
+echo
+echo "== what a real window is for =="
+# The rules below were, until recently, untestable: they are properties of a live
+# GPUI `Window` rather than of any function, so a unit test holding the window that
+# would do the work could not observe them. `interaction_window_tests` drives a
+# real window with real events, so they are ordinary mutations now.
 
-gap "$CANVAS" "text creation returns to Selection before its session opens" \
-  'if object_type != ObjectType::Text {
-            self.finish_creation();
-        }' \
-  'if true {
-            self.finish_creation();
-        }'
+run "$CANVAS" "" "the canvas stops being a focus target" \
+  'viewport = viewport.track_focus(focus_handle);' \
+  'viewport = viewport;'
 
-# The toolbar highlight reads the canvas's tool instead of a second copy, which
-# is the whole reason the duplicate field is gone. Both toolbars read the same
-# line, so the mutation is applied to every occurrence.
-gap "$SHELL" "the toolbar reads a tool the canvas is not using" \
-  'let selected = self.canvas.read(cx).tool() == *tool;' \
-  'let selected = *tool != canvas::Tool::Rectangle;' \
-  all
+run "$CANVAS" "" "the Text handover commits the session it just opened" \
+  '                                                this.tool = Tool::Select;' \
+  '                                                this.set_tool(Tool::Select);'
+
+run "$CANVAS" "" "a Text click never opens a session" \
+  '                                    if this.tool == Tool::Text {' \
+  '                                    if false {'
+
+run "$SHELL" "" "the toolbar highlight ignores the tool in effect" \
+  '        self.canvas.read(cx).tool() == tool' \
+  '        matches!(tool, canvas::Tool::Select)'
+
 
 echo
 echo "== summary =="
 printf 'killed:    %s\n' "$passed"
 printf 'equivalent: %s (mutating these cannot change behaviour)\n' "$equivalent"
 printf 'survived:  %s\n' "$survived"
-printf 'gaps:      %s (invariants no test can currently reach)\n' "$gaps"
 
 restore
 [ "$survived" -eq 0 ] || exit 1

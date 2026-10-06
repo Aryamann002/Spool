@@ -14,5 +14,19 @@ tree-sitter = "0.27.0"
 tree-sitter-html = "0.23.2"
 # smallvec is included here for convenience, it is used by gpui when creating
 # components that can have children. uncomment this line or
-# use `cargo add smallvec` to add it to your project
+# use `cargo add smallvec` and it will be added to the project
 #smallvec = "1.13.2"
+
+# GPUI's own test facility, for dev only.
+#
+# Focus, key dispatch, and text sessions are properties of a live `Window`, and
+# every one of them is the kind of behaviour that looks right in a unit test
+# because the unit test is holding the `Window` that does the work. `test-support`
+# is what lets a test drive a real window: `VisualTestContext` renders, clicks,
+# and types through the same code path the app does.
+#
+# Declared as a dev-dependency rather than a feature on the dependency above so
+# the flag cannot reach the shipped binary. Cargo unifies features across a
+# build, but a dev-dependency is only in the graph for `cargo test`.
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
