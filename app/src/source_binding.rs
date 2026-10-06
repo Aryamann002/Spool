@@ -61,6 +61,13 @@ pub struct ElementBinding {
     pub tag: String,
     /// Range of the whole element, including its tags.
     pub element_range: ByteRange,
+    /// Byte offset just inside the element, where a new last child would go.
+    ///
+    /// The start of this element's closing tag, or the end of the element when it
+    /// has none (a void or self-closing tag). A writer that wants to insert a
+    /// child needs this rather than `element_range.end`, which is past the close
+    /// tag and would put the new element *after* its parent.
+    pub content_end: usize,
     /// Range of the `data-spool-id` value token alone — inside the quotes for
     /// a quoted value, and the token itself when unquoted. This is the only
     /// range a write may touch.
@@ -245,21 +252,9 @@ impl<'a> IndexBuilder<'a> {
         // a second attribute on the same element does not own children.
         let (first, rest) = identities.split_first().expect("identities was non-empty");
         let text_range = self.own_text_range(node);
-        let opened = self.push_binding(
-            first.clone(),
-            &tag,
-            node.byte_range(),
-            parent,
-            text_range.clone(),
-        );
+        let opened = self.push_binding(first.clone(), &tag, node, parent, text_range.clone());
         for extra in rest {
-            self.push_binding(
-                extra.clone(),
-                &tag,
-                node.byte_range(),
-                parent,
-                text_range.clone(),
-            );
+            self.push_binding(extra.clone(), &tag, node, parent, text_range.clone());
         }
         if let Some(parent_index) = parent {
             self.bindings[parent_index].children.push(opened);
@@ -285,15 +280,17 @@ impl<'a> IndexBuilder<'a> {
         &mut self,
         identity: (NodeId, ByteRange, bool),
         tag: &str,
-        element_range: ByteRange,
+        element: Node,
         parent: Option<usize>,
         text_range: Option<ByteRange>,
     ) -> usize {
+        let element_range = element.byte_range();
         let index = self.bindings.len();
         self.bindings.push(ElementBinding {
             id: identity.0,
             tag: tag.to_owned(),
             element_range,
+            content_end: content_end(element),
             value_range: identity.1,
             quoted: identity.2,
             parent,
@@ -898,6 +895,34 @@ fn text_ownership_survives_attributes_and_whitespace_inside_the_element() {
         range.start > binding.element_range.start && range.end < binding.element_range.end,
         "the text range sits strictly inside the element"
     );
+}
+
+/// The byte offset just inside `element`, where a new last child belongs.
+///
+/// The start of the closing tag when there is one; otherwise the end of the
+/// element, which is the right answer for a void or self-closing element because
+/// there is nowhere inside it to put anything.
+fn content_end(element: Node) -> usize {
+    let mut cursor = element.walk();
+    for child in element.children(&mut cursor) {
+        if child.kind() == "end_tag" {
+            return child.start_byte();
+        }
+    }
+    element.end_byte()
+}
+
+/// The whitespace run immediately before `offset`, and where it starts.
+///
+/// Used to reuse an author's own indentation instead of inventing one, which is
+/// the difference between a one-line diff and a reformatted file.
+pub fn trailing_indent(source: &str, offset: usize) -> (usize, &str) {
+    let bytes = source.as_bytes();
+    let mut start = offset;
+    while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    (start, &source[start..offset])
 }
 
 #[cfg(test)]

@@ -33,9 +33,10 @@ gpui::actions!(
 use crate::{
     diagnostics,
     hierarchy::Hierarchy,
-    operations::{EditSession, OperationError, SemanticOperation},
+    operations::{EditSession, OperationError, SemanticOperation, StructureChange},
     snap,
     source_document::{NodeId, PersistentDocument},
+    source_document::{SourceBinding, StructuralNode},
     theme,
 };
 
@@ -71,6 +72,24 @@ const MIN_OBJECT_SIZE: f32 = 20.0;
 /// allows.
 const DUPLICATE_OFFSET: f32 = 16.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+
+/// The side a creation tool makes when the user clicks rather than drags.
+///
+/// A click has no bounds to honour, so the tool needs an answer of its own. In
+/// world units, so it is a size in the document and not in the window: the same
+/// 100 units at 50% and at 200%.
+///
+/// `docs/research/products/figma.md` records the rule this implements — every
+/// tool works with a click and with a drag, and the two differ: click gives a
+/// default size, drag gives explicit bounds.
+const DEFAULT_CREATION_SIZE: f32 = 100.0;
+
+/// The box a Text click leaves.
+///
+/// Text auto-sizes once it holds text, so this is only the box the caret starts
+/// in. It is the size Text click-creation already used.
+const DEFAULT_TEXT_WIDTH: f32 = 180.0;
+const DEFAULT_TEXT_HEIGHT: f32 = 48.0;
 /// Wheel deltas are converted at this many pixels per line.
 ///
 /// Named because both the pan reading and the zoom reading use it, and two
@@ -1722,6 +1741,17 @@ struct CreateGesture {
     pointer_start_screen: Point<f32>,
     pointer_start_world: Point<f32>,
     current_world: Point<f32>,
+    /// Whether the pointer has moved at all since the press.
+    ///
+    /// Not the same question as whether the drag threshold was crossed, and the
+    /// difference is the whole of click creation. Sub-threshold movement is still
+    /// movement: the user dragged, just not far enough to mean anything by drag,
+    /// and it leaves no object behind. A press and release with no movement at all
+    /// is a click, and gets the tool's default size.
+    ///
+    /// `current_world` cannot answer this, because below the threshold it is never
+    /// updated — so a 3px jiggle and a perfect click are indistinguishable there.
+    moved: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1777,6 +1807,20 @@ impl Interaction {
             object_type: gesture.object_type,
             geometry: creation_geometry(gesture.pointer_start_world, gesture.current_world),
         })
+    }
+}
+
+/// The size a click with this tool makes.
+///
+/// A named answer per tool rather than one number everywhere, because Text is
+/// genuinely a different shape: it auto-sizes, so its click box is only a starting
+/// box. Text's value is preserved from what click-creation already used.
+fn default_creation_size(object_type: ObjectType) -> Size<f32> {
+    match object_type {
+        ObjectType::Text => size(DEFAULT_TEXT_WIDTH, DEFAULT_TEXT_HEIGHT),
+        ObjectType::Frame | ObjectType::Rectangle | ObjectType::Ellipse => {
+            size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE)
+        }
     }
 }
 
@@ -2215,6 +2259,20 @@ pub struct CanvasView {
     /// disk for a session in which the user did nothing, which is exactly the
     /// behaviour source-preserving save exists to prevent.
     source_snapshot: BTreeMap<NodeId, SourceSnapshot>,
+    /// Every node this session has authored an element for, and the file it
+    /// lives in.
+    ///
+    /// Session state on the view, not document state, and for the same reason the
+    /// snapshot is. It exists because a node that has left the document cannot be
+    /// asked which file its element was in — yet the save still has to take that
+    /// element back out.
+    ///
+    /// Derived from the structure rather than from a log of deletions, on
+    /// purpose. Anything recorded here and absent from the structure now is a node
+    /// to un-author, so undoing a creation un-authors it too, for free — a
+    /// deletion log would have to be rewound by hand and would not be. A creation
+    /// adds itself here when the save authors it.
+    authored_elements: BTreeMap<NodeId, String>,
     /// `⇧` is held, so this movement is constrained to one axis.
     ///
     /// Sampled per pointer movement rather than at press time, which is the
@@ -2349,6 +2407,7 @@ impl CanvasView {
             workload_running: false,
             project_root: None,
             source_snapshot: BTreeMap::new(),
+            authored_elements: BTreeMap::new(),
             constrain_drag: false,
             center_drag: false,
             hovered: None,
@@ -2384,6 +2443,30 @@ impl CanvasView {
         // after the session exists because the snapshot needs each object's
         // parent origin, which is resolved through the runtime.
         self.source_snapshot = self.opened_state();
+        // Node identities come back with the project, so the allocator has to
+        // start past all of them. Without this, creating an object in a reopened
+        // project would hand it an identity the project already uses, and the
+        // next load would bind two objects to one element.
+        self.session.runtime.next_node_id = next_node_id_after(&self.session.document);
+        // What the project was opened with. A save compares this against the
+        // structure to decide what has to be taken back out of the source.
+        self.authored_elements = self
+            .session
+            .document
+            .structure
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.source.file.clone()))
+            .collect();
+        // Names are unique across the whole document, not just across the canvas,
+        // so the counters have to start past whatever the project already calls its
+        // objects. Without this a reopened project hands out `Rectangle 1` again,
+        // the structural change is refused for a duplicate name, and the creation
+        // silently does nothing.
+        seed_object_names(
+            &mut self.session.runtime,
+            &self.session.document.structure.nodes,
+        );
         // A freshly loaded document has no selection, and keeping stale ids
         // would let hit-testing and layers refer to objects that no longer
         // exist.
@@ -2441,6 +2524,79 @@ impl CanvasView {
     /// through the persistent document rather than the runtime object list so
     /// it is the authored hierarchy that decides, not the order things happen
     /// to be drawn in.
+    /// The element to author for a created object.
+    ///
+    /// Inline, because a created element has no class the author's stylesheet
+    /// could own: inventing a rule inside a file the author wrote would be
+    /// editing their CSS to describe something they never asked for. Every
+    /// declaration here is one the editor will read back, so the object looks the
+    /// same after a reopen.
+    ///
+    /// Authored complete — position and size as well as appearance. A created box
+    /// has no authored position for the flow to discover, so it is taken out of
+    /// the flow and given coordinates from where the editor dropped it. Every
+    /// later move goes through the ordinary geometry path, which respects the
+    /// author's own positioning instead of overwriting this.
+    fn authored_element_for(&self, object: &DesignObject) -> crate::project_save::NewElement {
+        // The editor works in world coordinates and the element is written inside
+        // its parent's content, so the position has to be measured from the
+        // parent's corner or the object lands twice as far over.
+        let origin = self.parent_origin(&object.spool_id);
+        let mut declarations = vec![
+            ("position".to_owned(), "absolute".to_owned()),
+            (
+                "left".to_owned(),
+                format!(
+                    "{}px",
+                    crate::project_save::css_length(object.position.x - origin.x)
+                ),
+            ),
+            (
+                "top".to_owned(),
+                format!(
+                    "{}px",
+                    crate::project_save::css_length(object.position.y - origin.y)
+                ),
+            ),
+            (
+                "width".to_owned(),
+                format!("{}px", crate::project_save::css_length(object.size.width)),
+            ),
+            (
+                "height".to_owned(),
+                format!("{}px", crate::project_save::css_length(object.size.height)),
+            ),
+        ];
+        if let Some(fill) = object.fill {
+            declarations.push(("background-color".to_owned(), css_color(fill.color)));
+        }
+        if let Some(stroke) = object.stroke {
+            declarations.push((
+                "border".to_owned(),
+                format!("{} solid", css_color(stroke.color)),
+            ));
+        }
+        // A zero radius is the absence of a radius, so it is not authored:
+        // `border-radius: 0` would pin a value the author never chose.
+        if object.border_radius > 0.0 {
+            declarations.push((
+                "border-radius".to_owned(),
+                format!(
+                    "{}px",
+                    crate::project_save::css_length(object.border_radius)
+                ),
+            ));
+        }
+        if object.opacity < 1.0 {
+            declarations.push(("opacity".to_owned(), format!("{}", object.opacity)));
+        }
+        crate::project_save::NewElement {
+            tag: "div".to_owned(),
+            text: object.text_content.clone(),
+            declarations,
+        }
+    }
+
     fn parent_origin(&self, node: &NodeId) -> Point<f32> {
         let parent = self
             .session
@@ -2496,36 +2652,66 @@ impl CanvasView {
             return Ok(outcome);
         };
         let mut edits = Vec::new();
+        // Anything the project was opened with and is no longer in the document
+        // has to leave the source too, or a reopen brings back an object the user
+        // deleted — or an object they undid creating.
+        for (node, file) in &self.authored_elements {
+            let still_there = self
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|candidate| &candidate.id == node);
+            if !still_there {
+                edits.push(crate::project_save::SourceEdit::Remove {
+                    node: node.clone(),
+                    file: file.clone(),
+                });
+            }
+        }
         for object in self.session.runtime.objects() {
-            // Only objects that came from authored source can be written back.
-            let bound = self
+            let known = self
                 .session
                 .document
                 .structure
                 .nodes
                 .iter()
                 .any(|node| node.id == object.spool_id);
-            if !bound {
+            if !known {
+                // An object with no node has no binding and therefore nowhere to
+                // be authored. Reported rather than invented.
                 outcome
                     .unsupported
                     .push(crate::project_save::UnsupportedEdit {
                         node: object.spool_id.clone(),
                         kind: "object",
-                        reason: "created in this session, so it has no authored element yet".into(),
+                        reason: "not in the persistent document, so there is nothing to bind"
+                            .into(),
                     });
                 continue;
             }
-            // No snapshot means this object was not the one that was loaded —
-            // an object recreated under the same identity. Writing it would be a
-            // guess, so it is reported instead.
+            // No snapshot means the object was not the one that was opened: it was
+            // created in this session, so it has an element to author rather than
+            // an existing one to edit.
             let Some(before) = self.source_snapshot.get(&object.spool_id) else {
-                outcome
-                    .unsupported
-                    .push(crate::project_save::UnsupportedEdit {
-                        node: object.spool_id.clone(),
-                        kind: "object",
-                        reason: "no opened state to compare against".into(),
-                    });
+                // Recorded before the edit, because the file is read out of the
+                // structure and this is where it is still there.
+                if let Some(node) = self
+                    .session
+                    .document
+                    .structure
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == object.spool_id)
+                {
+                    self.authored_elements
+                        .insert(object.spool_id.clone(), node.source.file.clone());
+                }
+                edits.push(crate::project_save::SourceEdit::Create {
+                    node: object.spool_id.clone(),
+                    element: self.authored_element_for(object),
+                });
                 continue;
             };
 
@@ -3175,6 +3361,80 @@ impl CanvasView {
     #[cfg(test)]
     pub fn runtime_document(&self) -> &Document {
         &self.session.runtime
+    }
+
+    /// The undo stack, for the window-level interaction tests.
+    ///
+    /// Test-only for the same reason `runtime_document` is: history depth is an
+    /// assertion about an interaction's consequences, and the interactions that
+    /// matter most here — a click, a key press — cannot be run without a window.
+    #[cfg(test)]
+    pub fn test_history(&self) -> &crate::operations::SemanticHistory {
+        &self.session.history
+    }
+
+    /// Whether the canvas currently holds keyboard focus.
+    ///
+    /// Asked as a question rather than exposing the handle, so that nothing can
+    /// take the handle and use it for something other than asking this. It is
+    /// the precondition for every editor shortcut, and until the canvas takes
+    /// focus on pointer interaction a key press goes to the dispatch tree's
+    /// synthetic root instead of to the shell.
+    #[cfg(test)]
+    pub fn holds_keyboard_focus(&self, window: &Window) -> bool {
+        self.focus_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_focused(window))
+    }
+
+    /// A world point in canvas-local screen coordinates.
+    ///
+    /// The inverse of `object_screen_center`, for the tests that need to click
+    /// somewhere rather than something — empty canvas, mostly.
+    #[cfg(test)]
+    pub fn world_to_canvas_screen(&self, world: Point<f32>) -> Point<f32> {
+        self.camera.world_to_screen(world)
+    }
+
+    /// An object's centre in canvas-local screen coordinates.
+    ///
+    /// For tests that intend to click a particular object. Computing the point
+    /// from the camera is the point: a hard-coded coordinate would quietly stop
+    /// pointing at the object the moment the layout or zoom changed, and the
+    /// test would go on passing while clicking empty canvas.
+    #[cfg(test)]
+    pub fn object_screen_center(&self, index: usize) -> Option<Point<f32>> {
+        let object = self.document_objects().get(index)?;
+        let centre = point(
+            object.position.x + object.size.width / 2.0,
+            object.position.y + object.size.height / 2.0,
+        );
+        Some(self.camera.world_to_screen(centre))
+    }
+
+    /// The tool the canvas is acting with.
+    ///
+    /// Read by the shell so the toolbar shows the tool that is actually in
+    /// effect. Creation completes by changing it, and a second copy in the shell
+    /// would be a toolbar that disagrees with the canvas.
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Return to the Selection tool after a creation.
+    ///
+    /// So the next thing the user does — move, resize, rename, duplicate, delete —
+    /// acts on the object they just made, without a trip back to the toolbar
+    /// first. One method, called from every creation, so a click-created object
+    /// and a drag-created one finish identically.
+    ///
+    /// Deliberately not `set_tool`: that commits an open text edit, and for a Text
+    /// click the session this is about to open is not the one to end.
+    fn finish_creation(&mut self) {
+        self.abandon_interaction();
+        self.marquee = None;
+        self.clear_gesture_feedback();
+        self.tool = Tool::Select;
     }
 
     pub fn set_tool(&mut self, tool: Tool) {
@@ -4282,6 +4542,7 @@ impl CanvasView {
                 pointer_start_screen: screen,
                 pointer_start_world: world,
                 current_world: world,
+                moved: false,
             });
             self.capture_pointer(window);
             return;
@@ -4354,6 +4615,13 @@ impl CanvasView {
                         })
                 })
                 .collect();
+            // Deliberately no `window.focus` here. GPUI already moves focus to a
+            // `track_focus` element on mouse-down, and the viewport has one, so
+            // an explicit call would only restate it — and an editor shortcut
+            // still depends on it, because a key event reaches only the path from
+            // the focused node up to the root. What keeps the canvas reachable is
+            // the `track_focus` in `render`, which is what the window tests
+            // mutate.
             self.interaction = Interaction::PotentialMove(MoveGesture {
                 pointer_start_screen: screen,
                 pointer_start_world: world,
@@ -4541,6 +4809,7 @@ impl CanvasView {
             }
             Interaction::PotentialCreate(mut gesture) => {
                 if !drag_threshold_crossed(gesture.pointer_start_screen, screen) {
+                    gesture.moved = gesture.moved || gesture.pointer_start_screen != screen;
                     self.interaction = Interaction::PotentialCreate(gesture);
                     return false;
                 }
@@ -4598,15 +4867,27 @@ impl CanvasView {
             }
             Interaction::PotentialCreate(gesture) => {
                 if gesture.object_type == ObjectType::Text {
+                    // Text has always answered a click, and a drag reaches
+                    // `Creating` below instead.
                     self.commit_creation(
                         gesture.object_type,
                         gesture.pointer_start_world,
-                        size(180.0, 48.0),
+                        default_creation_size(ObjectType::Text),
                     );
                 } else if drag_threshold_crossed(gesture.pointer_start_screen, screen) {
                     let current_world = self.camera.screen_to_world(screen);
                     let geometry = creation_geometry(gesture.pointer_start_world, current_world);
                     self.commit_creation(gesture.object_type, geometry.position, geometry.size);
+                } else if !gesture.moved {
+                    // A click: pressed and released without moving. The object is
+                    // placed at the same point a drag would start from, so the two
+                    // share one anchor — its top-left, because
+                    // `creation_geometry` puts a drag's top-left at the press.
+                    self.commit_creation(
+                        gesture.object_type,
+                        gesture.pointer_start_world,
+                        default_creation_size(gesture.object_type),
+                    );
                 }
             }
             Interaction::Creating(gesture) => {
@@ -4633,7 +4914,98 @@ impl CanvasView {
         let placement = self.session.runtime.placement(object.id).unwrap();
         self.selection
             .click(Some(object.id), false, &self.hierarchy());
-        self.commit(DocumentCommand::insert(vec![placement]));
+        self.commit_created(vec![placement]);
+        // Text keeps its tool: the session the pointer-up handler opens is
+        // announced by the tool still being Text, and the tool returns to
+        // Selection once that session is open. Every other tool is finished here.
+        if object_type != ObjectType::Text {
+            self.finish_creation();
+        }
+    }
+
+    /// Record new objects in the document *and* on the canvas, as one history
+    /// entry.
+    ///
+    /// Two halves, because a created object has two existences. The canvas needs
+    /// the shape in order to draw it, and the persistent document needs the node
+    /// in order to write it to `lamine.yaml` and bind it to an authored element.
+    /// Committing only the runtime half is exactly what made a created object
+    /// vanish on reopen. Committing them as one compound is what keeps "one
+    /// gesture is one history entry" true now that both halves exist.
+    fn commit_created(&mut self, placements: Vec<ObjectPlacement>) {
+        let mut operations = Vec::with_capacity(placements.len() * 2);
+        for placement in &placements {
+            let Some(node) = self.structure_for_new(&placement.object) else {
+                continue;
+            };
+            operations.push(SemanticOperation::Structure(StructureChange::Insert {
+                node,
+                node_index: self.session.document.structure.nodes.len(),
+                child_index: None,
+            }));
+        }
+        // A project that is open but cannot take the node is a document in a
+        // state this milestone cannot fix; the object is still drawn, and the save
+        // reports it rather than pretending it was written. No project open at all
+        // is the starter scene, where there is nothing to persist to and a
+        // runtime-only object is the whole truth.
+        operations.push(SemanticOperation::Runtime(DocumentCommand::insert(
+            placements,
+        )));
+        self.commit_operation(SemanticOperation::compound(operations));
+    }
+
+    /// The persistent node for an object that does not have one yet.
+    fn structure_for_new(&self, object: &DesignObject) -> Option<StructuralNode> {
+        let (parent, file) = self.creation_site(object)?;
+        Some(StructuralNode {
+            id: object.spool_id.clone(),
+            name: object.name.clone(),
+            kind: kind_for(object.object_type).to_owned(),
+            parent,
+            children: Vec::new(),
+            source: SourceBinding {
+                file,
+                selector: format!("[data-spool-id=\"{}\"]", object.spool_id.as_str()),
+            },
+        })
+    }
+
+    /// Where a newly created object is authored: its parent node and the file its
+    /// element goes into.
+    ///
+    /// Both come from the selected container, which is the same rule the canvas
+    /// already uses to decide what a click acts on. A rectangle drawn inside a
+    /// frame therefore becomes that frame's child in the document as well as on
+    /// the canvas, instead of being a second answer to "where does this belong?".
+    fn creation_site(&self, object: &DesignObject) -> Option<(Option<NodeId>, String)> {
+        let chosen = self
+            .selection
+            .ids()
+            .first()
+            .copied()
+            .filter(|id| *id != object.id)
+            .and_then(|id| self.session.runtime.object(id))
+            .and_then(|parent| {
+                self.session
+                    .document
+                    .structure
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == parent.spool_id)
+                    .map(|node| (Some(node.id.clone()), node.source.file.clone()))
+            });
+        // Nothing suitable selected: the project's top-level frame, which is the
+        // container the whole document hangs from.
+        chosen.or_else(|| {
+            self.session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .find(|node| node.parent.is_none())
+                .map(|root| (Some(root.id.clone()), root.source.file.clone()))
+        })
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) -> bool {
@@ -4655,7 +5027,32 @@ impl CanvasView {
             self.retain_existing_selection();
             return false;
         }
-        self.commit(DocumentCommand::delete(deleted));
+        // The runtime half and the document half, as one entry. The node has to
+        // leave `lamine.yaml` and lose its authored element too, or a reopen
+        // would bring back an object the user deleted.
+        let mut operations = Vec::with_capacity(deleted.len() * 2);
+        for placement in &deleted {
+            let Some(index) = self
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .position(|node| node.id == placement.object.spool_id)
+            else {
+                continue;
+            };
+            let Some(node) = self.session.document.structure.nodes.get(index).cloned() else {
+                continue;
+            };
+            operations.push(SemanticOperation::Structure(StructureChange::Remove {
+                node,
+                node_index: index,
+                child_index: None,
+            }));
+        }
+        operations.push(SemanticOperation::Runtime(DocumentCommand::delete(deleted)));
+        self.commit_operation(SemanticOperation::compound(operations));
         self.retain_existing_selection();
         true
     }
@@ -4685,7 +5082,8 @@ impl CanvasView {
             .collect();
         self.selection
             .replace_normalized(duplicate_ids, &self.hierarchy());
-        self.commit(DocumentCommand::insert(duplicates));
+        // The same path as creation, because a duplicate is a created object.
+        self.commit_created(duplicates);
         true
     }
 
@@ -4843,6 +5241,11 @@ impl Render for CanvasView {
         let input_entity = entity.clone();
         let mut viewport = div()
             .id("canvas-viewport")
+            // GPUI's own hook for locating an element's bounds from a test, and a
+            // no-op in release builds. It is what lets the window-level
+            // interaction tests click the object they mean to click instead of
+            // guessing a coordinate — see `src/interaction_window_tests.rs`.
+            .debug_selector(|| "canvas-viewport".to_string())
             .relative()
             .flex_1()
             .overflow_hidden()
@@ -5011,6 +5414,11 @@ impl Render for CanvasView {
                                                 |object| object.object_type == ObjectType::Text,
                                             ) {
                                                 this.begin_text_edit(id, window, cx);
+                                                // The session is open, so the
+                                                // creation is over: back to the
+                                                // Selection tool like every
+                                                // other one.
+                                                this.tool = Tool::Select;
                                             }
                                         }
                                     }
@@ -6253,6 +6661,80 @@ fn editor_frame(zoom: f32, frame_size: Size<f32>) -> impl IntoElement {
         )
 }
 
+/// Move the "Rectangle N" counters past every name the document already uses.
+///
+/// Only names this allocator could have produced are considered — `Rectangle 12`
+/// is one, `Primary CTA` is not — so an author's own naming is never renumbered,
+/// only avoided.
+fn seed_object_names(runtime: &mut Document, nodes: &[StructuralNode]) {
+    for node in nodes {
+        let Some(number) = node
+            .name
+            .rsplit(' ')
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(label) = node.name.rsplit(' ').next().map(|last| {
+            node.name[..node.name.len() - last.len()]
+                .trim_end()
+                .to_owned()
+        }) else {
+            continue;
+        };
+        let index = match label.as_str() {
+            "Frame" => 0,
+            "Rectangle" => 1,
+            "Ellipse" => 2,
+            "Text" => 3,
+            _ => continue,
+        };
+        runtime.next_names[index] = runtime.next_names[index].max(number + 1);
+    }
+}
+
+/// The `lamine.yaml` kind for a canvas object type.
+///
+/// The same strings the projection reads back, so a created object is described
+/// in metadata the way it will be understood on reopen. A kind the projection
+/// cannot read comes back as an object that exists and draws nothing — persisted
+/// but invisible — which is why this is one function rather than a literal at
+/// each call site.
+fn kind_for(object_type: ObjectType) -> &'static str {
+    match object_type {
+        ObjectType::Frame => "frame",
+        ObjectType::Rectangle => "rectangle",
+        ObjectType::Ellipse => "ellipse",
+        ObjectType::Text => "text",
+    }
+}
+
+/// The next free identity number for a project that has just been opened.
+///
+/// Reads the identities already on disk rather than trusting the counter the
+/// runtime starts with. `allocate_node_id` only knows about objects in the
+/// runtime, so a reopened project full of `spool-node-…` identities would
+/// otherwise be handed one it already uses — and two objects would arrive at the
+/// same element on the next load.
+///
+/// Unparseable identities are ignored rather than guessed at: a node whose id was
+/// not minted by the allocator cannot collide with one that was, and refusing to
+/// open over it would be worse than skipping it.
+fn next_node_id_after(document: &PersistentDocument) -> u64 {
+    const PREFIX: &str = "spool-node-";
+    document
+        .structure
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let rest = node.id.as_str().strip_prefix(PREFIX)?;
+            u64::from_str_radix(rest, 16).ok()
+        })
+        .max()
+        .map_or(1, |highest| highest + 1)
+}
+
 fn features_frame(zoom: f32, frame_size: Size<f32>) -> impl IntoElement {
     div()
         .flex()
@@ -7189,6 +7671,414 @@ mod tests {
         assert_eq!(geometry.size, size(160.0, 120.0));
     }
 
+    // -- Click creation and the tool that completes it.
+
+    /// Press and release without moving, with `tool` active: the production
+    /// pointer-up path, driven the way a pointer drives it.
+    fn click_with(tool: Tool, object_type: ObjectType, at: Point<f32>) -> CanvasView {
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(tool);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        canvas
+    }
+
+    /// The same, with the camera already zoomed, and the world point the press
+    /// actually landed on.
+    fn click_with_zoomed(
+        tool: Tool,
+        object_type: ObjectType,
+        at: Point<f32>,
+        zoom: f32,
+    ) -> (CanvasView, Point<f32>) {
+        let mut canvas = CanvasView::new();
+        canvas.camera.set_zoom_at_center(zoom);
+        canvas.set_tool(tool);
+        let world = canvas.camera.screen_to_world(at);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type,
+            pointer_start_screen: at,
+            pointer_start_world: world,
+            current_world: world,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        (canvas, world)
+    }
+
+    /// The object the gesture just made, read back off the canvas.
+    fn last_object(canvas: &CanvasView) -> DesignObject {
+        canvas
+            .session
+            .runtime
+            .objects()
+            .last()
+            .cloned()
+            .expect("an object was created")
+    }
+
+    #[test]
+    fn a_click_creates_the_tools_default_box() {
+        for (tool, object_type) in [
+            (Tool::Frame, ObjectType::Frame),
+            (Tool::Rectangle, ObjectType::Rectangle),
+            (Tool::Ellipse, ObjectType::Ellipse),
+        ] {
+            let canvas = click_with(tool, object_type, point(240.0, 180.0));
+            let created = last_object(&canvas);
+            assert_eq!(created.object_type, object_type);
+            assert_eq!(
+                created.size,
+                size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE),
+                "{object_type:?} gets the default square"
+            );
+            // Named here so the requirement is stated rather than implied.
+            assert_eq!(DEFAULT_CREATION_SIZE, 100.0, "Frame click is 100x100");
+        }
+    }
+
+    #[test]
+    fn a_click_with_the_text_tool_creates_its_existing_box() {
+        // Text's click size predates click creation for the other tools; it is
+        // preserved rather than folded into the default square.
+        let canvas = click_with(Tool::Text, ObjectType::Text, point(240.0, 180.0));
+        let created = last_object(&canvas);
+        assert_eq!(created.object_type, ObjectType::Text);
+        // Literal, not the constants: asserting a constant against itself would
+        // pass whatever the constants were changed to, which is the opposite of
+        // pinning the box down.
+        assert_eq!(
+            created.size,
+            size(180.0, 48.0),
+            "text keeps its existing box"
+        );
+    }
+
+    #[test]
+    fn a_click_places_the_object_by_its_top_left_where_a_drag_would() {
+        // One anchor for both. `creation_geometry` puts a drag's top-left at the
+        // press, so a click does the same rather than inventing a centre.
+        //
+        // Zoomed, because at 1x the press point and its own world coordinate are
+        // the same number and a click anchored to either would look identical.
+        // At 2x they are genuinely different places, and only the press point's
+        // world coordinate can be where the click was.
+        let press = point(140.0, 110.0);
+        let zoomed = click_with_zoomed(Tool::Rectangle, ObjectType::Rectangle, press, 2.0);
+        let at = zoomed.1;
+        let clicked = last_object(&zoomed.0);
+
+        let mut canvas = CanvasView::new();
+        canvas.camera.set_zoom_at_center(2.0);
+        canvas.set_tool(Tool::Rectangle);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        let to = point(360.0, 300.0);
+        canvas.update_interaction(to);
+        canvas.finish_interaction(to);
+        let dragged = last_object(&canvas);
+
+        assert_eq!(clicked.position, at, "click anchors top-left at the press");
+        assert_eq!(
+            dragged.position, at,
+            "and so does a drag, which is the whole claim"
+        );
+        let to_world = canvas.camera.screen_to_world(to);
+        assert_eq!(
+            dragged.size,
+            size((to_world.x - at.x).abs(), (to_world.y - at.y).abs()),
+            "the drag still sets its own bounds"
+        );
+    }
+
+    #[test]
+    fn a_drag_still_creates_explicit_geometry() {
+        let at = point(100.0, 100.0);
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Frame);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Frame,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.update_interaction(point(260.0, 220.0));
+        canvas.finish_interaction(point(260.0, 220.0));
+        let created = last_object(&canvas);
+        assert_eq!(created.size, size(160.0, 120.0), "the drag's own bounds");
+    }
+
+    #[test]
+    fn a_clicks_default_size_is_the_same_at_every_zoom() {
+        // The default is in world units. Zoom changes how big the box looks on
+        // screen and must not change the box in the document.
+        for zoom in [0.5, 1.0, 2.0] {
+            let mut canvas = CanvasView::new();
+            canvas.camera.set_zoom_at_center(zoom);
+            canvas.set_tool(Tool::Frame);
+            // Deliberately off-centre: on the viewport's own centre, the world
+            // point a press maps to is the same at every zoom, which would let an
+            // anchor bug hide.
+            let at = canvas.camera.screen_to_world(point(260.0, 210.0));
+            canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+                object_type: ObjectType::Frame,
+                pointer_start_screen: point(260.0, 210.0),
+                pointer_start_world: at,
+                current_world: at,
+                moved: false,
+            });
+            canvas.finish_interaction(point(260.0, 210.0));
+            let created = last_object(&canvas);
+            assert_eq!(
+                created.size,
+                size(DEFAULT_CREATION_SIZE, DEFAULT_CREATION_SIZE),
+                "at {zoom}x the world size is unchanged"
+            );
+            assert_eq!(created.position, at, "and it lands where the click was");
+        }
+    }
+
+    #[test]
+    fn a_creation_selects_the_new_object_and_returns_to_selection() {
+        for (tool, object_type) in [
+            (Tool::Frame, ObjectType::Frame),
+            (Tool::Text, ObjectType::Text),
+        ] {
+            let canvas = click_with(tool, object_type, point(240.0, 180.0));
+            let created = last_object(&canvas);
+            assert_eq!(
+                canvas.selection.ids(),
+                vec![created.id],
+                "{object_type:?}: the new object is the only selection"
+            );
+            // Text's session is opened by the pointer-up handler that also owns
+            // this transition, and it returns to Selection there.
+            if object_type != ObjectType::Text {
+                assert_eq!(
+                    canvas.tool(),
+                    Tool::Select,
+                    "{object_type:?}: creation finishes back on Selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_creation_deselects_whatever_was_selected_first() {
+        let mut canvas = CanvasView::new();
+        let previously = canvas.session.runtime.objects()[0].id;
+        canvas.selection.replace(vec![previously]);
+        assert_eq!(canvas.selection.ids(), vec![previously]);
+
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+
+        let created = last_object(&canvas).id;
+        assert_eq!(
+            canvas.selection.ids(),
+            vec![created],
+            "the new object replaced the selection, not joined it"
+        );
+    }
+
+    #[test]
+    fn a_drag_creation_also_returns_to_selection() {
+        let at = point(100.0, 100.0);
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Ellipse);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Ellipse,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.update_interaction(point(200.0, 200.0));
+        canvas.finish_interaction(point(200.0, 200.0));
+        assert_eq!(canvas.tool(), Tool::Select);
+        assert_eq!(canvas.selection.ids(), vec![last_object(&canvas).id]);
+    }
+
+    #[test]
+    fn a_click_creation_is_one_history_entry_that_undo_and_redo_restore() {
+        let mut canvas = CanvasView::new();
+        let before = canvas.session.runtime.objects().len();
+        let entries = canvas.session.history.undo_len();
+
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+        let created = last_object(&canvas).spool_id.clone();
+
+        assert_eq!(canvas.session.runtime.objects().len(), before + 1);
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "a click is one gesture and therefore one entry"
+        );
+        // Selecting the new object is runtime state and records nothing.
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "tool switching and selection are not history"
+        );
+
+        canvas.session.undo().expect("undo");
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        canvas.session.redo().expect("redo");
+        assert!(canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .any(|object| object.spool_id == created));
+    }
+
+    #[test]
+    fn repeated_clicks_keep_creating() {
+        let mut canvas = CanvasView::new();
+        canvas.set_tool(Tool::Rectangle);
+        let before = canvas.session.runtime.objects().len();
+        for index in 0..3 {
+            let at = point(100.0 + index as f32 * 50.0, 100.0);
+            canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+                object_type: ObjectType::Rectangle,
+                pointer_start_screen: at,
+                pointer_start_world: at,
+                current_world: at,
+                moved: false,
+            });
+            canvas.finish_interaction(at);
+            // Each creation returns to Selection, so the tool is re-armed each
+            // time exactly as a user's would be.
+            canvas.set_tool(Tool::Rectangle);
+        }
+        assert_eq!(canvas.session.runtime.objects().len(), before + 3);
+    }
+
+    // -- Deleting from the canvas.
+
+    #[test]
+    fn deleting_the_canvas_selection_removes_it_and_one_history_entry_covers_it() {
+        let mut canvas = CanvasView::new();
+        let victims: Vec<_> = canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .take(2)
+            .map(|object| object.id)
+            .collect();
+        canvas.selection.replace(victims.clone());
+        let entries = canvas.session.history.undo_len();
+        let before = canvas.session.runtime.objects().len();
+
+        assert!(canvas.delete_selected_objects());
+
+        assert_eq!(canvas.session.runtime.objects().len(), before - 2);
+        assert_eq!(
+            canvas.session.history.undo_len(),
+            entries + 1,
+            "two objects, one gesture, one entry"
+        );
+        assert!(
+            canvas.selection.ids().is_empty(),
+            "and nothing deleted is left selected"
+        );
+
+        canvas.session.undo().expect("undo");
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        for victim in &victims {
+            assert!(
+                canvas.session.runtime.object(*victim).is_some(),
+                "undo restored {victim:?}"
+            );
+        }
+        canvas.session.redo().expect("redo");
+        assert_eq!(canvas.session.runtime.objects().len(), before - 2);
+    }
+
+    #[test]
+    fn the_delete_key_and_backspace_are_one_command_on_the_canvas() {
+        // Both spellings reach the same `Command::Delete`, which is the only
+        // deletion implementation: Canvas and Layers have no separate paths.
+        let modifiers = gpui::Modifiers::default();
+        for key in ["delete", "backspace"] {
+            assert_eq!(
+                crate::commands::resolve(key, modifiers, crate::commands::Scope::Editor),
+                Some(crate::commands::Command::Delete),
+                "{key} deletes the selection"
+            );
+        }
+        // And not while a text buffer owns the key.
+        assert_eq!(
+            crate::commands::resolve("backspace", modifiers, crate::commands::Scope::TextEditing),
+            None,
+            "a caret outranks deletion"
+        );
+    }
+
+    #[test]
+    fn a_creation_then_delete_leaves_nothing_behind() {
+        // The completion chain this milestone exists for: create, the new object
+        // is selected, delete it, and the document is back where it started.
+        let mut canvas = CanvasView::new();
+        let before = canvas.session.runtime.objects().len();
+        canvas.set_tool(Tool::Rectangle);
+        let at = point(240.0, 180.0);
+        canvas.interaction = Interaction::PotentialCreate(CreateGesture {
+            object_type: ObjectType::Rectangle,
+            pointer_start_screen: at,
+            pointer_start_world: at,
+            current_world: at,
+            moved: false,
+        });
+        canvas.finish_interaction(at);
+
+        let created = last_object(&canvas).id;
+        assert_eq!(
+            canvas.selection.ids(),
+            vec![created],
+            "the new object is selected, so Delete needs no further setup"
+        );
+        assert!(canvas.delete_selected_objects());
+        assert_eq!(canvas.session.runtime.objects().len(), before);
+        assert!(canvas
+            .session
+            .runtime
+            .objects()
+            .iter()
+            .all(|object| object.id != created));
+        assert!(canvas.selection.ids().is_empty());
+    }
+
     #[test]
     fn sub_threshold_creation_gesture_creates_no_object() {
         let mut canvas = CanvasView::new();
@@ -7198,6 +8088,7 @@ mod tests {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(100.0, 100.0),
             current_world: point(100.0, 100.0),
+            moved: false,
         });
 
         canvas.update_interaction(point(3.0, 0.0));
@@ -7224,6 +8115,7 @@ mod tests {
                 pointer_start_screen: start_screen,
                 pointer_start_world: start_world,
                 current_world: start_world,
+                moved: false,
             });
 
             assert!(canvas.update_interaction(end_screen));
@@ -7248,6 +8140,7 @@ mod tests {
             pointer_start_screen: point(0.0, 0.0),
             pointer_start_world: point(100.0, 100.0),
             current_world: point(180.0, 160.0),
+            moved: true,
         });
         let preview = canvas.interaction.preview();
         assert!(preview.is_some());
@@ -7269,6 +8162,7 @@ mod tests {
             pointer_start_screen: point(100.0, 120.0),
             pointer_start_world: point(100.0, 120.0),
             current_world: point(100.0, 120.0),
+            moved: false,
         });
 
         canvas.finish_interaction(point(100.0, 120.0));
@@ -11935,10 +12829,13 @@ mod tests {
     }
 
     #[test]
-    fn a_created_object_cannot_be_renamed_because_it_has_no_node_yet() {
-        // Reported, not invented: a created object has no metadata entry to
-        // rename, and writing one would be a structural edit the user did not
-        // ask for.
+    fn an_object_with_no_node_cannot_be_renamed() {
+        // Reported, not invented. An object placed on the canvas without
+        // `commit_created` has no metadata entry to rename, and writing one would
+        // be a structural edit the user did not ask for.
+        //
+        // Not the created-object case: an object created through the creation
+        // gesture *does* have a node now, and is renamed like any other.
         let mut view = CanvasView::new();
         let created = view.session.runtime.create_object(
             ObjectType::Rectangle,
@@ -12224,8 +13121,684 @@ mod tests {
         }
     }
 
+    // -- Created-object persistence: the milestone this closes.
+    //
+    // Every test here drives the *production* path — `commit_created`, then
+    // `save_project`, then a fresh `open_project` from disk — because the gap
+    // this milestone closed was never in a type. It was that a created object
+    // reached the canvas and not the document, and no amount of unit testing the
+    // two halves separately would have shown it.
+
+    /// Create one object exactly as the creation gesture does.
+    ///
+    /// The same three steps `commit_creation` performs, on the same private
+    /// methods, because the point of these tests is the production path rather
+    /// than a stand-in for it.
+    fn create(view: &mut CanvasView, object_type: ObjectType) -> DesignObject {
+        let text = (object_type == ObjectType::Text).then(|| "Type something".to_string());
+        let object = view.session.runtime.create_object(
+            object_type,
+            point(240.0, 180.0),
+            size(120.0, 80.0),
+            text,
+        );
+        let placement = view
+            .session
+            .runtime
+            .placement(object.id)
+            .expect("a new object is placed");
+        view.selection
+            .click(Some(object.id), false, &view.hierarchy());
+        view.commit_created(vec![placement]);
+        object
+    }
+
+    /// Replace a text object's content, as the text editor commits it.
+    fn set_text(view: &mut CanvasView, id: ObjectId, text: &str) {
+        let geometry = view.session.runtime.geometry(id).expect("has geometry");
+        let position = geometry.position;
+        let size = geometry.size;
+        view.commit(DocumentCommand::text(vec![TextChange {
+            id,
+            before: view
+                .session
+                .runtime
+                .object(id)
+                .and_then(|object| object.text_content.clone())
+                .unwrap_or_default(),
+            after: text.to_owned(),
+        }]));
+        let _ = (position, size);
+    }
+
+    /// Reopen the project from disk, as a fresh session.
+    fn reopen(root: &std::path::Path) -> crate::project_open::LoadedProject {
+        crate::project_open::open_project(root).expect("the project reopens")
+    }
+
+    fn node_of<'a>(loaded: &'a crate::project_open::LoadedProject, id: &str) -> &'a StructuralNode {
+        loaded
+            .document
+            .structure
+            .nodes
+            .iter()
+            .find(|node| node.id.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is in the document"))
+    }
+
+    fn ids(loaded: &crate::project_open::LoadedProject) -> Vec<String> {
+        loaded
+            .document
+            .structure
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str().to_owned())
+            .collect()
+    }
+
     #[test]
-    fn a_session_created_object_is_reported_rather_than_silently_dropped() {
+    fn a_created_rectangle_survives_save_and_reopen() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        let node_id = created.spool_id.clone();
+
+        let outcome = view.save_project().expect("save succeeds");
+        assert!(
+            outcome.unsupported.is_empty(),
+            "a created object is supportable now: {:?}",
+            outcome.unsupported
+        );
+
+        // The metadata knows about it...
+        let reloaded = reopen(&root);
+        let node = node_of(&reloaded, node_id.as_str());
+        assert_eq!(node.kind, "rectangle");
+        assert_eq!(node.name, created.name);
+        assert_eq!(node.source.file, "pages/index.html");
+        // ...the authored source has an element carrying its identity...
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(
+            html.contains(&format!("data-spool-id=\"{}\"", node_id.as_str())),
+            "the element was authored: {html}"
+        );
+        // ...and the reopened project draws it as the same kind of object.
+        assert_eq!(reloaded.runtime.objects().len(), 4);
+        let round_tripped = reloaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id == node_id)
+            .expect("the created object is projected");
+        assert_eq!(round_tripped.object_type, ObjectType::Rectangle);
+        assert_eq!(round_tripped.name, created.name);
+    }
+
+    #[test]
+    fn a_created_ellipse_survives_save_and_reopen_as_an_ellipse() {
+        // The kind has to be one the projection reads back. A created ellipse
+        // authored as anything else would reopen as an object that exists in the
+        // document and draws as nothing.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Ellipse);
+        view.save_project().expect("save succeeds");
+
+        let reloaded = reopen(&root);
+        assert_eq!(
+            node_of(&reloaded, created.spool_id.as_str()).kind,
+            "ellipse"
+        );
+        let round_tripped = reloaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id == created.spool_id)
+            .expect("projected");
+        assert_eq!(round_tripped.object_type, ObjectType::Ellipse);
+    }
+
+    #[test]
+    fn a_created_text_object_keeps_its_text_across_a_reopen() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Text);
+        let text = created
+            .text_content
+            .clone()
+            .expect("text objects start with text");
+        view.save_project().expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(html.contains(&text), "the text is in the source: {html}");
+
+        let reloaded = reopen(&root);
+        let round_tripped = reloaded
+            .runtime
+            .objects()
+            .iter()
+            .find(|object| object.spool_id == created.spool_id)
+            .expect("projected");
+        assert_eq!(round_tripped.object_type, ObjectType::Text);
+        assert_eq!(round_tripped.text_content.as_deref(), Some(text.as_str()));
+    }
+
+    #[test]
+    fn editing_a_created_text_object_then_saving_persists_the_edit() {
+        // Text the user typed after creation has to survive too, which means the
+        // created element must own a single run of text for the next edit to
+        // find a range in.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Text);
+
+        let edited = "Spool writes this back";
+        set_text(&mut view, created.id, edited);
+        view.save_project().expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(html.contains(edited), "the edit is in the source: {html}");
+        let reloaded = reopen(&root);
+        assert_eq!(
+            reloaded
+                .runtime
+                .objects()
+                .iter()
+                .find(|object| object.spool_id == created.spool_id)
+                .and_then(|object| object.text_content.clone())
+                .as_deref(),
+            Some(edited)
+        );
+    }
+
+    #[test]
+    fn a_created_object_is_a_child_of_the_selected_frame() {
+        // Hierarchy is the question the canvas already answers for a click, so a
+        // creation asks it the same way rather than inventing a parent.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let frame = object_with_node(&view, "spool-frame-root");
+        view.selection.replace(vec![frame.id]);
+
+        let created = create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+
+        let reloaded = reopen(&root);
+        let node = node_of(&reloaded, created.spool_id.as_str());
+        assert_eq!(
+            node.parent.as_ref().map(|id| id.as_str()),
+            Some("spool-frame-root"),
+            "created inside the selected frame"
+        );
+        let frame_node = node_of(&reloaded, "spool-frame-root");
+        assert!(
+            frame_node
+                .children
+                .iter()
+                .any(|child| child.as_str() == created.spool_id.as_str()),
+            "and the frame lists it as a child"
+        );
+        // The element really is inside the frame's element, not merely claimed
+        // by it: the structure says one thing and the source has to agree.
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        let frame_at = html
+            .find("data-spool-id=\"spool-frame-root\"")
+            .expect("frame");
+        let created_at = html
+            .find(&format!("data-spool-id=\"{}\"", created.spool_id.as_str()))
+            .expect("created element");
+        assert!(frame_at < created_at, "authored inside the frame: {html}");
+    }
+
+    #[test]
+    fn two_created_objects_keep_creation_order_in_the_authored_source() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let first = create(&mut view, ObjectType::Rectangle);
+        let second = create(&mut view, ObjectType::Ellipse);
+        view.save_project().expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        let first_at = html.find(first.spool_id.as_str()).expect("first element");
+        let second_at = html.find(second.spool_id.as_str()).expect("second element");
+        assert!(
+            first_at < second_at,
+            "creation order is source order: {html}"
+        );
+
+        let reloaded = reopen(&root);
+        let order: Vec<String> = ids(&reloaded);
+        assert_eq!(order.len(), 5);
+    }
+
+    #[test]
+    fn creating_twice_saves_twice_and_does_not_rewrite_the_first_object() {
+        // The second save is measured from the first. If the created object were
+        // authored again on the second save, its element would be duplicated.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("first save");
+        let after_first = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+
+        view.save_project().expect("second save");
+        let after_second = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert_eq!(
+            after_first, after_second,
+            "a second save with nothing changed writes nothing"
+        );
+        assert_eq!(
+            after_second
+                .matches(&format!("data-spool-id=\"{}\"", created.spool_id.as_str()))
+                .count(),
+            1,
+            "one element, authored once"
+        );
+    }
+
+    #[test]
+    fn create_save_edit_save_keeps_both_the_creation_and_the_edit() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("first save");
+
+        // Reopen, so the second save is measured from what is on disk.
+        let mut view = project_view(&root);
+        let reopened = object_with_node(&view, created.spool_id.as_str());
+        view.selection.replace(vec![reopened.id]);
+        view.nudge_selection(60.0, 40.0);
+        view.save_project().expect("second save");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        // The created element was authored out of the flow, so moving it writes
+        // coordinates from its containing block — which is what the existing
+        // geometry policy does for an absolute element. The frame sits at the
+        // origin, so these are the world coordinates the editor left it at.
+        assert!(
+            html.contains("left: 300px") && html.contains("top: 220px"),
+            "the move survived alongside the creation: {html}"
+        );
+        assert_eq!(
+            html.matches(created.spool_id.as_str()).count(),
+            1,
+            "and the element was not authored twice"
+        );
+        assert_eq!(reopen(&root).runtime.objects().len(), 4);
+    }
+
+    #[test]
+    fn a_created_object_keeps_its_identity_through_save_and_reopen() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+
+        let reloaded = reopen(&root);
+        assert_eq!(
+            node_of(&reloaded, created.spool_id.as_str()).id,
+            created.spool_id,
+            "the same logical node, read back from lamine.yaml and the source"
+        );
+        // And the identity is what the authored element carries, so the two
+        // halves cannot drift apart.
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(html.contains(created.spool_id.as_str()));
+    }
+
+    #[test]
+    fn a_duplicated_object_persists_with_its_own_identity() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let original = object_with_node(&view, "spool-cta-primary");
+        let original_node = original.spool_id.clone();
+        view.selection.replace(vec![original.id]);
+
+        assert!(view.duplicate_selected_objects());
+        let duplicate = *view
+            .selection
+            .ids()
+            .first()
+            .expect("the duplicate is selected");
+        let duplicate_node = view
+            .session
+            .runtime
+            .object(duplicate)
+            .expect("duplicated")
+            .spool_id
+            .clone();
+        assert_ne!(
+            duplicate_node, original_node,
+            "a duplicate is a different node, not a second handle on one"
+        );
+
+        view.save_project().expect("save succeeds");
+        let reloaded = reopen(&root);
+        assert_eq!(
+            reloaded.runtime.objects().len(),
+            4,
+            "original and duplicate"
+        );
+        // Both exist, both bound, and they kept their own identities.
+        for node in [&original_node, &duplicate_node] {
+            assert!(
+                reloaded
+                    .document
+                    .structure
+                    .nodes
+                    .iter()
+                    .any(|candidate| &candidate.id == node),
+                "{:?} survived",
+                node
+            );
+        }
+        // And they are distinguishable: the duplicate was offset, so its geometry
+        // is different in the source, not the same box twice.
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert_eq!(html.matches("data-spool-id=").count(), 4);
+    }
+
+    #[test]
+    fn undo_removes_a_created_object_and_redo_brings_it_back() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let before = view.document_objects().len();
+        let created = create(&mut view, ObjectType::Rectangle);
+        assert_eq!(
+            view.document_objects().len(),
+            before + 1,
+            "created on the canvas and in the document"
+        );
+        assert!(
+            view.session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.id == created.spool_id),
+            "the document knows it too"
+        );
+
+        view.session.undo().expect("undo replays");
+        assert_eq!(view.document_objects().len(), before, "undo removed it");
+        assert!(
+            !view
+                .session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.id == created.spool_id),
+            "and the document forgot it as well, which is the half that used to be missing"
+        );
+
+        view.session.redo().expect("redo replays");
+        assert_eq!(
+            view.document_objects().len(),
+            before + 1,
+            "redo restored it"
+        );
+        assert!(
+            view.session
+                .document
+                .structure
+                .nodes
+                .iter()
+                .any(|node| node.id == created.spool_id),
+            "in the document again"
+        );
+    }
+
+    #[test]
+    fn one_creation_is_one_history_entry() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let before = view.session.history.undo_len();
+        create(&mut view, ObjectType::Rectangle);
+        assert_eq!(
+            view.session.history.undo_len(),
+            before + 1,
+            "the document half and the runtime half travel together as one entry"
+        );
+    }
+
+    #[test]
+    fn creating_saving_and_undoing_then_saving_leaves_the_project_without_it() {
+        // History is semantic, and the save is a function of the document. An
+        // undone creation that is then saved must not leave the element behind.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+        assert!(std::fs::read_to_string(root.join("pages/index.html"))
+            .expect("html")
+            .contains(created.spool_id.as_str()));
+
+        view.session.undo().expect("undo replays");
+        view.save_project().expect("save succeeds");
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(
+            !html.contains(created.spool_id.as_str()),
+            "the undone object was taken back out of the source: {html}"
+        );
+        assert_eq!(reopen(&root).runtime.objects().len(), 3);
+    }
+
+    #[test]
+    fn a_deleted_object_stays_deleted_after_a_reopen() {
+        // The inverse lifecycle. A delete has to leave the metadata too, or the
+        // object comes back with nothing to draw it.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let victim = object_with_node(&view, "spool-cta-primary");
+        let victim_node = victim.spool_id.clone();
+        view.selection.replace(vec![victim.id]);
+
+        assert!(view.delete_selected_objects());
+        view.save_project().expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert!(
+            !html.contains(victim_node.as_str()),
+            "its element is gone from the source: {html}"
+        );
+        let metadata = std::fs::read_to_string(root.join("lamine.yaml")).expect("metadata");
+        assert!(
+            !metadata.contains(victim_node.as_str()),
+            "and its node is gone from lamine.yaml: {metadata}"
+        );
+        let reloaded = reopen(&root);
+        assert_eq!(reloaded.runtime.objects().len(), 2);
+        assert!(!ids(&reloaded).iter().any(|id| id == victim_node.as_str()));
+    }
+
+    #[test]
+    fn deleting_a_created_object_removes_the_element_it_authored() {
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let created = create(&mut view, ObjectType::Rectangle);
+        let id = view
+            .session
+            .runtime
+            .object(created.id)
+            .expect("still there")
+            .id;
+        view.selection.replace(vec![id]);
+        view.save_project().expect("save the creation first");
+
+        assert!(view.delete_selected_objects());
+        view.save_project().expect("save succeeds");
+        assert!(!std::fs::read_to_string(root.join("pages/index.html"))
+            .expect("html")
+            .contains(created.spool_id.as_str()));
+        assert_eq!(reopen(&root).runtime.objects().len(), 3);
+    }
+
+    #[test]
+    fn a_created_object_does_not_disturb_the_rest_of_the_authored_source() {
+        // The smallest reasonable diff: one element added inside the frame, and
+        // nothing else in the file moved.
+        let root = project_scratch("landing.spool");
+        let before = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        let mut view = project_view(&root);
+        create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+        let after = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+
+        // Remove the one line that was added; the rest has to be the original.
+        let added: Vec<&str> = after
+            .lines()
+            .filter(|line| !before.contains(*line))
+            .collect();
+        assert_eq!(added.len(), 1, "exactly one line added: {added:?}");
+        let original_lines: Vec<&str> = before.lines().collect();
+        for line in &original_lines {
+            assert!(after.contains(line), "an authored line survived: {line}");
+        }
+        assert_eq!(
+            after
+                .lines()
+                .filter(|line| line.contains("data-spool-id"))
+                .count(),
+            4,
+            "three authored identities plus the created one"
+        );
+    }
+
+    #[test]
+    fn a_created_object_stays_inside_the_project() {
+        // Confinement is the loader's rule and creation does not get an exemption:
+        // the binding names a file under the root, and nothing is written outside.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        create(&mut view, ObjectType::Rectangle);
+        let outcome = view.save_project().expect("save succeeds");
+        for path in &outcome.written {
+            assert!(
+                path.starts_with(&root),
+                "{} escaped the project root",
+                path.display()
+            );
+        }
+        assert!(outcome.written.iter().all(|path| path.starts_with(&root)));
+    }
+
+    #[test]
+    fn a_created_object_in_a_reopened_project_does_not_reuse_an_identity() {
+        // The allocator has to read the identities already on disk, or the first
+        // creation after a reopen collides with one the project is using and two
+        // objects arrive at the same element.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+
+        let mut reopened = project_view(&root);
+        let created = create(&mut reopened, ObjectType::Rectangle);
+        reopened.save_project().expect("save succeeds");
+
+        let reloaded = reopen(&root);
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids(&reloaded) {
+            assert!(seen.insert(id.clone()), "{id} appears twice");
+        }
+        assert!(seen.contains(created.spool_id.as_str()));
+        assert_eq!(reloaded.runtime.objects().len(), 5);
+    }
+
+    #[test]
+    fn create_duplicate_move_style_save_reopen_keeps_the_whole_chain() {
+        // The combination the milestone asks for, end to end.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        let frame = object_with_node(&view, "spool-frame-root");
+        view.selection.replace(vec![frame.id]);
+
+        let created = create(&mut view, ObjectType::Rectangle);
+        let created_id = view.session.runtime.object(created.id).expect("created").id;
+        assert!(view.duplicate_selected_objects(), "duplicate the rectangle");
+        let duplicate_id = *view.selection.ids().first().expect("the duplicate");
+
+        view.selection.replace(vec![created_id]);
+        view.nudge_selection(30.0, 20.0);
+        view.apply_selected_style(StyleEdit::Opacity(0.5));
+        view.save_project().expect("save succeeds");
+
+        let reloaded = reopen(&root);
+        assert_eq!(
+            reloaded.runtime.objects().len(),
+            5,
+            "3 + created + duplicate"
+        );
+        let all = ids(&reloaded);
+        let duplicate_node = view
+            .session
+            .runtime
+            .object(duplicate_id)
+            .map(|object| object.spool_id.clone())
+            .unwrap_or_else(|| {
+                view.selection
+                    .ids()
+                    .first()
+                    .and_then(|id| view.session.runtime.object(*id))
+                    .map(|object| object.spool_id.clone())
+                    .expect("the duplicate")
+            });
+        assert!(
+            all.iter().any(|id| id == duplicate_node.as_str()),
+            "the duplicate's own identity is in the document: {all:?}"
+        );
+        assert_eq!(all.len(), 5);
+        assert_eq!(
+            all.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            5,
+            "five distinct identities"
+        );
+        // The duplicate kept its own geometry.
+        let nodes = &reloaded.document.structure.nodes;
+        assert!(nodes.len() >= 5);
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        assert_eq!(html.matches("data-spool-id=").count(), 5);
+        assert!(
+            html.contains("opacity: 0.5"),
+            "the style edit persisted: {html}"
+        );
+    }
+
+    #[test]
+    fn a_created_element_is_indented_like_the_authored_children() {
+        // The authored file has to stay readable as source. An element written at
+        // column zero next to two-space children looks like a machine produced it,
+        // and it is the only cue that the insertion reused the document's layout
+        // rather than inventing one.
+        let root = project_scratch("landing.spool");
+        let mut view = project_view(&root);
+        create(&mut view, ObjectType::Rectangle);
+        view.save_project().expect("save succeeds");
+
+        let html = std::fs::read_to_string(root.join("pages/index.html")).expect("html");
+        let created = html
+            .lines()
+            .find(|line| line.contains("spool-node-"))
+            .expect("the created element is on its own line");
+        assert!(
+            created.starts_with("      "),
+            "indented like its siblings, not at column zero: {created:?}"
+        );
+        // And its parent is still closed on a line of its own.
+        assert!(
+            html.contains("\n    </main>"),
+            "the parent's close tag kept its line: {html}"
+        );
+    }
+
+    #[test]
+    fn an_object_with_no_document_node_is_reported_rather_than_invented() {
+        // The escape hatch stays honest. A created object is given a node by
+        // `commit_created`, so this is the shape that must NOT happen: an object
+        // put on the canvas with no node behind it. It has no binding and no
+        // parent, so there is nowhere to author it — and the save says so instead
+        // of inventing an element for it.
         let root = project_scratch("landing");
         let mut view = project_view(&root);
         let created = view.session.runtime.create_object(
@@ -12249,10 +13822,12 @@ mod tests {
         assert_eq!(
             reported,
             vec![created.spool_id.as_str()],
-            "the object with no authored element is named, not quietly skipped"
+            "the object with no node is named, not quietly skipped"
         );
         assert!(
-            outcome.unsupported[0].reason.contains("authored element"),
+            outcome.unsupported[0]
+                .reason
+                .contains("persistent document"),
             "and the reason says why: {}",
             outcome.unsupported[0].reason
         );

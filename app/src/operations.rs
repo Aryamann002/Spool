@@ -133,7 +133,8 @@
 //!
 //! # MUTATION HARNESS
 //!
-//! `app/mutate_ops.sh` breaks one rule at a time in this file — the reverse
+//! `app/mutate_ops.sh` and `app/mutate_created_objects.sh` break one rule at a
+//! time in this file — the reverse
 //! order of a compound undo, the validate checks, the point at which an
 //! operation is recorded — and requires the test suite to notice. A rule that
 //! can be broken without a test failing is reported as `SURVIVED`, because an
@@ -141,7 +142,7 @@
 //! this marker, so it cannot be pointed at an unrelated file.
 
 use crate::canvas::{Document, DocumentCommand, ObjectId, ReplayDirection};
-use crate::source_document::{NodeId, PersistentDocument, RenameNode};
+use crate::source_document::{NodeId, PersistentDocument, RenameNode, StructuralNode};
 
 /// Who asked for an operation.
 ///
@@ -211,6 +212,15 @@ pub enum SemanticOperation {
     /// This is the operation that used to live behind its own private
     /// history. It now shares the stack with everything else.
     Rename(RenameNode),
+    /// Persistent, source-backed structure: a node joining or leaving the
+    /// document.
+    ///
+    /// Creation and deletion are the operations that make an object *exist*, as
+    /// opposed to moving or restyling one that already does, so they are the one
+    /// case where the runtime document is not the whole truth: an object the
+    /// runtime holds but `structure` does not is a shape the editor can show and
+    /// cannot save. This variant is what stops that state from being reachable.
+    Structure(StructureChange),
     /// A canvas command: geometry (move/resize), style, text, insert, or
     /// delete.
     ///
@@ -240,6 +250,8 @@ impl SemanticOperation {
     pub fn is_noop(&self) -> bool {
         match self {
             Self::Rename(rename) => rename.before == rename.after,
+            // Whether a node joins or leaves the structure.
+            Self::Structure(change) => change.is_noop(),
             // The canvas command owns this judgement for its own variants; an
             // empty insert or delete changes nothing either.
             Self::Runtime(command) => command.is_noop(),
@@ -279,12 +291,188 @@ impl SemanticOperation {
     }
 }
 
+/// A node appears in the persistent document, or disappears from it.
+///
+/// Insert and remove are inverses by construction, exactly as a canvas insert
+/// and delete are, so one variant carries both directions and
+/// [`ReplayDirection`] chooses. That is why a replay cannot drift: undoing a
+/// creation is the same splice as deleting the node.
+///
+/// Both indices are recorded rather than recomputed. A node's place in
+/// `structure.nodes` and its place in its parent's `children` are different
+/// orderings, and only the operation that made the change knows both. An undo
+/// that re-derived them from the current document would put a redone object
+/// somewhere other than where it was created — which for a source-backed
+/// document is not cosmetic, because the order decides where the authored
+/// element lands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructureChange {
+    /// Redo inserts the node; undo removes it.
+    Insert {
+        node: StructuralNode,
+        /// Where the node sits in `structure.nodes`.
+        node_index: usize,
+        /// Where its id sits in its parent's `children`.
+        child_index: Option<usize>,
+    },
+    /// Redo removes the node; undo restores it.
+    Remove {
+        node: StructuralNode,
+        node_index: usize,
+        child_index: Option<usize>,
+    },
+}
+
+impl StructureChange {
+    fn parts(&self) -> (&StructuralNode, usize, Option<usize>) {
+        match self {
+            Self::Insert {
+                node,
+                node_index,
+                child_index,
+            }
+            | Self::Remove {
+                node,
+                node_index,
+                child_index,
+            } => (node, *node_index, *child_index),
+        }
+    }
+
+    /// Whether applying this change would alter nothing.
+    pub fn is_noop(&self) -> bool {
+        let (node, _, _) = self.parts();
+        // A node with no identity and no name cannot be authored, so treating it
+        // as a no-op is the only safe reading.
+        node.id.as_str().is_empty() || node.name.trim().is_empty()
+    }
+
+    /// Check the change can apply, before any state changes.
+    ///
+    /// A removal is checked against the document it is removing *from*; an
+    /// insertion against the document it is joining. That asymmetry is the point:
+    /// requiring presence for both would reject every legitimate operation, and
+    /// requiring absence for both would reject every undo.
+    pub fn validate(&self, document: &PersistentDocument) -> Result<(), OperationError> {
+        let (node, _, _) = self.parts();
+        let present = document.structure.nodes.iter().any(|n| n.id == node.id);
+        match self {
+            Self::Insert { .. } => {
+                if present {
+                    return Err(OperationError::DuplicateNode(node.id.clone()));
+                }
+                if document
+                    .structure
+                    .nodes
+                    .iter()
+                    .any(|other| other.name == node.name)
+                {
+                    return Err(OperationError::DuplicateName(node.name.clone()));
+                }
+                // A parent that is not there would leave a child that no walk can
+                // reach, so it is refused rather than silently promoted to a root.
+                if let Some(parent) = &node.parent {
+                    if !document.structure.nodes.iter().any(|n| &n.id == parent) {
+                        return Err(OperationError::MissingNode(parent.clone()));
+                    }
+                }
+                Ok(())
+            }
+            Self::Remove { .. } => {
+                if present {
+                    Ok(())
+                } else {
+                    Err(OperationError::MissingNode(node.id.clone()))
+                }
+            }
+        }
+    }
+
+    /// Apply the change. Direction is not a parameter: [`Self::inverse`] is what
+    /// undo replays, exactly as it is for [`RenameNode`], so there is one place
+    /// that decides which way an operation travels rather than two that have to
+    /// agree.
+    pub fn apply(&self, document: &mut PersistentDocument) -> Result<(), OperationError> {
+        let (node, node_index, child_index) = self.parts();
+        match self {
+            Self::Insert { .. } => insert_node(document, node, node_index, child_index),
+            Self::Remove { .. } => remove_node(document, &node.id),
+        }
+        Ok(())
+    }
+
+    /// The change that undoes this one.
+    pub fn inverse(&self) -> Self {
+        let (node, node_index, child_index) = self.parts();
+        match self {
+            Self::Insert { .. } => Self::Remove {
+                node: node.clone(),
+                node_index,
+                child_index,
+            },
+            Self::Remove { .. } => Self::Insert {
+                node: node.clone(),
+                node_index,
+                child_index,
+            },
+        }
+    }
+}
+
+/// Put `node` into the structure at the recorded positions.
+///
+/// Clamped rather than rejected: the indices were recorded against the document
+/// this change was built for, and a document that has since grown must not turn
+/// an ordinary replay into a failure. Clamping puts the node at the end, which
+/// is the only answer that keeps the structure well-formed.
+fn insert_node(
+    document: &mut PersistentDocument,
+    node: &StructuralNode,
+    node_index: usize,
+    child_index: Option<usize>,
+) {
+    let node = node.clone();
+    let index = node_index.min(document.structure.nodes.len());
+    document.structure.nodes.insert(index, node.clone());
+    if let Some(parent) = &node.parent {
+        if let Some(found) = document
+            .structure
+            .nodes
+            .iter_mut()
+            .find(|n| &n.id == parent)
+        {
+            let at = child_index
+                .unwrap_or(found.children.len())
+                .min(found.children.len());
+            if !found.children.contains(&node.id) {
+                found.children.insert(at, node.id.clone());
+            }
+        }
+    }
+}
+
+/// Take `id` out of the structure, and out of its parent's children.
+fn remove_node(document: &mut PersistentDocument, id: &NodeId) {
+    if let Some(index) = document.structure.nodes.iter().position(|n| &n.id == id) {
+        document.structure.nodes.remove(index);
+    }
+    for node in &mut document.structure.nodes {
+        node.children.retain(|child| child != id);
+    }
+}
+
 /// A failure applying an operation. A failed operation changes neither state
 /// nor history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationError {
     /// The operation named a node that does not exist.
     MissingNode(NodeId),
+    /// The operation would give a node an identity another node already holds.
+    ///
+    /// Distinct from [`OperationError::DuplicateName`]: this is the identity that
+    /// has to survive save and reopen, so colliding with it would make two
+    /// objects the same object on the next load rather than merely confusing.
+    DuplicateNode(NodeId),
     /// The operation named a runtime object that does not exist.
     MissingObject(ObjectId),
     /// The operation does not apply to this kind of target, for example a
@@ -310,6 +498,9 @@ impl std::fmt::Display for OperationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingNode(id) => write!(f, "no node with identity {}", id.as_str()),
+            Self::DuplicateNode(id) => {
+                write!(f, "another node already has identity {}", id.as_str())
+            }
             Self::MissingObject(id) => write!(f, "no runtime object {id:?}"),
             Self::WrongTarget(what) => write!(f, "{what} cannot be applied to this target"),
             Self::DuplicateName(name) => write!(f, "another node is already named {name:?}"),
@@ -567,6 +758,20 @@ fn apply_one(
                     .map_err(|error| OperationError::from_rename(rename, error))
             }
         },
+        SemanticOperation::Structure(change) => match target {
+            // A bare runtime has no structure to join or leave, and a structure
+            // change that quietly did nothing would be worse than a refusal.
+            OperationTarget::Runtime(_) => Err(OperationError::WrongTarget("a structural change")),
+            OperationTarget::Full { document, .. } | OperationTarget::Document(document) => {
+                let applied = match direction {
+                    // Undo replays the inverse. Replaying the change itself would
+                    // be a no-op at best, and a stale-edit error at worst.
+                    ReplayDirection::Undo => change.inverse(),
+                    ReplayDirection::Redo => change.clone(),
+                };
+                applied.apply(document)
+            }
+        },
         SemanticOperation::Runtime(command) => {
             let runtime = match target {
                 OperationTarget::Runtime(runtime) => runtime,
@@ -693,6 +898,7 @@ fn validate(
     runtime: &Document,
 ) -> Result<(), OperationError> {
     match operation {
+        SemanticOperation::Structure(change) => change.validate(document),
         SemanticOperation::Rename(rename) => {
             let Some(node) = document
                 .structure
@@ -1006,6 +1212,256 @@ mod tests {
         );
         assert!(session.redo().unwrap());
         assert!(session.runtime.object(id).is_none());
+    }
+
+    // -- Structure: a node joining and leaving the persistent document.
+
+    /// An edit session over a document holding exactly these nodes.
+    fn structure_session(nodes: Vec<StructuralNode>) -> EditSession {
+        EditSession::new(
+            PersistentDocument {
+                structure: crate::source_document::LamineStructure { nodes },
+                sources: std::collections::HashMap::new(),
+            },
+            Document::default(),
+        )
+    }
+
+    fn doc(session: &EditSession) -> &PersistentDocument {
+        &session.document
+    }
+
+    fn doc_mut(session: &mut EditSession) -> &mut PersistentDocument {
+        &mut session.document
+    }
+
+    fn structural(id: &str, name: &str, parent: Option<&str>) -> StructuralNode {
+        StructuralNode {
+            id: NodeId::new(id).expect("valid id"),
+            name: name.to_owned(),
+            kind: "rectangle".to_owned(),
+            parent: parent.map(NodeId::new).transpose().expect("valid parent"),
+            children: Vec::new(),
+            source: SourceBinding {
+                file: "index.html".to_owned(),
+                selector: format!("[data-spool-id=\"{id}\"]"),
+            },
+        }
+    }
+
+    fn frame(id: &str, children: &[&str]) -> StructuralNode {
+        let mut node = structural(id, id, None);
+        node.children = children.iter().map(|c| NodeId::new(*c).unwrap()).collect();
+        node
+    }
+
+    fn insert(node: StructuralNode, at: usize) -> SemanticOperation {
+        SemanticOperation::Structure(StructureChange::Insert {
+            node,
+            node_index: at,
+            child_index: None,
+        })
+    }
+
+    fn ids(document: &PersistentDocument) -> Vec<String> {
+        document
+            .structure
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn an_inserted_node_joins_the_document_and_its_parent() {
+        let mut document = structure_session(vec![frame("spool-root", &[])]);
+        document
+            .execute(insert(
+                structural("spool-new", "New", Some("spool-root")),
+                1,
+            ))
+            .expect("the insert applies");
+
+        assert_eq!(ids(doc(&document)), ["spool-root", "spool-new"]);
+        assert_eq!(
+            doc(&document).structure.nodes[0].children[0].as_str(),
+            "spool-new",
+            "and the parent lists it"
+        );
+    }
+
+    #[test]
+    fn a_removed_node_leaves_the_document_and_its_parent() {
+        let mut new = structural("spool-new", "New", Some("spool-root"));
+        new.kind = "rectangle".to_owned();
+        let mut document =
+            structure_session(vec![frame("spool-root", &["spool-new"]), new.clone()]);
+        let node = new;
+        let position = 1;
+        document
+            .execute(SemanticOperation::Structure(StructureChange::Remove {
+                node: node.clone(),
+                node_index: position,
+                child_index: Some(0),
+            }))
+            .expect("the removal applies");
+
+        assert_eq!(ids(doc(&document)), ["spool-root"]);
+        assert!(
+            doc(&document).structure.nodes[0].children.is_empty(),
+            "the parent no longer lists it"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_are_exact_inverses_for_structure() {
+        let keep = structural("spool-keep", "Keep", Some("spool-root"));
+        let mut document = structure_session(vec![frame("spool-root", &["spool-keep"]), keep]);
+        let before = doc(&document).structure.clone();
+        document
+            .execute(insert(
+                structural("spool-new", "New", Some("spool-root")),
+                2,
+            ))
+            .expect("applies");
+        assert_ne!(doc(&document).structure, before);
+
+        document.undo().expect("undo replays");
+        assert_eq!(
+            doc(&document).structure,
+            before,
+            "undo restored the document"
+        );
+        document.redo().expect("redo replays");
+        assert_eq!(
+            ids(doc(&document)),
+            ["spool-root", "spool-keep", "spool-new"]
+        );
+        assert_eq!(doc(&document).structure.nodes[0].children.len(), 2);
+    }
+
+    #[test]
+    fn a_structural_insert_is_refused_when_the_identity_is_taken() {
+        let mut document =
+            structure_session(vec![frame("spool-root", &[]), frame("spool-taken", &[])]);
+        let error = document
+            .execute(insert(frame("spool-taken", &[]), 2))
+            .expect_err("an identity may not be reused");
+        assert!(
+            matches!(error, OperationError::DuplicateNode(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            ids(doc(&document)),
+            ["spool-root", "spool-taken"],
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn a_structural_insert_is_refused_when_the_name_is_taken() {
+        let mut document =
+            structure_session(vec![frame("spool-root", &[]), frame("spool-other", &[])]);
+        let mut node = structural("spool-new", "spool-root", None);
+        node.name = "Rectangle 1".to_owned();
+        doc_mut(&mut document).structure.nodes[1].name = "Rectangle 1".to_owned();
+        let error = document
+            .execute(insert(node, 2))
+            .expect_err("names are unique across the document");
+        assert!(
+            matches!(error, OperationError::DuplicateName(_)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_of_a_parent_that_is_not_there_is_refused() {
+        // A child nothing can reach is a node that exists in the file and in
+        // nothing else, so it is refused rather than silently promoted to a root.
+        let mut document = structure_session(vec![frame("spool-root", &[])]);
+        let error = document
+            .execute(insert(
+                structural("spool-new", "New", Some("spool-ghost")),
+                1,
+            ))
+            .expect_err("the parent is not there");
+        assert!(matches!(error, OperationError::MissingNode(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_removal_of_a_node_that_is_absent_is_refused() {
+        let mut document = structure_session(vec![frame("spool-root", &[])]);
+        let error = document
+            .execute(SemanticOperation::Structure(StructureChange::Remove {
+                node: frame("spool-ghost", &[]),
+                node_index: 0,
+                child_index: None,
+            }))
+            .expect_err("there is nothing to remove");
+        assert!(matches!(error, OperationError::MissingNode(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_creation_is_one_history_entry_whatever_it_touches() {
+        let mut document = structure_session(vec![frame("spool-root", &[])]);
+        let mut runtime = Document::default();
+        let operation = SemanticOperation::compound(vec![
+            insert(structural("spool-new", "New", Some("spool-root")), 1),
+            SemanticOperation::Runtime(DocumentCommand::insert(Vec::new())),
+        ]);
+        assert!(document.execute(operation).expect("applies"));
+        assert_eq!(document.history.undo_len(), 1, "one gesture, one entry");
+        document.undo().expect("undo");
+        assert_eq!(ids(doc(&document)), ["spool-root"], "both halves went");
+        let _ = &mut runtime;
+    }
+
+    #[test]
+    fn undoing_a_removal_puts_the_node_back_where_it_was() {
+        // The other direction. If insert and remove were not inverses, undoing a
+        // delete would either do nothing or create a second copy, and neither
+        // would be visible on the canvas — the node would just never come back.
+        let victim = structural("spool-gone", "Gone", Some("spool-root"));
+        let mut document =
+            structure_session(vec![frame("spool-root", &["spool-gone"]), victim.clone()]);
+        document
+            .execute(SemanticOperation::Structure(StructureChange::Remove {
+                node: victim.clone(),
+                node_index: 1,
+                child_index: Some(0),
+            }))
+            .expect("the removal applies");
+        assert_eq!(ids(doc(&document)), ["spool-root"]);
+
+        document.undo().expect("undo replays");
+        assert_eq!(
+            ids(doc(&document)),
+            ["spool-root", "spool-gone"],
+            "the node is back, once"
+        );
+        assert_eq!(doc(&document).structure.nodes[0].children.len(), 1);
+        document.redo().expect("redo replays");
+        assert_eq!(ids(doc(&document)), ["spool-root"], "and removed again");
+    }
+
+    #[test]
+    fn a_node_is_inserted_where_the_operation_recorded() {
+        // The recorded index is what keeps a redone object in the same place, and
+        // for a source-backed document that decides where its authored element
+        // lands. Inserting at the end regardless would silently reorder.
+        let mut document = structure_session(vec![
+            frame("spool-root", &[]),
+            frame("spool-a", &[]),
+            frame("spool-b", &[]),
+        ]);
+        document
+            .execute(insert(frame("spool-new", &[]), 1))
+            .expect("applies");
+        assert_eq!(
+            ids(doc(&document)),
+            ["spool-root", "spool-new", "spool-a", "spool-b"],
+            "the node took the index it was given"
+        );
     }
 
     // -- Duplicate.

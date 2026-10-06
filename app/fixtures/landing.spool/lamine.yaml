@@ -1,0 +1,23 @@
+version: 1
+nodes:
+  - id: "spool-frame-root"
+    name: "Landing Frame"
+    kind: "frame"
+    parent: null
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-frame-root\"]"
+    children: ["spool-text-headline", "spool-cta-primary"]
+  - id: "spool-text-headline"
+    name: "Headline"
+    kind: "text"
+    parent: "spool-frame-root"
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-text-headline\"]"
+    children: []
+  - id: "spool-cta-primary"
+    name: "Primary CTA"
+    kind: "frame"
+    parent: "spool-frame-root"
+    file: "pages/index.html"
+    selector: "[data-spool-id=\"spool-cta-primary\"]"
+    children: []
