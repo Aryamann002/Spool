@@ -19,9 +19,8 @@ available in the app today.
 - Open an existing `.spool` project — an `HTML`/`CSS` project with its
   `lamine.yaml` metadata — and edit it through the native Canvas, Layers and
   Inspector.
-- Select and multi-select objects, move and resize them, duplicate or delete
-  them in the current session, rename layers, edit text and change supported
-  visual properties.
+- Select and multi-select objects, move and resize them, create, duplicate or
+  delete them, rename layers, edit text and change supported visual properties.
 - Use alignment snapping, canvas navigation, and undo/redo for supported edits.
 - Save supported changes back to their owning source files. The audit verified
   minimal authored diffs, correct CSS ownership, no-op saves that write
@@ -38,9 +37,10 @@ the implementation roadmap.
 
 ## Current limitations
 
-- **Created-object persistence is not implemented.** Duplicated or otherwise
-  created objects can exist during an editing session, but saving them to the
-  authored project is not yet supported.
+- **Deleting an object that contains other objects cannot be saved.** The
+  objects inside it are left pointing at a parent that no longer exists, so the
+  save is refused and the deletion is lost on reopen. Deleting objects without
+  children saves normally.
 - **CSS and layout coverage is limited.** Spool does not yet reproduce all
   browser layout or cascade behavior. See the support boundary above and the
   [roadmap](docs/04-implementation-roadmap.md).
@@ -134,12 +134,12 @@ Read more about the boundaries and implementation in
 
 ## Where we're going
 
-The next major milestone is **created-object persistence**: making objects
-created or duplicated in the editor persist correctly in the HTML/CSS/SVG
-project and its metadata. This extends Spool's central promise: visual edits
-operate on the project itself and survive saving and reopening.
+**Created-object persistence** has landed: objects created, duplicated or
+deleted in the editor are written to the HTML/CSS/SVG project and its metadata,
+and survive saving and reopening. This extends Spool's central promise: visual
+edits operate on the project itself.
 
-Beyond that, the project will continue to expand its supported CSS and layout
+Next, the project will continue to expand its supported CSS and layout
 model and improve feedback around unsupported or synthesized values. Private,
 local AI remains a longer-term direction for working with structured projects,
 not part of today's feature set. See the
