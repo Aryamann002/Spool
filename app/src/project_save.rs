@@ -2948,18 +2948,48 @@ mod tests {
         assert_eq!(read(&root.join("styles.css")), css);
     }
 
-    #[test]
+    /// Make `assets/styles.css` impossible to replace, and return the path and
+    /// permissions that undo it.
+    ///
+    /// Unix refuses through the directory: with `assets/` read-only, the sibling
+    /// temp file cannot be created.
     #[cfg(unix)]
+    fn refuse_stylesheet_replacement(
+        assets: &std::path::Path,
+    ) -> (std::path::PathBuf, std::fs::Permissions) {
+        std::fs::set_permissions(assets, std::fs::Permissions::from_mode(0o555))
+            .expect("make the stylesheet directory read-only");
+        (assets.to_path_buf(), std::fs::Permissions::from_mode(0o755))
+    }
+
+    /// Windows has no directory mode bits, so it refuses through the file: a
+    /// rename cannot replace a read-only file.
+    #[cfg(windows)]
+    fn refuse_stylesheet_replacement(
+        assets: &std::path::Path,
+    ) -> (std::path::PathBuf, std::fs::Permissions) {
+        let stylesheet = assets.join("styles.css");
+        let original = std::fs::metadata(&stylesheet)
+            .expect("stylesheet metadata")
+            .permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&stylesheet, read_only).expect("make the stylesheet read-only");
+        (stylesheet, original)
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
     fn a_failure_part_way_through_reports_the_files_that_did_land() {
         // A multi-file save is not atomic, and this is the case that proves the
         // code says so rather than implying it.
         //
         // A geometry edit lands in the markup and a fill edit in a stylesheet
         // under `assets/`, so the save writes `index.html` and then fails on the
-        // stylesheet — because that directory is made read-only after the
-        // project was opened, so the sibling temp file cannot be created. Reading
-        // is unaffected, which is what makes this a *write* failure rather than
-        // an unreadable project.
+        // stylesheet — because replacing it is refused after the project was
+        // opened (see `refuse_stylesheet_replacement` for how, per platform).
+        // Reading is unaffected, which is what makes this a *write* failure
+        // rather than an unreadable project.
         //
         // The error has to carry the fact that `index.html` is already on disk. A
         // caller that concluded "the save failed, so nothing changed" would keep
@@ -2982,13 +3012,14 @@ mod tests {
         let loaded = open_project(&root).expect("opens");
 
         let assets = root.join("assets");
-        let writable = std::fs::Permissions::from_mode(0o755);
-        let blocked_mode = std::fs::Permissions::from_mode(0o555);
-        std::fs::set_permissions(&assets, blocked_mode)
-            .expect("make the stylesheet directory read-only");
+        let (blocked, writable) = refuse_stylesheet_replacement(&assets);
+        let probe = assets.join("probe.tmp");
+        let probed = std::fs::File::create(&probe)
+            .and_then(|_| std::fs::rename(&probe, assets.join("styles.css")));
+        let _ = std::fs::remove_file(&probe);
         assert!(
-            std::fs::File::create(assets.join("probe.tmp")).is_err(),
-            "the directory really does refuse a new file, so the failure below is \
+            probed.is_err(),
+            "the stylesheet really cannot be replaced, so the failure below is \
              the filesystem's and not this code's"
         );
         let outcome = save_project(
@@ -3008,7 +3039,7 @@ mod tests {
                 },
             ],
         );
-        std::fs::set_permissions(&assets, writable).expect("restore permissions");
+        std::fs::set_permissions(&blocked, writable).expect("restore permissions");
 
         let failure = outcome.expect_err("the blocked directory refuses the write");
         assert!(
