@@ -88,7 +88,7 @@ $env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
 ```bat
 :: Windows cmd
 cd app
-set SPOOL_PROJECT=.\fixtures\landing && cargo run
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 `SPOOL_PROJECT` is a development override. A real project is a directory named

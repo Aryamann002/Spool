@@ -40,7 +40,7 @@ $env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
 ```bat
 :: Windows cmd
 cd app
-set SPOOL_PROJECT=.\fixtures\landing && cargo run
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 The first build can take a while: GPUI is fetched from the Zed repository at
@@ -140,7 +140,7 @@ $env:SPOOL_PROJECT = ".\fixtures\landing"; cargo run
 ```bat
 :: Windows cmd
 cd app
-set SPOOL_PROJECT=.\fixtures\landing && cargo run
+set "SPOOL_PROJECT=.\fixtures\landing" && cargo run
 ```
 
 `SPOOL_PROJECT` still works and is still how the committed fixtures and the test
